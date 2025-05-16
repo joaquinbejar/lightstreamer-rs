@@ -6,27 +6,59 @@
 
 /// Represents the current status of the `LightstreamerClient`.
 pub enum ClientStatus {
+    /// The client is attempting to connect to the Lightstreamer Server.
     Connecting,
+    /// The client has successfully connected to the Lightstreamer Server.
+    /// Contains the type of connection established.
     Connected(ConnectionType),
+    /// The connection has been temporarily interrupted.
+    /// The client will automatically try to recover the connection.
     Stalled,
+    /// The client is disconnected from the Lightstreamer Server.
+    /// Contains information about the disconnection type.
     Disconnected(DisconnectionType),
 }
 
+/// Represents the type of connection established with the Lightstreamer Server.
+///
+/// This enum indicates the specific transport protocol and connection mode being used
+/// for communication with the server.
 pub enum ConnectionType {
+    /// Connection established using HTTP polling transport.
     HttpPolling,
+    /// Connection established using HTTP streaming transport.
     HttpStreaming,
+    /// Connection in stream-sensing mode, where the client is determining the best
+    /// transport to use.
     StreamSensing,
+    /// Connection established using WebSocket polling transport.
     WsPolling,
+    /// Connection established using WebSocket streaming transport.
     WsStreaming,
 }
 
+/// Represents the type of disconnection that occurred with the Lightstreamer Server.
+///
+/// This enum provides information about the disconnection state and what actions
+/// the client will take following the disconnection.
 pub enum DisconnectionType {
+    /// The client will automatically try to reconnect to the server.
     WillRetry,
+    /// The client is attempting to recover the previous session.
+    /// This happens when a temporary disconnection is detected and the client
+    /// is trying to restore the previous session without losing subscriptions.
     TryingRecovery,
 }
 
+/// Represents the type of logging to be used by the LightstreamerClient.
+///
+/// This enum determines how log messages from the client will be handled and output.
 pub enum LogType {
+    /// Use the tracing crate for logging.
+    /// This provides structured, leveled logging with spans and events.
     TracingLogs,
+    /// Use standard output (stdout/stderr) for logging.
+    /// This provides simpler logging directly to the console.
     StdLogs,
 }
 
