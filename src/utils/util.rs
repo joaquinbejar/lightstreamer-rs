@@ -11,10 +11,11 @@ pub fn clean_message(text: &str) -> String {
         } else if inside_braces {
             // We're processing a segment after an opening brace
             inside_braces = false;
-            result.push_str(&part);
+            result.push_str(part);
         } else {
             // Process the part outside braces
-            result.push_str(&part.replace('\n', "").replace('\r', "").to_lowercase());
+            let chars_to_replace = ['\n', '\r']; // Using an array of chars to replace
+            result.push_str(&part.replace(chars_to_replace, "").to_lowercase());
         }
     }
 

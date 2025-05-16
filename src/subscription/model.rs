@@ -20,13 +20,13 @@ impl Default for &Snapshot {
     }
 }
 
-impl ToString for Snapshot {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Snapshot::Yes => "true".to_string(),
-            Snapshot::No => "false".to_string(),
-            Snapshot::Number(n) => n.to_string(),
-            Snapshot::None => "none".to_string(),
+            Snapshot::Yes => write!(f, "true"),
+            Snapshot::No => write!(f, "false"),
+            Snapshot::Number(n) => write!(f, "{}", n),
+            Snapshot::None => write!(f, ""),
         }
     }
 }
@@ -40,13 +40,13 @@ pub enum SubscriptionMode {
     Command,
 }
 
-impl ToString for SubscriptionMode {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for SubscriptionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubscriptionMode::Merge => "MERGE".to_string(),
-            SubscriptionMode::Distinct => "DISTINCT".to_string(),
-            SubscriptionMode::Raw => "RAW".to_string(),
-            SubscriptionMode::Command => "COMMAND".to_string(),
+            SubscriptionMode::Merge => write!(f, "MERGE"),
+            SubscriptionMode::Distinct => write!(f, "DISTINCT"),
+            SubscriptionMode::Command => write!(f, "COMMAND"),
+            SubscriptionMode::Raw => write!(f, "RAW"),
         }
     }
 }
@@ -177,7 +177,7 @@ impl Subscription {
         self.listeners.retain(|l| {
             let l_ref = l.as_ref() as &dyn SubscriptionListener;
             let listener_ref = listener as &dyn SubscriptionListener;
-            !(std::ptr::addr_of!(*l_ref) == std::ptr::addr_of!(*listener_ref))
+            std::ptr::addr_of!(*l_ref) != std::ptr::addr_of!(*listener_ref)
         });
     }
 
@@ -662,7 +662,7 @@ impl Subscription {
     ///
     /// # Parameters
     /// - `snapshot`: "yes"/"no" to request/not request snapshot delivery (the check is case insensitive). If the Subscription mode is DISTINCT, instead of "yes", it is also possible to supply an integer number, to specify the requested length of the snapshot (though the length of the received snapshot may be less than
-    /// requested, because of insufficient data or server side limits); passing "yes" means that the snapshot length should be determined only by the Server. `None` is also a valid value; if specified, no snapshot preference will be sent to the server that will decide itself whether or not to send any snapshot.
+    ///   requested, because of insufficient data or server side limits); passing "yes" means that the snapshot length should be determined only by the Server. `None` is also a valid value; if specified, no snapshot preference will be sent to the server that will decide itself whether or not to send any snapshot.
     ///
     /// # See also
     /// `ItemUpdate.isSnapshot()`

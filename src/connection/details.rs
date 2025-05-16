@@ -10,6 +10,7 @@ use crate::utils::IllegalArgumentException;
 /// An instance of this class is attached to every `LightstreamerClient` as `LightstreamerClient.connectionDetails`
 ///
 /// See also `LightstreamerClient`
+#[derive(Default)]
 pub struct ConnectionDetails {
     adapter_set: Option<String>,
     client_ip: Option<String>,
@@ -379,21 +380,6 @@ impl Debug for ConnectionDetails {
     }
 }
 
-impl Default for ConnectionDetails {
-    fn default() -> Self {
-        ConnectionDetails {
-            adapter_set: None,
-            client_ip: None,
-            server_address: None,
-            server_instance_address: None,
-            server_socket_name: None,
-            session_id: None,
-            user: None,
-            password: None,
-            listeners: Vec::new(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

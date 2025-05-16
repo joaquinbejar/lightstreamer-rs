@@ -22,39 +22,12 @@ use tracing::{debug, error, info, instrument, trace, warn, Level};
 use url::Url;
 pub(crate) use crate::client::listener::ClientListener;
 use crate::client::message_listener::ClientMessageListener;
+use crate::client::model::{ClientStatus, DisconnectionType, LogType};
+use crate::client::request::SubscriptionRequest;
+use crate::client::Transport;
+use crate::client::utils::get_subscription_by_id;
 use crate::connection::{ConnectionDetails, ConnectionOptions};
 use crate::utils::{clean_message, parse_arguments, IllegalStateException};
-
-/// Represents the current status of the `LightstreamerClient`.
-pub enum ClientStatus {
-    Connecting,
-    Connected(ConnectionType),
-    Stalled,
-    Disconnected(DisconnectionType),
-}
-
-pub enum ConnectionType {
-    HttpPolling,
-    HttpStreaming,
-    StreamSensing,
-    WsPolling,
-    WsStreaming,
-}
-
-pub enum DisconnectionType {
-    WillRetry,
-    TryingRecovery,
-}
-
-pub enum LogType {
-    TracingLogs,
-    StdLogs,
-}
-
-pub struct SubscriptionRequest {
-    subscription: Option<Subscription>,
-    subscription_id: Option<usize>,
-}
 
 /// Facade class for the management of the communication to Lightstreamer Server. Used to provide
 /// configuration settings, event handlers, operations for the control of the connection lifecycle,
@@ -120,16 +93,6 @@ pub struct LightstreamerClient {
     pub subscription_sender: Sender<SubscriptionRequest>,
     /// The receiver used for subscribe/unsubsribe
     subscription_receiver: Receiver<SubscriptionRequest>,
-}
-
-/// Retrieve a reference to a subscription with the given `id`
-fn get_subscription_by_id(
-    subscriptions: &Vec<Subscription>,
-    subscription_id: usize,
-) -> Option<&Subscription> {
-    subscriptions
-        .iter()
-        .find(|sub| sub.id == subscription_id)
 }
 
 impl Debug for LightstreamerClient {
@@ -260,10 +223,10 @@ impl LightstreamerClient {
             ("LS_ack", "false"),
         ];
         // Remove the data adapter parameter if not specified.
-        if ls_data_adapter == "" {
+        if ls_data_adapter.is_empty() {
             params.remove(0);
         }
-        if ls_snapshot != "" {
+        if !ls_snapshot.is_empty() {
             params.push(("LS_snapshot", &ls_snapshot));
         }
 
@@ -342,7 +305,7 @@ impl LightstreamerClient {
         // Convert the HTTP URL to a WebSocket URL.
         //
         let http_url = self.connection_details.get_server_address().unwrap(); // unwrap() is safe here.
-        let mut url = Url::parse(&http_url)
+        let mut url = Url::parse(http_url)
             .expect("Failed to parse server address URL from connection details.");
         match url.scheme() {
             "http" => url
@@ -449,7 +412,7 @@ impl LightstreamerClient {
                                 .filter(|&line| !line.trim().is_empty()) // Filter out empty lines.
                                 .collect();
                             for submessage in submessages {
-                                let clean_text = clean_message(&submessage);
+                                let clean_text = clean_message(submessage);
                                 let submessage_fields: Vec<&str> = clean_text.split(",").collect();
                                 match *submessage_fields.first().unwrap_or(&"") {
                                     //
@@ -464,7 +427,7 @@ impl LightstreamerClient {
                                     //
                                     "conok" => {
                                         is_connected = true;
-                                        if let Some(session_id) = submessage_fields.get(1).as_deref() {
+                                        if let Some(session_id) = submessage_fields.get(1) {
                                             self.make_log( Level::DEBUG, &format!("Session creation confirmed by server: {}", clean_text) );
                                             self.make_log( Level::DEBUG, &format!("Session created with ID: {:?}", session_id) );
                                             //
@@ -570,7 +533,7 @@ impl LightstreamerClient {
                                                                     // If item doesn't exist in item_updates yet, the first update
                                                                     // is always a snapshot.
                                                                     if let Some(item_updates) = subscription_item_updates.get(&(subscription_index)) {
-                                                                        if let Some(_) = item_updates.get(&(item_index)) {
+                                                                        if item_updates.get(&(item_index)).is_some() {
                                                                             // Item update already exists in item_updates, so it's not a snapshot.
                                                                             false
                                                                         } else {
@@ -584,11 +547,7 @@ impl LightstreamerClient {
                                                                 }
                                                             },
                                                             SubscriptionMode::Distinct | SubscriptionMode::Command => {
-                                                                if !subscription.is_subscribed() {
-                                                                    true
-                                                                } else {
-                                                                    false
-                                                                }
+                                                                !subscription.is_subscribed()
                                                             },
                                                             _ => false,
                                                         }
@@ -676,11 +635,11 @@ impl LightstreamerClient {
                                                 value if value.starts_with('{') => {
                                                     // in this case it is a json payload that we will let the consumer handle. In this case, it is important
                                                     // to preserve casing for parsing.
-                                                    let original_json = parse_arguments(&submessage).get(3).unwrap_or(&"").split('|').collect::<Vec<&str>>();
+                                                    let original_json = parse_arguments(submessage).get(3).unwrap_or(&"").split('|').collect::<Vec<&str>>();
                                                     let mut payload = "";
                                                     for json in original_json.iter()
                                                     {
-                                                        if json.is_empty() || json.to_string() == "#"
+                                                        if json.is_empty() || *json == "#"
                                                         {
                                                             continue;
                                                         }
@@ -705,13 +664,7 @@ impl LightstreamerClient {
 
                                         // Store only item_update's changed fields.
                                         let changed_fields: HashMap<String, String> = field_map.iter()
-                                            .filter_map(|(k, v)| {
-                                                if let Some(v) = v {
-                                                    Some((k.clone(), v.clone()))
-                                                } else {
-                                                    None
-                                                }
-                                            })
+                                            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone())))
                                             .collect();
 
                                         //
@@ -730,7 +683,7 @@ impl LightstreamerClient {
                                                             item_update.fields.insert((*field_name).clone(), Some(new_value.clone()));
                                                         }
                                                     }
-                                                    item_update.changed_fields = changed_fields;
+                                                    item_update.changed_fields = changed_fields.clone();
                                                     item_update.is_snapshot = is_snapshot;
                                                     current_item_update = item_update.clone();
                                                 },
@@ -739,9 +692,9 @@ impl LightstreamerClient {
                                                     let item_update = ItemUpdate {
                                                         item_name: item.cloned(),
                                                         item_pos: item_index,
-                                                        fields: field_map,
-                                                        changed_fields: changed_fields,
-                                                        is_snapshot: is_snapshot,
+                                                        fields: field_map.clone(),
+                                                        changed_fields: changed_fields.clone(),
+                                                        is_snapshot,
                                                     };
                                                     current_item_update = item_update.clone();
                                                     item_updates.insert(item_index, item_update);
@@ -753,8 +706,8 @@ impl LightstreamerClient {
                                                     item_name: item.cloned(),
                                                     item_pos: item_index,
                                                     fields: field_map,
-                                                    changed_fields: changed_fields,
-                                                    is_snapshot: is_snapshot,
+                                                    changed_fields,
+                                                    is_snapshot,
                                                 };
                                                 current_item_update = item_update.clone();
                                                 let mut item_updates = HashMap::new();
@@ -789,7 +742,7 @@ impl LightstreamerClient {
                                         };
                                         let ls_send_sync = self.connection_options.get_send_sync().to_string();
                                         let mut params: Vec<(&str, &str)> = vec![
-                                            ("LS_adapter_set", &ls_adapter_set),
+                                            ("LS_adapter_set", ls_adapter_set),
                                             ("LS_cid", "mgQkwtwdysogQz2BJ4Ji kOj2Bg"),
                                             ("LS_send_sync", &ls_send_sync),
                                         ];
@@ -891,13 +844,13 @@ impl LightstreamerClient {
                         
                         if self.subscriptions.is_empty()
                         {
-                            self.make_log( Level::INFO, &"No more subscriptions, disconnecting".to_string() );
+                            self.make_log( Level::INFO, "No more subscriptions, disconnecting" );
                             shutdown_signal.notify_one();
                         }
                     }
                 },
                 _ = shutdown_signal.notified() => {
-                    self.make_log( Level::INFO, &format!("Received shutdown signal") );
+                    self.make_log( Level::INFO, "Received shutdown signal" );
                     break;
                 },
             }
@@ -1147,7 +1100,7 @@ impl LightstreamerClient {
         listener: Option<Box<dyn ClientMessageListener>>,
         enqueue_while_disconnected: bool,
     ) {
-        let _sequence = sequence.unwrap_or_else(|| "UNORDERED_MESSAGES");
+        let _sequence = sequence.unwrap_or("UNORDERED_MESSAGES");
 
         // Handle the message based on the current connection status
         match &self.status {
@@ -1280,16 +1233,25 @@ impl LightstreamerClient {
     /// 
     pub async fn subscribe_get_id(
         subscription_sender: Sender<SubscriptionRequest>,
-        subscription: Subscription,
+        mut subscription: Subscription,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
-        // First, get a reference to the id_receiver
-        let id = subscription.id;
-
+        // Extract the id_receiver before sending the subscription
+        let mut id_receiver = subscription.id_receiver;
+        
+        // Create a new channel for the subscription we're about to send
+        let (_new_sender, new_receiver) = channel(1);
+        subscription.id_receiver = new_receiver;
+        
         // Send the subscription
         LightstreamerClient::subscribe(subscription_sender, subscription).await;
 
-        // Return the subscription ID directly
-        Ok(id)
+        // Wait for the ID to be updated through the channel
+        match id_receiver.recv().await {
+            Some(id) => Ok(id),
+            None => Err(Box::new(IllegalStateException::new(
+                "Failed to get subscription id",
+            ))),
+        }
     }
     
     /*
@@ -1386,35 +1348,6 @@ impl LightstreamerClient {
             },
         }
     }
-}
-
-/// The transport type to be used by the client.
-/// - WS: the Stream-Sense algorithm is enabled as in the `None` case but the client will
-///   only use WebSocket based connections. If a connection over WebSocket is not possible
-///   because of the environment the client will not connect at all.
-/// - HTTP: the Stream-Sense algorithm is enabled as in the `None` case but the client
-///   will only use HTTP based connections. If a connection over HTTP is not possible because
-///   of the environment the client will not connect at all.
-/// - WS-STREAMING: the Stream-Sense algorithm is disabled and the client will only connect
-///   on Streaming over WebSocket. If Streaming over WebSocket is not possible because of
-///   the environment the client will not connect at all.
-/// - HTTP-STREAMING: the Stream-Sense algorithm is disabled and the client will only
-///   connect on Streaming over HTTP. If Streaming over HTTP is not possible because of the
-///   browser/environment the client will not connect at all.
-/// - WS-POLLING: the Stream-Sense algorithm is disabled and the client will only connect
-///   on Polling over WebSocket. If Polling over WebSocket is not possible because of the
-///   environment the client will not connect at all.
-/// - HTTP-POLLING: the Stream-Sense algorithm is disabled and the client will only connect
-///   on Polling over HTTP. If Polling over HTTP is not possible because of the environment
-///   the client will not connect at all.
-#[derive(Debug, PartialEq)]
-pub enum Transport {
-    Ws,
-    Http,
-    WsStreaming,
-    HttpStreaming,
-    WsPolling,
-    HttpPolling,
 }
 
 #[cfg(test)]

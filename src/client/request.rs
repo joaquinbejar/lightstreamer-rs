@@ -3,15 +3,9 @@
     Email: jb@taunais.com 
     Date: 16/5/25
  ******************************************************************************/
- 
-mod listener;
-mod message_listener;
+use crate::subscription::Subscription;
 
-mod implementation;
-mod model;
-mod utils;
-mod request;
-
-pub(crate) use implementation::ClientListener;
-pub use implementation::LightstreamerClient;
-pub use model::Transport;
+pub struct SubscriptionRequest {
+    pub(crate) subscription: Option<Subscription>,
+    pub(crate) subscription_id: Option<usize>,
+}
