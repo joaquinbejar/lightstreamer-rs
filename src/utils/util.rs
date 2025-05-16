@@ -67,6 +67,22 @@ mod tests {
             let result = clean_message(text);
             assert_eq!(result, "helloworld");
         }
+        
+        #[test]
+        fn test_clean_message_with_partial_braces() {
+            // This tests the case where a part starts with '{' but doesn't end with '}'
+            let text = "{partial brace content} followed by text";
+            let result = clean_message(text);
+            assert_eq!(result, "{partial brace content} followed by text");
+        }
+        
+        #[test]
+        fn test_clean_message_with_ending_brace() {
+            // This tests the case where a part ends with '}' but doesn't start with '{'
+            let text = "text followed by {partial brace content}";
+            let result = clean_message(text);
+            assert_eq!(result, "text followed by {partial brace content}");
+        }
 
         #[test]
         fn test_clean_message_with_carriage_return() {

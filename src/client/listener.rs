@@ -424,18 +424,18 @@ mod tests {
         let listener = MinimalClientListener;
         listener.on_server_error(1, "test error");
     }
-
+    
     #[test]
     #[should_panic(expected = "Implement on_status_change method for ClientListener")]
     fn test_default_on_status_change_implementation() {
         let listener = MinimalClientListener;
         listener.on_status_change("CONNECTING");
     }
-
+    
     #[test]
     fn test_default_on_listen_start_implementation() {
         let listener = MinimalClientListener;
-
+        
         // This shouldn't panic as it uses a default implementation
         listener.on_listen_start();
     }

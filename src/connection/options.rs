@@ -1487,4 +1487,53 @@ mod tests {
         options.set_supported_diffs(None);
         assert_eq!(options.get_supported_diffs(), None);
     }
+    
+    #[test]
+    fn test_debug_implementation() {
+        let options = ConnectionOptions::new();
+        
+        // Test that Debug implementation works without panicking
+        let debug_string = format!("{:?}", options);
+        
+        // Verify it contains some expected fields
+        assert!(debug_string.contains("content_length"));
+        assert!(debug_string.contains("first_retry_max_delay"));
+        assert!(debug_string.contains("forced_transport"));
+        assert!(debug_string.contains("http_extra_headers"));
+    }
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
+    #[test]
+    fn test_combined_settings() {
+        let mut options = ConnectionOptions::new();
+        
+        // Test multiple settings together
+        options.set_keepalive_interval(5000);
+        options.set_stalled_timeout(2000);
+        options.set_reconnect_timeout(3000);
+        options.set_first_retry_max_delay(100);
+        options.set_retry_delay(4000);
+        
+        // Verify all settings were applied correctly
+        assert_eq!(options.get_keepalive_interval(), 5000);
+        assert_eq!(options.get_stalled_timeout(), 2000);
+        assert_eq!(options.get_reconnect_timeout(), 3000);
+        assert_eq!(options.get_first_retry_max_delay(), 100);
+        assert_eq!(options.get_retry_delay(), 4000);
+    }
