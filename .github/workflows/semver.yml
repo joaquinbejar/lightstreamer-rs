@@ -30,6 +30,6 @@ jobs:
       - name: Check semver
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          package: optionstratlib
+          package: lightstreamer-rs
           feature-group: all-features
           rust-toolchain: stable
