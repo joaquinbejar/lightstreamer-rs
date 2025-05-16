@@ -21,8 +21,6 @@ release:
 .PHONY: test
 test:
 	LOGLEVEL=WARN cargo test
-	LOGLEVEL=WARN cargo test --features plotly
-	LOGLEVEL=WARN cargo test --features kaleido plotly 
 
 # Format the code
 .PHONY: fmt

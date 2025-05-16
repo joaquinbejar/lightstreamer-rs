@@ -3,6 +3,6 @@
 
 pub mod subscription;
 
-mod utils;
-mod client;
+pub mod utils;
+pub mod client;
 mod connection;

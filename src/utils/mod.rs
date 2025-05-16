@@ -8,6 +8,9 @@ pub mod error;
 mod proxy;
 mod util;
 
+mod logger;
+
 pub use proxy::Proxy;
 pub(crate) use util::{clean_message,parse_arguments};
 pub use error::{IllegalArgumentException, IllegalStateException};
+pub use logger::{setup_logger, setup_logger_with_level};

@@ -9,4 +9,5 @@ mod message_listener;
 
 mod client;
 
-pub(crate) use client::{ClientListener, Transport};
+pub(crate) use client::ClientListener;
+pub use client::{ Transport, LightstreamerClient};

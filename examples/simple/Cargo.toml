@@ -1,0 +1,10 @@
+[package]
+name = "simple"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lightstreamer-rs = { path = "../.." }
+tokio = { version = "1.45.0", features = ["sync", "macros", "rt-multi-thread", "time"] }
+signal-hook = "0"
+colored = "3.0.0"

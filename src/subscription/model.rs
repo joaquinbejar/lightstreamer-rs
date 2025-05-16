@@ -117,7 +117,7 @@ impl Subscription {
             return Err("Items and fields must be provided".to_string().into());
         }
 
-        let (id_sender, id_receiver) = channel(0);
+        let (id_sender, id_receiver) = channel(1);
 
         Ok(Subscription {
             mode,

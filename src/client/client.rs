@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
+    mpsc::{ Receiver, Sender},
     Notify,
 };
 use tokio::sync::mpsc::channel;
@@ -1259,12 +1259,13 @@ impl LightstreamerClient {
     ///   values.
     ///
     /// See also `unsubscribe()`
-    pub fn subscribe(subscription_sender: Sender<SubscriptionRequest>, subscription: Subscription) {
+    pub async fn subscribe(subscription_sender: Sender<SubscriptionRequest>, subscription: Subscription) {
         subscription_sender
             .send(SubscriptionRequest {
                 subscription: Some(subscription),
                 subscription_id: None,
             })
+            .await
             .unwrap()
     }
 
@@ -1281,6 +1282,22 @@ impl LightstreamerClient {
         subscription_sender: Sender<SubscriptionRequest>,
         subscription: Subscription,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        // First, get a reference to the id_receiver
+        let id = subscription.id;
+
+        // Send the subscription
+        LightstreamerClient::subscribe(subscription_sender, subscription).await;
+
+        // Return the subscription ID directly
+        Ok(id)
+    }
+    
+    /*
+    
+        pub async fn subscribe_get_id(
+        subscription_sender: Sender<SubscriptionRequest>,
+        subscription: Subscription,
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let mut id_receiver = subscription.id_receiver.clone();
         LightstreamerClient::subscribe(subscription_sender.clone(), subscription);
 
@@ -1291,6 +1308,7 @@ impl LightstreamerClient {
             ))),
         }
     }
+     */
 
     /// Operation method that removes a `Subscription` that is currently in the "active" state.
     ///
@@ -1309,7 +1327,7 @@ impl LightstreamerClient {
     /// * `subsrciption_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
     /// * `subscription_id`: The id of the subscription to be unsubscribed from.
     ///   instance.
-    pub fn unsubscribe(
+    pub async fn unsubscribe(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription_id: usize,
     ) {
@@ -1318,6 +1336,7 @@ impl LightstreamerClient {
                 subscription: None,
                 subscription_id: Some(subscription_id),
             })
+            .await
             .unwrap()
     }
 
