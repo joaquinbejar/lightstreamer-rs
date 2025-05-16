@@ -1501,22 +1501,23 @@ mod tests {
         assert!(debug_string.contains("forced_transport"));
         assert!(debug_string.contains("http_extra_headers"));
     }
-}
-#[test]
-fn test_combined_settings() {
-    let mut options = ConnectionOptions::new();
 
-    // Test multiple settings together
-    options.set_keepalive_interval(5000).unwrap();
-    options.set_stalled_timeout(2000).unwrap();
-    options.set_reconnect_timeout(3000).unwrap();
-    options.set_first_retry_max_delay(100).unwrap();
-    options.set_retry_delay(4000).unwrap();
+    #[test]
+    fn test_combined_settings() {
+        let mut options = ConnectionOptions::new();
 
-    // Verify all settings were applied correctly
-    assert_eq!(options.get_keepalive_interval(), 5000);
-    assert_eq!(options.get_stalled_timeout(), 2000);
-    assert_eq!(options.get_reconnect_timeout(), 3000);
-    assert_eq!(options.get_first_retry_max_delay(), 100);
-    assert_eq!(options.get_retry_delay(), 4000);
+        // Test multiple settings together
+        options.set_keepalive_interval(5000).unwrap();
+        options.set_stalled_timeout(2000).unwrap();
+        options.set_reconnect_timeout(3000).unwrap();
+        options.set_first_retry_max_delay(100).unwrap();
+        options.set_retry_delay(4000).unwrap();
+
+        // Verify all settings were applied correctly
+        assert_eq!(options.get_keepalive_interval(), 5000);
+        assert_eq!(options.get_stalled_timeout(), 2000);
+        assert_eq!(options.get_reconnect_timeout(), 3000);
+        assert_eq!(options.get_first_retry_max_delay(), 100);
+        assert_eq!(options.get_retry_delay(), 4000);
+    }
 }
