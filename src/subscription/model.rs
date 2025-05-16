@@ -20,8 +20,8 @@ impl Default for &Snapshot {
     }
 }
 
-impl std::fmt::Display for Snapshot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Snapshot::Yes => write!(f, "true"),
             Snapshot::No => write!(f, "false"),
@@ -40,8 +40,8 @@ pub enum SubscriptionMode {
     Command,
 }
 
-impl std::fmt::Display for SubscriptionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SubscriptionMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             SubscriptionMode::Merge => write!(f, "MERGE"),
             SubscriptionMode::Distinct => write!(f, "DISTINCT"),

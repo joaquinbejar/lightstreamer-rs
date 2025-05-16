@@ -53,23 +53,3 @@ async fn main() {
     client.connect(None).await.unwrap();
 }
 ```
-
-For a more advanced example of how to use the SDK to subscribe to item updates, refer to the main.rs file in the project source code. It demonstrates creating a Lightstreamer client, setting up subscriptions, handling item updates, and managing the connection lifecycle with a configurable number of connection attempts.
-
-For more details on using the SDK, please refer to the reference documentation.
-
-## Documentation
-
-The full SDK documentation is available at [docs.rs](https://docs.rs/lightstreamer-rs).
-
-## Project Structure
-
-Although this SDK does not provide a complete implementation of the Lightstreamer protocol, it has been built with a solid structure and scaffolding, similar to the official Lightstreamer libraries. The code is documented, and the project is designed to facilitate contributions from the community to add support for missing features.
-
-## License
-
-This project is licensed under the GPL-3.0 License. See the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome. Please open an issue or submit a pull request to propose changes and help complete the SDK with additional Lightstreamer features.
