@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::fmt::{self, Debug, Formatter};
 use crate::client::Transport;
 use crate::utils::{IllegalArgumentException, Proxy};
+use std::collections::HashMap;
+use std::fmt::{self, Debug, Formatter};
 
 /// Used by LightstreamerClient to provide an extra connection properties data object.
 /// Data struct that contains the policy settings used to connect to a Lightstreamer Server.
@@ -1238,16 +1238,25 @@ mod tests {
 
         // Test setting different transport types
         options.set_forced_transport(Some(Transport::WsStreaming));
-        assert_eq!(options.get_forced_transport(), Some(&Transport::WsStreaming));
+        assert_eq!(
+            options.get_forced_transport(),
+            Some(&Transport::WsStreaming)
+        );
 
         options.set_forced_transport(Some(Transport::HttpStreaming));
-        assert_eq!(options.get_forced_transport(), Some(&Transport::HttpStreaming));
+        assert_eq!(
+            options.get_forced_transport(),
+            Some(&Transport::HttpStreaming)
+        );
 
         options.set_forced_transport(Some(Transport::WsPolling));
         assert_eq!(options.get_forced_transport(), Some(&Transport::WsPolling));
 
         options.set_forced_transport(Some(Transport::HttpPolling));
-        assert_eq!(options.get_forced_transport(), Some(&Transport::HttpPolling));
+        assert_eq!(
+            options.get_forced_transport(),
+            Some(&Transport::HttpPolling)
+        );
 
         options.set_forced_transport(Some(Transport::Ws));
         assert_eq!(options.get_forced_transport(), Some(&Transport::Ws));
@@ -1429,10 +1438,10 @@ mod tests {
         assert_eq!(options.get_stalled_timeout(), 1000);
         assert!(options.set_stalled_timeout(0).is_err());
         assert!(options.set_stalled_timeout(6000).is_err());
-        
+
         options.set_reconnect_timeout(2000).unwrap();
-        assert!(options.set_stalled_timeout(1500).is_ok()); 
-        assert!(options.set_stalled_timeout(2500).is_err()); 
+        assert!(options.set_stalled_timeout(1500).is_ok());
+        assert!(options.set_stalled_timeout(2500).is_err());
     }
 
     #[test]
@@ -1469,7 +1478,10 @@ mod tests {
 
         // Test setting value
         options.set_supported_diffs(Some("TLCP-diff,JSON-patch".to_string()));
-        assert_eq!(options.get_supported_diffs().unwrap(), "TLCP-diff,JSON-patch");
+        assert_eq!(
+            options.get_supported_diffs().unwrap(),
+            "TLCP-diff,JSON-patch"
+        );
 
         // Test setting None
         options.set_supported_diffs(None);

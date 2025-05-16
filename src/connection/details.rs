@@ -1,7 +1,7 @@
-use std::error::Error;
-use std::fmt::{self, Debug, Formatter};
 use crate::client::ClientListener;
 use crate::utils::IllegalArgumentException;
+use std::error::Error;
+use std::fmt::{self, Debug, Formatter};
 
 /// Used by `LightstreamerClient` to provide a basic connection properties data object.
 ///
@@ -380,7 +380,6 @@ impl Debug for ConnectionDetails {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,7 +404,9 @@ mod tests {
 
     impl ClientListener for MockClientListener {
         fn on_property_change(&self, property: &str) {
-            self.property_changes.borrow_mut().push(property.to_string());
+            self.property_changes
+                .borrow_mut()
+                .push(property.to_string());
         }
     }
 
@@ -420,32 +421,29 @@ mod tests {
         );
         assert!(result.is_ok());
         let details = result.unwrap();
-        assert_eq!(details.get_server_address().unwrap(), "http://test.lightstreamer.com");
+        assert_eq!(
+            details.get_server_address().unwrap(),
+            "http://test.lightstreamer.com"
+        );
         assert_eq!(details.get_adapter_set().unwrap(), "DEMO");
         assert_eq!(details.get_user().unwrap(), "user1");
         assert_eq!(details.get_password().unwrap(), "pass1");
 
         // Test with only mandatory values
-        let result = ConnectionDetails::new(
-            Some("http://test.lightstreamer.com"),
-            None,
-            None,
-            None,
-        );
+        let result =
+            ConnectionDetails::new(Some("http://test.lightstreamer.com"), None, None, None);
         assert!(result.is_ok());
         let details = result.unwrap();
-        assert_eq!(details.get_server_address().unwrap(), "http://test.lightstreamer.com");
+        assert_eq!(
+            details.get_server_address().unwrap(),
+            "http://test.lightstreamer.com"
+        );
         assert_eq!(details.get_adapter_set().unwrap(), "DEFAULT"); // Default value
         assert_eq!(details.get_user(), None);
         assert_eq!(details.get_password(), None);
 
         // Test with invalid server address
-        let result = ConnectionDetails::new(
-            Some("invalid-url"),
-            None,
-            None,
-            None,
-        );
+        let result = ConnectionDetails::new(Some("invalid-url"), None, None, None);
         assert!(result.is_err());
     }
 
@@ -454,19 +452,44 @@ mod tests {
         let mut details = ConnectionDetails::default();
 
         // Test valid HTTP URL
-        assert!(details.set_server_address(Some("http://test.lightstreamer.com".to_string())).is_ok());
-        assert_eq!(details.get_server_address().unwrap(), "http://test.lightstreamer.com");
+        assert!(
+            details
+                .set_server_address(Some("http://test.lightstreamer.com".to_string()))
+                .is_ok()
+        );
+        assert_eq!(
+            details.get_server_address().unwrap(),
+            "http://test.lightstreamer.com"
+        );
 
         // Test valid HTTPS URL
-        assert!(details.set_server_address(Some("https://test.lightstreamer.com".to_string())).is_ok());
-        assert_eq!(details.get_server_address().unwrap(), "https://test.lightstreamer.com");
+        assert!(
+            details
+                .set_server_address(Some("https://test.lightstreamer.com".to_string()))
+                .is_ok()
+        );
+        assert_eq!(
+            details.get_server_address().unwrap(),
+            "https://test.lightstreamer.com"
+        );
 
         // Test with port
-        assert!(details.set_server_address(Some("https://test.lightstreamer.com:8080".to_string())).is_ok());
-        assert_eq!(details.get_server_address().unwrap(), "https://test.lightstreamer.com:8080");
+        assert!(
+            details
+                .set_server_address(Some("https://test.lightstreamer.com:8080".to_string()))
+                .is_ok()
+        );
+        assert_eq!(
+            details.get_server_address().unwrap(),
+            "https://test.lightstreamer.com:8080"
+        );
 
         // Test invalid URL (missing http:// or https://)
-        assert!(details.set_server_address(Some("test.lightstreamer.com".to_string())).is_err());
+        assert!(
+            details
+                .set_server_address(Some("test.lightstreamer.com".to_string()))
+                .is_err()
+        );
 
         // Test None value
         assert!(details.set_server_address(None).is_ok());
@@ -516,7 +539,11 @@ mod tests {
         details.add_listener(listener);
 
         // Change server address and verify notification
-        assert!(details.set_server_address(Some("http://test.lightstreamer.com".to_string())).is_ok());
+        assert!(
+            details
+                .set_server_address(Some("http://test.lightstreamer.com".to_string()))
+                .is_ok()
+        );
 
         // Change adapter set and verify notification
         details.set_adapter_set(Some("TEST_ADAPTER".to_string()));

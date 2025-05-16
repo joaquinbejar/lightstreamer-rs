@@ -1,10 +1,21 @@
 use std::error::Error;
 use std::fmt;
 
+/// Exception thrown when an illegal or inappropriate argument is passed to a method.
+///
+/// This exception indicates that a method has been passed an illegal or inappropriate argument.
+/// It is similar to Java's IllegalArgumentException.
 #[derive(Debug)]
 pub struct IllegalArgumentException(String);
 
 impl IllegalArgumentException {
+    /// Creates a new IllegalArgumentException with the specified detail message.
+    ///
+    /// # Arguments
+    /// * `msg` - The detail message explaining the reason for the exception
+    ///
+    /// # Returns
+    /// A new IllegalArgumentException instance with the specified message
     pub fn new(msg: &str) -> IllegalArgumentException {
         IllegalArgumentException(msg.to_string())
     }
@@ -22,12 +33,24 @@ impl Error for IllegalArgumentException {
     }
 }
 
+/// Exception thrown when a method is invoked at an illegal or inappropriate time.
+///
+/// This exception indicates that a method has been invoked at an inappropriate time
+/// or that the object is in an inappropriate state for the requested operation.
+/// It is similar to Java's IllegalStateException.
 #[derive(Debug)]
 pub struct IllegalStateException {
     details: String,
 }
 
 impl IllegalStateException {
+    /// Creates a new IllegalStateException with the specified detail message.
+    ///
+    /// # Arguments
+    /// * `msg` - The detail message explaining the reason for the exception
+    ///
+    /// # Returns
+    /// A new IllegalStateException instance with the specified message
     pub fn new(msg: &str) -> IllegalStateException {
         IllegalStateException {
             details: msg.to_string(),
@@ -46,7 +69,6 @@ impl Error for IllegalStateException {
         &self.details
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -150,7 +172,9 @@ mod tests {
         // Function that returns different error types based on input
         fn may_fail(value: i32) -> Result<(), Box<dyn Error>> {
             if value < 0 {
-                Err(Box::new(IllegalArgumentException::new("Value cannot be negative")))
+                Err(Box::new(IllegalArgumentException::new(
+                    "Value cannot be negative",
+                )))
             } else if value > 100 {
                 Err(Box::new(IllegalStateException::new("Value too large")))
             } else {

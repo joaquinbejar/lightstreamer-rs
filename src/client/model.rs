@@ -1,8 +1,8 @@
 /******************************************************************************
-    Author: Joaquín Béjar García
-    Email: jb@taunais.com 
-    Date: 16/5/25
- ******************************************************************************/
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 16/5/25
+******************************************************************************/
 
 /// Represents the current status of the `LightstreamerClient`.
 pub enum ClientStatus {
@@ -51,10 +51,16 @@ pub enum LogType {
 ///   the client will not connect at all.
 #[derive(Debug, PartialEq)]
 pub enum Transport {
+    /// WebSocket transport with Stream-Sense algorithm enabled. The client will only use WebSocket-based connections.
     Ws,
+    /// HTTP transport with Stream-Sense algorithm enabled. The client will only use HTTP-based connections.
     Http,
+    /// WebSocket Streaming transport with Stream-Sense algorithm disabled. The client will only connect on Streaming over WebSocket.
     WsStreaming,
+    /// HTTP Streaming transport with Stream-Sense algorithm disabled. The client will only connect on Streaming over HTTP.
     HttpStreaming,
+    /// WebSocket Polling transport with Stream-Sense algorithm disabled. The client will only connect on Polling over WebSocket.
     WsPolling,
+    /// HTTP Polling transport with Stream-Sense algorithm disabled. The client will only connect on Polling over HTTP.
     HttpPolling,
 }

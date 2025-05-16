@@ -2,7 +2,7 @@
 <img src="https://raw.githubusercontent.com/joaquinbejar/lightstreamer-rs/refs/heads/main/doc/images/logo.png" alt="lightstreamer-rs" style="width: 100%; height: 100%;">
 </div>
 
-[![Dual License](https://img.shields.io/badge/license-MIT%20and%20Apache%202.0-blue)](./LICENSE)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/lightstreamer-rs.svg)](https://crates.io/crates/lightstreamer-rs)
 [![Downloads](https://img.shields.io/crates/d/lightstreamer-rs.svg)](https://crates.io/crates/lightstreamer-rs)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/lightstreamer-rs.svg)](https://github.com/joaquinbejar/lightstreamer-rs/stargazers)

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Contains all the information related to an update of the field values for an item.
 /// It reports all the new values of the fields.
@@ -24,10 +24,15 @@ use serde::Serialize;
 ///   length would be required.
 #[derive(Debug, Clone, Serialize)]
 pub struct ItemUpdate {
+    /// The name of the item to which this update belongs. May be None if the item was subscribed to by position only.
     pub item_name: Option<String>,
+    /// The position of the item in the subscription item list to which this update belongs.
     pub item_pos: usize,
+    /// A map containing the current values for all fields in this update.
     pub fields: HashMap<String, Option<String>>,
+    /// A map containing only the fields that have changed in this update.
     pub changed_fields: HashMap<String, String>,
+    /// Flag indicating whether this update is part of a snapshot (initial state) or a real-time update.
     pub is_snapshot: bool,
 }
 

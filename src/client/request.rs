@@ -1,8 +1,8 @@
 /******************************************************************************
-    Author: Joaquín Béjar García
-    Email: jb@taunais.com 
-    Date: 16/5/25
- ******************************************************************************/
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 16/5/25
+******************************************************************************/
 use crate::subscription::Subscription;
 
 pub struct SubscriptionRequest {

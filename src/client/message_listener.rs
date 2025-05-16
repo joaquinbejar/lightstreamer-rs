@@ -230,12 +230,18 @@ mod tests {
 
         // Verify that the method was called and the parameters were stored correctly
         assert!(listener.was_on_abort_called());
-        assert_eq!(listener.get_on_abort_message(), Some("Test message".to_string()));
+        assert_eq!(
+            listener.get_on_abort_message(),
+            Some("Test message".to_string())
+        );
         assert!(listener.was_sent_on_network());
 
         // Test with different parameters
         listener.on_abort("Another message", false);
-        assert_eq!(listener.get_on_abort_message(), Some("Another message".to_string()));
+        assert_eq!(
+            listener.get_on_abort_message(),
+            Some("Another message".to_string())
+        );
         assert!(!listener.was_sent_on_network());
     }
 
@@ -248,15 +254,24 @@ mod tests {
 
         // Verify that the method was called and the parameters were stored correctly
         assert!(listener.was_on_deny_called());
-        assert_eq!(listener.get_on_deny_message(), Some("Test message".to_string()));
+        assert_eq!(
+            listener.get_on_deny_message(),
+            Some("Test message".to_string())
+        );
         assert_eq!(listener.get_on_deny_code(), 123);
         assert_eq!(listener.get_on_deny_error(), Some("Test error".to_string()));
 
         // Test with different parameters
         listener.on_deny("Another message", -1, "Another error");
-        assert_eq!(listener.get_on_deny_message(), Some("Another message".to_string()));
+        assert_eq!(
+            listener.get_on_deny_message(),
+            Some("Another message".to_string())
+        );
         assert_eq!(listener.get_on_deny_code(), -1);
-        assert_eq!(listener.get_on_deny_error(), Some("Another error".to_string()));
+        assert_eq!(
+            listener.get_on_deny_error(),
+            Some("Another error".to_string())
+        );
     }
 
     #[test]
@@ -268,11 +283,17 @@ mod tests {
 
         // Verify that the method was called and the parameters were stored correctly
         assert!(listener.was_on_discarded_called());
-        assert_eq!(listener.get_on_discarded_message(), Some("Test message".to_string()));
+        assert_eq!(
+            listener.get_on_discarded_message(),
+            Some("Test message".to_string())
+        );
 
         // Test with different parameters
         listener.on_discarded("Another message");
-        assert_eq!(listener.get_on_discarded_message(), Some("Another message".to_string()));
+        assert_eq!(
+            listener.get_on_discarded_message(),
+            Some("Another message".to_string())
+        );
     }
 
     #[test]
@@ -284,11 +305,17 @@ mod tests {
 
         // Verify that the method was called and the parameters were stored correctly
         assert!(listener.was_on_error_called());
-        assert_eq!(listener.get_on_error_message(), Some("Test message".to_string()));
+        assert_eq!(
+            listener.get_on_error_message(),
+            Some("Test message".to_string())
+        );
 
         // Test with different parameters
         listener.on_error("Another message");
-        assert_eq!(listener.get_on_error_message(), Some("Another message".to_string()));
+        assert_eq!(
+            listener.get_on_error_message(),
+            Some("Another message".to_string())
+        );
     }
 
     #[test]
@@ -300,12 +327,21 @@ mod tests {
 
         // Verify that the method was called and the parameters were stored correctly
         assert!(listener.was_on_processed_called());
-        assert_eq!(listener.get_on_processed_message(), Some("Test message".to_string()));
-        assert_eq!(listener.get_on_processed_response(), Some("Test response".to_string()));
+        assert_eq!(
+            listener.get_on_processed_message(),
+            Some("Test message".to_string())
+        );
+        assert_eq!(
+            listener.get_on_processed_response(),
+            Some("Test response".to_string())
+        );
 
         // Test with a None response
         listener.on_processed("Another message", None);
-        assert_eq!(listener.get_on_processed_message(), Some("Another message".to_string()));
+        assert_eq!(
+            listener.get_on_processed_message(),
+            Some("Another message".to_string())
+        );
         assert_eq!(listener.get_on_processed_response(), None);
     }
 

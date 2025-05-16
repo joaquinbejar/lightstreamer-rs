@@ -93,14 +93,20 @@ mod tests {
         fn test_clean_message_preserve_braces_content() {
             let text = "Message with {Preserved\nContent} and not preserved\nContent";
             let result = clean_message(text);
-            assert_eq!(result, "message with {preservedcontent} and not preservedcontent");
+            assert_eq!(
+                result,
+                "message with {preservedcontent} and not preservedcontent"
+            );
         }
 
         #[test]
         fn test_clean_message_nested_braces() {
             let text = "Message with {Outer{Inner\nContent}Outer} and regular\nContent";
             let result = clean_message(text);
-            assert_eq!(result, "message with {outer{innercontent}outer} and regularcontent");
+            assert_eq!(
+                result,
+                "message with {outer{innercontent}outer} and regularcontent"
+            );
         }
 
         #[test]
@@ -188,7 +194,10 @@ mod tests {
             // TLCP protocol message example arguments
             let input = "CONOK,S8f4aec42c3c14ad0,50000,5000,*";
             let result = parse_arguments(input);
-            assert_eq!(result, vec!["CONOK", "S8f4aec42c3c14ad0", "50000", "5000", "*"]);
+            assert_eq!(
+                result,
+                vec!["CONOK", "S8f4aec42c3c14ad0", "50000", "5000", "*"]
+            );
 
             let input = "u,1,1,a|b|c";
             let result = parse_arguments(input);

@@ -269,13 +269,19 @@ mod tests {
     impl ClientListener for TestClientListener {
         fn on_property_change(&self, property: &str) {
             *self.on_property_change_called.lock().unwrap() = true;
-            self.property_changes.lock().unwrap().push(property.to_string());
+            self.property_changes
+                .lock()
+                .unwrap()
+                .push(property.to_string());
         }
 
         fn on_server_error(&self, code: i32, message: &str) {
             *self.on_server_error_called.lock().unwrap() = true;
             self.error_codes.lock().unwrap().push(code);
-            self.error_messages.lock().unwrap().push(message.to_string());
+            self.error_messages
+                .lock()
+                .unwrap()
+                .push(message.to_string());
         }
 
         fn on_status_change(&self, status: &str) {
@@ -352,7 +358,11 @@ mod tests {
         assert_eq!(listener.get_error_codes(), vec![1, 2, -1]);
         assert_eq!(
             listener.get_error_messages(),
-            vec!["Authentication error", "Adapter set not available", "Custom error"]
+            vec![
+                "Authentication error",
+                "Adapter set not available",
+                "Custom error"
+            ]
         );
     }
 

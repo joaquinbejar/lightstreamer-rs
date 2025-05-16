@@ -1,33 +1,33 @@
 use crate::subscription::{ItemUpdate, Snapshot, Subscription, SubscriptionMode};
 
+use crate::client::Transport;
+pub(crate) use crate::client::listener::ClientListener;
+use crate::client::message_listener::ClientMessageListener;
+use crate::client::model::{ClientStatus, DisconnectionType, LogType};
+use crate::client::request::SubscriptionRequest;
+use crate::client::utils::get_subscription_by_id;
+use crate::connection::{ConnectionDetails, ConnectionOptions};
+use crate::utils::{IllegalStateException, clean_message, parse_arguments};
 use cookie::Cookie;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
-use tokio::sync::{
-    mpsc::{ Receiver, Sender},
-    Notify,
-};
 use tokio::sync::mpsc::channel;
+use tokio::sync::{
+    Notify,
+    mpsc::{Receiver, Sender},
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
-        http::{HeaderName, HeaderValue, Request},
         Message,
+        http::{HeaderName, HeaderValue, Request},
     },
 };
-use tracing::{debug, error, info, instrument, trace, warn, Level};
+use tracing::{Level, debug, error, info, instrument, trace, warn};
 use url::Url;
-pub(crate) use crate::client::listener::ClientListener;
-use crate::client::message_listener::ClientMessageListener;
-use crate::client::model::{ClientStatus, DisconnectionType, LogType};
-use crate::client::request::SubscriptionRequest;
-use crate::client::Transport;
-use crate::client::utils::get_subscription_by_id;
-use crate::connection::{ConnectionDetails, ConnectionOptions};
-use crate::utils::{clean_message, parse_arguments, IllegalStateException};
 
 /// Facade class for the management of the communication to Lightstreamer Server. Used to provide
 /// configuration settings, event handlers, operations for the control of the connection lifecycle,
@@ -118,9 +118,20 @@ impl LightstreamerClient {
     //
     // Constants for WebSocket connection.
     //
+    /// WebSocket key used in the WebSocket handshake process.
+    /// This is a base64-encoded value that is used to establish the WebSocket connection.
     pub const SEC_WEBSOCKET_KEY: &'static str = "PNDUibe9ex7PnsrLbt0N4w==";
+
+    /// WebSocket protocol identifier for the TLCP protocol used by Lightstreamer.
+    /// This identifies the specific subprotocol used over the WebSocket connection.
     pub const SEC_WEBSOCKET_PROTOCOL: &'static str = "TLCP-2.4.0.lightstreamer.com";
+
+    /// WebSocket version used for the connection.
+    /// Version 13 is the standard version used in modern WebSocket implementations.
     pub const SEC_WEBSOCKET_VERSION: &'static str = "13";
+
+    /// WebSocket upgrade header value.
+    /// Used to indicate that the client wishes to upgrade from HTTP to WebSocket protocol.
     pub const SEC_WEBSOCKET_UPGRADE: &'static str = "websocket";
 
     /// A constant string representing the version of the TLCP protocol used by the library.
@@ -164,12 +175,12 @@ impl LightstreamerClient {
     }
 
     /// Packs s string with the necessary parameters for a subscription request.
-    /// 
+    ///
     /// # Parameters
-    /// 
+    ///
     /// * `subscription`: The subscription for which to get the parameters.
     /// * `request_id`: The request ID to use in the parameters.
-    /// 
+    ///
     fn get_subscription_params(
         subscription: &Subscription,
         request_id: usize,
@@ -232,7 +243,7 @@ impl LightstreamerClient {
 
         Ok(serde_urlencoded::to_string(&params)?)
     }
-    
+
     fn get_unsubscription_params(
         subscription_id: usize,
         request_id: usize,
@@ -283,7 +294,10 @@ impl LightstreamerClient {
     ///
     /// See also `ConnectionDetails.setServerAddress()`
     #[instrument]
-    pub async fn connect(&mut self, shutdown_signal: Arc<Notify>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn connect(
+        &mut self,
+        shutdown_signal: Arc<Notify>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Check if the server address is configured.
         if self.server_address.is_none() {
             return Err(Box::new(IllegalStateException::new(
@@ -643,10 +657,10 @@ impl LightstreamerClient {
                                                         {
                                                             continue;
                                                         }
-                                                        
+
                                                         payload = json;
                                                     }
-                                                    
+
                                                     if let Some(field_name) = subscription_fields.and_then(|fields| fields.get(field_index)) {
                                                         field_map.insert(field_name.to_string(), Some(payload.to_string()));
                                                     }
@@ -819,7 +833,7 @@ impl LightstreamerClient {
                         write_stream
                             .send(Message::Text(format!("control\r\n{}", encoded_params).into()))
                             .await?;
-                        
+
                         self.make_log( Level::INFO, &format!("Sent subscription request: '{}'", encoded_params) );
                     }
                     // Process unsubscription requests.
@@ -833,15 +847,15 @@ impl LightstreamerClient {
                                 return Err(err);
                             },
                         };
-                        
+
                         write_stream
                             .send(Message::Text(format!("control\r\n{}", encoded_params).into()))
                             .await?;
-                        
+
                         self.make_log( Level::INFO, &format!("Sent unsubscription request: '{}'", encoded_params) );
-                        
+
                         self.subscriptions.retain(|s| s.id != unsubscription_id);
-                        
+
                         if self.subscriptions.is_empty()
                         {
                             self.make_log( Level::INFO, "No more subscriptions, disconnecting" );
@@ -878,7 +892,7 @@ impl LightstreamerClient {
     #[instrument]
     pub async fn disconnect(&mut self) {
         // Implementation for disconnect
-        self.make_log( Level::INFO, "Disconnecting from Lightstreamer server" );
+        self.make_log(Level::INFO, "Disconnecting from Lightstreamer server");
     }
 
     /// Static inquiry method that can be used to share cookies between connections to the Server
@@ -1212,7 +1226,10 @@ impl LightstreamerClient {
     ///   values.
     ///
     /// See also `unsubscribe()`
-    pub async fn subscribe(subscription_sender: Sender<SubscriptionRequest>, subscription: Subscription) {
+    pub async fn subscribe(
+        subscription_sender: Sender<SubscriptionRequest>,
+        subscription: Subscription,
+    ) {
         subscription_sender
             .send(SubscriptionRequest {
                 subscription: Some(subscription),
@@ -1225,23 +1242,23 @@ impl LightstreamerClient {
     /// If you want to be able to unsubscribe from a subscription, you need to keep track of the id
     /// of the subscription. This blocking method allows you to wait for the id of the subscription
     /// to be returned.
-    /// 
+    ///
     /// # Parameters
-    /// 
+    ///
     /// * `subscription_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
     /// * `subscription`: A `Subscription` object, carrying all the information needed to process real-time
-    /// 
+    ///
     pub async fn subscribe_get_id(
         subscription_sender: Sender<SubscriptionRequest>,
         mut subscription: Subscription,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         // Extract the id_receiver before sending the subscription
         let mut id_receiver = subscription.id_receiver;
-        
+
         // Create a new channel for the subscription we're about to send
         let (_new_sender, new_receiver) = channel(1);
         subscription.id_receiver = new_receiver;
-        
+
         // Send the subscription
         LightstreamerClient::subscribe(subscription_sender, subscription).await;
 
@@ -1253,9 +1270,9 @@ impl LightstreamerClient {
             ))),
         }
     }
-    
+
     /*
-    
+
         pub async fn subscribe_get_id(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription: Subscription,
@@ -1379,7 +1396,7 @@ mod tests {
         fn with_shared_data(
             property_changes: Arc<Mutex<Vec<String>>>,
             status_changes: Arc<Mutex<Vec<String>>>,
-            server_errors: Arc<Mutex<Vec<(i32, String)>>>
+            server_errors: Arc<Mutex<Vec<(i32, String)>>>,
         ) -> Self {
             MockClientListener {
                 property_changes,
@@ -1387,13 +1404,14 @@ mod tests {
                 server_errors,
             }
         }
-
-
     }
 
     impl ClientListener for MockClientListener {
         fn on_property_change(&self, property: &str) {
-            self.property_changes.lock().unwrap().push(property.to_string());
+            self.property_changes
+                .lock()
+                .unwrap()
+                .push(property.to_string());
         }
 
         fn on_status_change(&self, status: &str) {
@@ -1401,7 +1419,10 @@ mod tests {
         }
 
         fn on_server_error(&self, code: i32, message: &str) {
-            self.server_errors.lock().unwrap().push((code, message.to_string()));
+            self.server_errors
+                .lock()
+                .unwrap()
+                .push((code, message.to_string()));
         }
     }
 
@@ -1437,7 +1458,7 @@ mod tests {
             let listener = MockClientListener::with_shared_data(
                 Arc::clone(&property_changes),
                 Arc::clone(&status_changes),
-                Arc::clone(&server_errors)
+                Arc::clone(&server_errors),
             );
 
             let mut client = LightstreamerClient::new(
@@ -1455,7 +1476,6 @@ mod tests {
                 server_errors,
             })
         }
-
     }
 
     #[test]
@@ -1468,7 +1488,10 @@ mod tests {
         );
         assert!(result.is_ok());
         let client = result.unwrap();
-        assert_eq!(client.server_address, Some("http://test.lightstreamer.com".to_string()));
+        assert_eq!(
+            client.server_address,
+            Some("http://test.lightstreamer.com".to_string())
+        );
         assert_eq!(client.adapter_set, Some("DEMO".to_string()));
         let result = LightstreamerClient::new(
             Some("http://test.lightstreamer.com"),
@@ -1478,21 +1501,17 @@ mod tests {
         );
         assert!(result.is_ok());
         let client = result.unwrap();
-        assert_eq!(client.connection_details.get_user(), Some(&"user1".to_string()));
-        assert_eq!(client.connection_details.get_password(), Some(&"pass1".to_string()));
-        let result = LightstreamerClient::new(
-            Some("invalid-url"),
-            Some("DEMO"),
-            None,
-            None,
+        assert_eq!(
+            client.connection_details.get_user(),
+            Some(&"user1".to_string())
         );
+        assert_eq!(
+            client.connection_details.get_password(),
+            Some(&"pass1".to_string())
+        );
+        let result = LightstreamerClient::new(Some("invalid-url"), Some("DEMO"), None, None);
         assert!(result.is_err());
-        let result = LightstreamerClient::new(
-            None,
-            Some("DEMO"),
-            None,
-            None,
-        );
+        let result = LightstreamerClient::new(None, Some("DEMO"), None, None);
         assert!(result.is_ok());
         let client = result.unwrap();
         assert_eq!(client.server_address, None);
@@ -1545,7 +1564,7 @@ mod tests {
         assert!(result.is_ok());
         let client = result.unwrap();
         match client.get_status() {
-            ClientStatus::Disconnected(DisconnectionType::WillRetry) => {},
+            ClientStatus::Disconnected(DisconnectionType::WillRetry) => {}
             _ => panic!("Expected initial status to be DISCONNECTED:WILL-RETRY"),
         }
     }
@@ -1562,16 +1581,10 @@ mod tests {
         let client = result.unwrap();
         assert_eq!(client.get_subscriptions().len(), 0);
     }
-    
 
     #[tokio::test]
     async fn test_connect_with_no_server_address() {
-        let result = LightstreamerClient::new(
-            None,
-            Some("DEMO"),
-            None,
-            None,
-        );
+        let result = LightstreamerClient::new(None, Some("DEMO"), None, None);
         assert!(result.is_ok());
         let mut client = result.unwrap();
         let shutdown_signal = Arc::new(Notify::new());
@@ -1594,7 +1607,9 @@ mod tests {
         let shutdown_signal = Arc::new(Notify::new());
         let result = client.connect(shutdown_signal).await;
         assert!(result.is_err());
-        client.connection_options.set_forced_transport(Some(Transport::WsStreaming));
+        client
+            .connection_options
+            .set_forced_transport(Some(Transport::WsStreaming));
     }
 
     #[test]
@@ -1603,12 +1618,13 @@ mod tests {
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string(), "item2".to_string()]),
             Some(vec!["field1".to_string(), "field2".to_string()]),
-        ).unwrap();
+        )
+        .unwrap();
 
         let params = LightstreamerClient::get_subscription_params(&subscription, 1);
         assert!(params.is_ok());
         let params_str = params.unwrap();
-        
+
         assert!(params_str.contains("LS_reqId=1"));
         assert!(params_str.contains("LS_op=add"));
         assert!(params_str.contains("LS_subId="));
@@ -1647,5 +1663,4 @@ mod tests {
         client.make_log(Level::INFO, "Test tracing log message");
         client.make_log(Level::DEBUG, "Test tracing debug message");
     }
-
 }

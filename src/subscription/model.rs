@@ -1,15 +1,19 @@
+use crate::subscription::SubscriptionListener;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::subscription::SubscriptionListener;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 /// Enum representing the snapshot delivery preferences to be requested to Lightstreamer Server for the items in the Subscription.
 #[derive(Debug, Default)]
 pub enum Snapshot {
+    /// Request the full snapshot for the subscribed items.
     Yes,
+    /// Do not request any snapshot for the subscribed items.
     No,
+    /// Request a snapshot with a specific length (number of updates).
     Number(usize),
+    /// Default value. No snapshot preference will be sent to the server.
     #[default]
     None,
 }
@@ -34,9 +38,13 @@ impl fmt::Display for Snapshot {
 /// Enum representing the subscription mode.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SubscriptionMode {
+    /// MERGE mode. The server sends an update for a specific item only if the state of at least one of the fields has changed.
     Merge,
+    /// DISTINCT mode. The server sends an update for an item every time new data for that item is available.
     Distinct,
+    /// RAW mode. The server forwards any update for an item that it receives, without performing any processing.
     Raw,
+    /// COMMAND mode. The server sends updates based on add, update, and delete commands.
     Command,
 }
 
@@ -937,8 +945,8 @@ impl Debug for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use crate::subscription::ItemUpdate;
+    use std::sync::{Arc, Mutex};
 
     struct MockSubscriptionListener {
         subscription_called: Arc<Mutex<bool>>,

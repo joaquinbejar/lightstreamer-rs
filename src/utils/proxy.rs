@@ -176,13 +176,7 @@ mod tests {
     #[test]
     fn test_proxy_with_ipv4_address() {
         // Crear un proxy con dirección IPv4
-        let proxy = Proxy::new(
-            ProxyType::Http,
-            "192.168.1.1".to_string(),
-            8080,
-            None,
-            None,
-        );
+        let proxy = Proxy::new(ProxyType::Http, "192.168.1.1".to_string(), 8080, None, None);
 
         assert_eq!(proxy.get_host(), "192.168.1.1");
     }

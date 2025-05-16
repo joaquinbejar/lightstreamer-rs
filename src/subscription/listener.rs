@@ -304,7 +304,7 @@ mod tests {
         on_real_max_frequency_called: Arc<Mutex<bool>>,
         item_name: Arc<Mutex<Option<String>>>,
         item_pos: Arc<Mutex<usize>>,
-        max_frequency: Arc<Mutex<Option<f64>>>
+        max_frequency: Arc<Mutex<Option<f64>>>,
     }
 
     impl TestSubscriptionListener {
@@ -318,7 +318,7 @@ mod tests {
                 on_real_max_frequency_called: Arc::new(Mutex::new(false)),
                 item_name: Arc::new(Mutex::new(None)),
                 item_pos: Arc::new(Mutex::new(0)),
-                max_frequency: Arc::new(Mutex::new(None))
+                max_frequency: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -361,7 +361,10 @@ mod tests {
         listener.on_clear_snapshot(Some("testItem"), 42);
 
         assert!(*listener.on_clear_snapshot_called.lock().unwrap());
-        assert_eq!(*listener.item_name.lock().unwrap(), Some("testItem".to_string()));
+        assert_eq!(
+            *listener.item_name.lock().unwrap(),
+            Some("testItem".to_string())
+        );
         assert_eq!(*listener.item_pos.lock().unwrap(), 42);
     }
 
@@ -372,7 +375,10 @@ mod tests {
         listener.on_end_of_snapshot(Some("testItem"), 42);
 
         assert!(*listener.on_end_of_snapshot_called.lock().unwrap());
-        assert_eq!(*listener.item_name.lock().unwrap(), Some("testItem".to_string()));
+        assert_eq!(
+            *listener.item_name.lock().unwrap(),
+            Some("testItem".to_string())
+        );
         assert_eq!(*listener.item_pos.lock().unwrap(), 42);
     }
 
@@ -434,10 +440,8 @@ mod tests {
     fn test_optional_methods_with_default_implementation() {
         struct MinimalListener;
 
-        impl SubscriptionListener for MinimalListener {
-        }
+        impl SubscriptionListener for MinimalListener {}
 
         let _listener = MinimalListener;
-
     }
 }
