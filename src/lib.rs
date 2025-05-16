@@ -1,18 +1,62 @@
 //! # Lightstreamer Rust Client
 //!
-//! This project is a partial implementation of the Lightstreamer TLCP (Text-based Live Connections Protocol) in Rust. It provides a client SDK to interact with Lightstreamer servers, focused on supporting the specific needs of the [ig_trading_api](https://github.com/joaquinbejar/ig_trading_api) project.
+//! This project is a Rust implementation of the Lightstreamer TLCP (Text-based Live Connections Protocol). It provides a robust client SDK to interact with Lightstreamer servers, enabling real-time data streaming for financial applications, IoT systems, and other use cases requiring live data updates. While it was initially developed to support the [ig_trading_api](https://github.com/joaquinbejar/ig_trading_api) project, it has evolved into a more comprehensive SDK with broader applicability.
+//!
+//! ## About Lightstreamer
+//!
+//! Lightstreamer is a high-performance real-time messaging server that provides several key features:
+//! - Real-time data streaming with optimized bandwidth usage
+//! - Support for various transport mechanisms (WebSockets, HTTP streaming, etc.)
+//! - Different subscription modes for various data delivery patterns
+//! - Robust connection management with automatic recovery
+//! - Scalable architecture for high-volume applications
 //!
 //! ## Features
 //!
-//! - Full-duplex WebSocket-based connection mode.
-//! - Subscriptions to items and item groups.
-//! - MERGE subscription mode.
-//! - Listening to connection events and messages.
-//! - Configuration of connection options and connection details.
-//! - Subscription lifecycle management.
-//! - Retrieval of real-time item updates.
+//! This Rust client SDK provides the following capabilities:
 //!
-//! Please note that this SDK currently does not support all the features and capabilities of the full Lightstreamer protocol. It has been developed to cover the requirements of the ig_trading_api project mentioned above. Features like other connection modes, subscription modes (DISTINCT, RAW, COMMAND), and some other advanced options are not implemented at this time.
+//! - **Connection Management**:
+//!   - Full-duplex WebSocket-based connection mode
+//!   - Automatic reconnection with configurable retry policies
+//!   - Session recovery after temporary disconnections
+//!   - Connection status monitoring and event notifications
+//!   - Proxy support for enterprise environments
+//!
+//! - **Subscription Capabilities**:
+//!   - Support for multiple subscription modes (MERGE, DISTINCT, COMMAND, RAW)
+//!   - Subscription to individual items or item groups
+//!   - Field schema definition for structured data
+//!   - Real-time item updates with change detection
+//!   - Snapshot support for initial state recovery
+//!
+//! - **Configuration Options**:
+//!   - Extensive connection options (polling intervals, timeouts, etc.)
+//!   - Bandwidth control and throttling
+//!   - Custom HTTP headers for authentication
+//!   - Logging configuration for debugging
+//!
+//! - **Event Handling**:
+//!   - Comprehensive event listener system
+//!   - Subscription lifecycle events (subscription, unsubscription)
+//!   - Item update notifications with field-level change detection
+//!   - Connection status change notifications
+//!   - Error handling and reporting
+//!
+//! ## Implementation Status
+//!
+//! The current implementation supports most core features of the Lightstreamer protocol, with a focus on the WebSocket transport mechanism and the MERGE subscription mode. While initially developed for specific trading API requirements, the library has expanded to include:
+//!
+//! - All subscription modes (MERGE, DISTINCT, COMMAND, RAW)
+//! - Robust error handling and recovery mechanisms
+//! - Comprehensive configuration options
+//! - Thread-safe asynchronous operation using Tokio
+//!
+//! Some advanced features that may be implemented in future versions include:
+//!
+//! - Message sending capabilities (MPN)
+//! - Client-side filtering and frequency limitations
+//! - Additional transport mechanisms beyond WebSockets
+//! - Enhanced security features
 //!
 //! ## Installation
 //!
@@ -20,7 +64,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lightstreamer-rs = "0.1.0"
+//! lightstreamer-rs = "0.1.1"
 //! ```
 //!
 //! ## Usage
