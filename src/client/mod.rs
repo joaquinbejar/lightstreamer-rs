@@ -12,6 +12,8 @@ mod model;
 mod request;
 mod utils;
 
-pub(crate) use implementation::ClientListener;
 pub use implementation::LightstreamerClient;
-pub use model::Transport;
+pub use listener::ClientListener;
+pub use message_listener::ClientMessageListener;
+pub use model::{ClientStatus, ConnectionType, DisconnectionType, LogType, Transport};
+pub use request::SubscriptionRequest;
