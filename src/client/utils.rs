@@ -25,7 +25,8 @@ mod tests {
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        ).unwrap();
+        )
+        .unwrap();
         subscription1.id = 1;
 
         // Create another test subscription with ID 2
@@ -33,7 +34,8 @@ mod tests {
             SubscriptionMode::Distinct,
             Some(vec!["item2".to_string()]),
             Some(vec!["field2".to_string()]),
-        ).unwrap();
+        )
+        .unwrap();
         subscription2.id = 2;
 
         // Create a vector of subscriptions
@@ -57,7 +59,8 @@ mod tests {
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        ).unwrap();
+        )
+        .unwrap();
         subscription.id = 1;
 
         // Create a vector with one subscription

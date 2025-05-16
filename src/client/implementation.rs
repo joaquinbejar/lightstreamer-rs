@@ -1663,7 +1663,7 @@ mod tests {
         client.make_log(Level::INFO, "Test tracing log message");
         client.make_log(Level::DEBUG, "Test tracing debug message");
     }
-    
+
     #[test]
     fn test_debug_implementation() {
         let result = LightstreamerClient::new(
@@ -1674,10 +1674,10 @@ mod tests {
         );
         assert!(result.is_ok());
         let client = result.unwrap();
-        
+
         // Test that Debug implementation works without panicking
         let debug_string = format!("{:?}", client);
-        
+
         // Verify it contains expected fields
         assert!(debug_string.contains("server_address"));
         assert!(debug_string.contains("adapter_set"));
@@ -1685,12 +1685,12 @@ mod tests {
         assert!(debug_string.contains("connection_options"));
         assert!(debug_string.contains("listeners"));
         assert!(debug_string.contains("subscriptions"));
-        
+
         // Verify the values are included
         assert!(debug_string.contains("http://test.lightstreamer.com"));
         assert!(debug_string.contains("DEMO"));
     }
-    
+
     #[test]
     #[should_panic(expected = "Implement mechanism to add cookies to LightstreamerClient")]
     fn test_add_cookies() {
@@ -1698,7 +1698,7 @@ mod tests {
         let cookie = Cookie::new("test_cookie", "test_value");
         LightstreamerClient::add_cookies("http://test.lightstreamer.com", &cookie);
     }
-    
+
     #[test]
     #[should_panic(expected = "not implemented")]
     fn test_get_cookies() {

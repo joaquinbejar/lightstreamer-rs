@@ -1308,29 +1308,33 @@ mod tests {
         assert!(!subscription.is_active());
         assert!(!subscription.is_subscribed());
     }
-    
+
     #[test]
     fn test_get_key_position() {
         // Create a COMMAND subscription with field_schema containing key
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
-            Some(vec!["key".to_string(), "command".to_string(), "field1".to_string()]),
+            Some(vec![
+                "key".to_string(),
+                "command".to_string(),
+                "field1".to_string(),
+            ]),
         )
         .unwrap();
-        
+
         // Set field_schema with key field
         subscription.field_schema = Some("key,command,field1".to_string());
-        
+
         // Not subscribed yet, should return None
         assert_eq!(subscription.get_key_position(), None);
-        
+
         // Mark as subscribed
         subscription.is_subscribed = true;
-        
+
         // Now it should return the position of key (0)
         assert_eq!(subscription.get_key_position(), Some(0));
-        
+
         // Test with a non-COMMAND subscription
         let mut non_command_subscription = Subscription::new(
             SubscriptionMode::Merge,
@@ -1338,13 +1342,13 @@ mod tests {
             Some(vec!["key".to_string(), "field1".to_string()]),
         )
         .unwrap();
-        
+
         non_command_subscription.field_schema = Some("key,field1".to_string());
         non_command_subscription.is_subscribed = true;
-        
+
         // Should return None for non-COMMAND subscription
         assert_eq!(non_command_subscription.get_key_position(), None);
-        
+
         // Test with COMMAND subscription but no key field
         let mut no_key_subscription = Subscription::new(
             SubscriptionMode::Command,
@@ -1352,36 +1356,40 @@ mod tests {
             Some(vec!["command".to_string(), "field1".to_string()]),
         )
         .unwrap();
-        
+
         no_key_subscription.field_schema = Some("command,field1".to_string());
         no_key_subscription.is_subscribed = true;
-        
+
         // Should return None when key field is not present
         assert_eq!(no_key_subscription.get_key_position(), None);
     }
-    
+
     #[test]
     fn test_get_command_position() {
         // Create a COMMAND subscription with field_schema containing command
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
-            Some(vec!["key".to_string(), "command".to_string(), "field1".to_string()]),
+            Some(vec![
+                "key".to_string(),
+                "command".to_string(),
+                "field1".to_string(),
+            ]),
         )
         .unwrap();
-        
+
         // Set field_schema with command field
         subscription.field_schema = Some("key,command,field1".to_string());
-        
+
         // Not subscribed yet, should return None
         assert_eq!(subscription.get_command_position(), None);
-        
+
         // Mark as subscribed
         subscription.is_subscribed = true;
-        
+
         // Now it should return the position of command (1)
         assert_eq!(subscription.get_command_position(), Some(1));
-        
+
         // Test with a non-COMMAND subscription
         let mut non_command_subscription = Subscription::new(
             SubscriptionMode::Merge,
@@ -1389,13 +1397,13 @@ mod tests {
             Some(vec!["command".to_string(), "field1".to_string()]),
         )
         .unwrap();
-        
+
         non_command_subscription.field_schema = Some("command,field1".to_string());
         non_command_subscription.is_subscribed = true;
-        
+
         // Should return None for non-COMMAND subscription
         assert_eq!(non_command_subscription.get_command_position(), None);
-        
+
         // Test with COMMAND subscription but no command field
         let mut no_command_subscription = Subscription::new(
             SubscriptionMode::Command,
@@ -1403,14 +1411,14 @@ mod tests {
             Some(vec!["key".to_string(), "field1".to_string()]),
         )
         .unwrap();
-        
+
         no_command_subscription.field_schema = Some("key,field1".to_string());
         no_command_subscription.is_subscribed = true;
-        
+
         // Should return None when command field is not present
         assert_eq!(no_command_subscription.get_command_position(), None);
     }
-    
+
     #[test]
     fn test_debug_implementation() {
         let subscription = Subscription::new(
@@ -1419,10 +1427,10 @@ mod tests {
             Some(vec!["field1".to_string()]),
         )
         .unwrap();
-        
+
         // Test that Debug implementation works without panicking
         let debug_string = format!("{:?}", subscription);
-        
+
         // Verify it contains some expected fields
         assert!(debug_string.contains("mode"));
         assert!(debug_string.contains("items"));
@@ -1430,7 +1438,7 @@ mod tests {
         assert!(debug_string.contains("is_active"));
         assert!(debug_string.contains("is_subscribed"));
     }
-    
+
     #[test]
     fn test_snapshot_display() {
         // Test the Display implementation for Snapshot
@@ -1439,7 +1447,7 @@ mod tests {
         assert_eq!(format!("{}", Snapshot::Number(5)), "5");
         assert_eq!(format!("{}", Snapshot::None), "");
     }
-    
+
     #[test]
     fn test_subscription_mode_display() {
         // Test the Display implementation for SubscriptionMode
@@ -1448,45 +1456,51 @@ mod tests {
         assert_eq!(format!("{}", SubscriptionMode::Command), "COMMAND");
         assert_eq!(format!("{}", SubscriptionMode::Raw), "RAW");
     }
-    
+
     #[test]
     fn test_snapshot_default() {
         // Test the Default implementation for &Snapshot
         let default_snapshot: &Snapshot = Default::default();
         assert!(matches!(default_snapshot, &Snapshot::None));
     }
-    
+
     #[test]
     fn test_get_command_value() {
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
-            Some(vec!["key".to_string(), "command".to_string(), "field1".to_string()]),
+            Some(vec![
+                "key".to_string(),
+                "command".to_string(),
+                "field1".to_string(),
+            ]),
         )
         .unwrap();
-        
+
         // Manually add some command values to test get_command_value
         let mut field_map = HashMap::new();
         field_map.insert(3, "test_value".to_string());
-        subscription.command_values.insert("1_test_key".to_string(), field_map);
-        
+        subscription
+            .command_values
+            .insert("1_test_key".to_string(), field_map);
+
         // Test getting an existing value
         let value = subscription.get_command_value(1, "test_key", 3);
         assert_eq!(value, Some(&"test_value".to_string()));
-        
+
         // Test getting a non-existent key
         let value = subscription.get_command_value(1, "non_existent_key", 3);
         assert_eq!(value, None);
-        
+
         // Test getting a non-existent field position
         let value = subscription.get_command_value(1, "test_key", 4);
         assert_eq!(value, None);
-        
+
         // Test getting a non-existent item position
         let value = subscription.get_command_value(2, "test_key", 3);
         assert_eq!(value, None);
     }
-    
+
     #[test]
     fn test_set_requested_buffer_size_with_unlimited() {
         let mut subscription = Subscription::new(
@@ -1495,13 +1509,13 @@ mod tests {
             Some(vec!["field1".to_string()]),
         )
         .unwrap();
-        
+
         // Test setting buffer size to "unlimited"
         let result = subscription.set_requested_buffer_size(None);
         assert!(result.is_ok());
         assert_eq!(subscription.get_requested_buffer_size(), None);
     }
-    
+
     #[test]
     fn test_command_second_level_field_methods_with_invalid_inputs() {
         // Test with non-COMMAND subscription
@@ -1511,17 +1525,19 @@ mod tests {
             Some(vec!["field1".to_string()]),
         )
         .unwrap();
-        
+
         // Test set_command_second_level_fields with invalid subscription mode
-        let result = non_command_subscription.set_command_second_level_fields(Some(vec!["field1".to_string()]));
+        let result = non_command_subscription
+            .set_command_second_level_fields(Some(vec!["field1".to_string()]));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Subscription mode is not Command");
-        
+
         // Test set_command_second_level_field_schema with invalid subscription mode
-        let result = non_command_subscription.set_command_second_level_field_schema(Some("field1".to_string()));
+        let result = non_command_subscription
+            .set_command_second_level_field_schema(Some("field1".to_string()));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Subscription mode is not Command");
-        
+
         // Test with COMMAND subscription but active
         let mut command_subscription = Subscription::new(
             SubscriptionMode::Command,
@@ -1529,21 +1545,23 @@ mod tests {
             Some(vec!["field1".to_string()]),
         )
         .unwrap();
-        
+
         // Make the subscription active
         command_subscription.is_active = true;
-        
+
         // Test set_command_second_level_fields with active subscription
-        let result = command_subscription.set_command_second_level_fields(Some(vec!["field1".to_string()]));
+        let result =
+            command_subscription.set_command_second_level_fields(Some(vec!["field1".to_string()]));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Subscription is active");
-        
+
         // Test set_command_second_level_field_schema with active subscription
-        let result = command_subscription.set_command_second_level_field_schema(Some("field1".to_string()));
+        let result =
+            command_subscription.set_command_second_level_field_schema(Some("field1".to_string()));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Subscription is active");
     }
-    
+
     #[test]
     fn test_set_data_adapter_with_invalid_inputs() {
         let mut subscription = Subscription::new(
@@ -1552,16 +1570,16 @@ mod tests {
             Some(vec!["field1".to_string()]),
         )
         .unwrap();
-        
+
         // Make the subscription active
         subscription.is_active = true;
-        
+
         // Test set_data_adapter with active subscription
         let result = subscription.set_data_adapter(Some("adapter1".to_string()));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Subscription is active");
     }
-    
+
     #[test]
     fn test_set_selector_with_invalid_inputs() {
         let mut subscription = Subscription::new(
@@ -1570,10 +1588,10 @@ mod tests {
             Some(vec!["field1".to_string()]),
         )
         .unwrap();
-        
+
         // Make the subscription active
         subscription.is_active = true;
-        
+
         // Test set_selector with active subscription
         let result = subscription.set_selector(Some("selector1".to_string()));
         assert!(result.is_err());

@@ -210,7 +210,7 @@ mod tests {
 
         // Test source method (should be None since we don't have a cause)
         assert!(error.source().is_none());
-        
+
         // Test description method directly
         assert_eq!(arg_exception.to_string(), "Test error");
 
@@ -220,7 +220,7 @@ mod tests {
 
         // Test source method (should be None since we don't have a cause)
         assert!(error.source().is_none());
-        
+
         // Test description method directly
         assert_eq!(state_exception.to_string(), "Test state error");
     }

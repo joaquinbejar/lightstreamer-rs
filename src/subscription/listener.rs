@@ -444,71 +444,75 @@ mod tests {
 
         let _listener = MinimalListener;
     }
-    
+
     #[test]
     #[should_panic(expected = "Implement on_clear_snapshot method for SubscriptionListener.")]
     fn test_default_on_clear_snapshot_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_clear_snapshot(Some("item"), 1);
     }
-    
+
     #[test]
-    #[should_panic(expected = "Implement on_command_second_level_item_lost_updates method for SubscriptionListener.")]
+    #[should_panic(
+        expected = "Implement on_command_second_level_item_lost_updates method for SubscriptionListener."
+    )]
     fn test_default_on_command_second_level_item_lost_updates_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_command_second_level_item_lost_updates(5, "key");
     }
-    
+
     #[test]
-    #[should_panic(expected = "Implement on_command_second_level_subscription_error method for SubscriptionListener.")]
+    #[should_panic(
+        expected = "Implement on_command_second_level_subscription_error method for SubscriptionListener."
+    )]
     fn test_default_on_command_second_level_subscription_error_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_command_second_level_subscription_error(1, Some("error"), "key");
     }
-    
+
     #[test]
     #[should_panic(expected = "Implement on_end_of_snapshot method for SubscriptionListener.")]
     fn test_default_on_end_of_snapshot_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_end_of_snapshot(Some("item"), 1);
     }
-    
+
     #[test]
     #[should_panic(expected = "Implement on_item_lost_updates method for SubscriptionListener.")]
     fn test_default_on_item_lost_updates_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_item_lost_updates(Some("item"), 1, 5);
     }
-    
+
     #[test]
     #[should_panic(expected = "Implement on_item_update method for SubscriptionListener.")]
     fn test_default_on_item_update_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let listener = MinimalListener;
-        
+
         let mut fields = HashMap::new();
         fields.insert("field1".to_string(), Some("value1".to_string()));
-        
+
         let mut changed_fields = HashMap::new();
         changed_fields.insert("field1".to_string(), "value1".to_string());
-        
+
         let item_update = ItemUpdate {
             item_name: Some("testItem".to_string()),
             item_pos: 1,
@@ -516,30 +520,27 @@ mod tests {
             changed_fields,
             is_snapshot: false,
         };
-        
+
         listener.on_item_update(&item_update);
     }
-    
 
     #[test]
     #[should_panic(expected = "Implement on_real_max_frequency method for SubscriptionListener.")]
     fn test_default_on_real_max_frequency_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_real_max_frequency(Some(10.0));
     }
-    
 
     #[test]
     #[should_panic(expected = "Implement on_subscription_error method for SubscriptionListener.")]
     fn test_default_on_subscription_error_implementation() {
         struct MinimalListener;
         impl SubscriptionListener for MinimalListener {}
-        
+
         let mut listener = MinimalListener;
         listener.on_subscription_error(1, Some("error"));
     }
-    
 }
