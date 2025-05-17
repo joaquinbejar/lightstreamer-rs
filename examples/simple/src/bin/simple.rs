@@ -1,44 +1,13 @@
 
 use colored::*;
-use signal_hook::low_level::signal_name;
-use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::info;
 use lightstreamer_rs::subscription::{ItemUpdate, Snapshot, Subscription, SubscriptionListener, SubscriptionMode};
 use lightstreamer_rs::client::{LightstreamerClient, Transport};
-use lightstreamer_rs::utils::setup_logger;
+use lightstreamer_rs::utils::{setup_logger, setup_signal_hook};
 const MAX_CONNECTION_ATTEMPTS: u64 = 1;
-
-/// Sets up a signal hook for SIGINT and SIGTERM.
-///
-/// Creates a signal hook for the specified signals and spawns a thread to handle them.
-/// When a signal is received, it logs the signal name and performs cleanup before exiting with 0 code
-/// to indicate orderly shutdown.
-///
-/// # Arguments
-///
-/// * `full_path` - The full path to the application configuration file.
-///
-/// # Panics
-///
-/// The function panics if it fails to create the signal iterator.
-///
-async fn setup_signal_hook(shutdown_signal: Arc<Notify>) {
-    // Create a signal set of signals to be handled and a signal iterator to monitor them.
-    let signals = &[SIGINT, SIGTERM];
-    let mut signals_iterator = Signals::new(signals).expect("Failed to create signal iterator");
-
-    // Create a new thread to handle signals sent to the process
-    tokio::spawn(async move {
-        for signal in signals_iterator.forever() {
-            info!("Received signal: {}", signal_name(signal).unwrap());
-            shutdown_signal.notify_one();
-            break;
-        }
-    });
-}
 
 pub struct MySubscriptionListener {}
 

@@ -17,4 +17,4 @@ mod logger;
 pub use error::{IllegalArgumentException, IllegalStateException};
 pub use logger::{setup_logger, setup_logger_with_level};
 pub use proxy::Proxy;
-pub(crate) use util::{clean_message, parse_arguments};
+pub use util::{clean_message, parse_arguments, setup_signal_hook};

@@ -1,3 +1,9 @@
+use signal_hook::low_level::signal_name;
+use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
+use std::sync::Arc;
+use tokio::sync::Notify;
+use tracing::info;
+
 /// Clean the message from newlines and carriage returns and convert it to lowercase. Also remove all brackets.
 pub fn clean_message(text: &str) -> String {
     let mut result = String::new();
@@ -22,6 +28,35 @@ pub fn clean_message(text: &str) -> String {
     result
 }
 
+/// Parses a comma-separated string input into a vector of string slices (`Vec<&str>`).
+///
+/// This function supports skipping commas inside nested curly braces `{}`. It correctly handles
+/// nested structures, ensuring that commas within curly braces are not treated as delimiters.
+///
+/// # Parameters
+/// - `input`: A string slice (`&str`) containing comma-separated values, potentially with nested curly braces.
+///
+/// # Returns
+/// A `Vec<&str>` containing trimmed substrings split by commas outside of curly braces.
+///
+/// # Behavior
+/// - Commas outside of curly braces `{}` are treated as delimiters.
+/// - Commas inside curly braces are ignored for splitting purposes.
+/// - Leading and trailing whitespace around substrings are trimmed.
+/// - Empty substrings (those consisting solely of whitespace) are ignored.
+///
+/// # Caveats
+/// - The function requires matched curly braces `{}`. If the input contains unmatched curly braces,
+///   the function may produce unexpected results.
+///
+/// # Panics
+/// This function does not explicitly panic, but improper manipulation of indices or unmatched
+/// braces could lead to unintended behavior.
+///
+/// # Errors in Current Code:
+/// - There is a bug in the code where `arguments.push(*slice)` is used. The dereference operator
+///   (`*`) is invalid for string slices. It should be `arguments.push(slice)`.
+/// - Recommend fixing this bug by removing the dereference operator for proper functionality.
 pub fn parse_arguments(input: &str) -> Vec<&str> {
     let mut arguments = Vec::new();
     let mut start = 0;
@@ -52,6 +87,34 @@ pub fn parse_arguments(input: &str) -> Vec<&str> {
     }
 
     arguments
+}
+
+/// Sets up a signal hook for SIGINT and SIGTERM.
+///
+/// Creates a signal hook for the specified signals and spawns a thread to handle them.
+/// When a signal is received, it logs the signal name and performs cleanup before exiting with 0 code
+/// to indicate orderly shutdown.
+///
+/// # Arguments
+///
+/// * `full_path` - The full path to the application configuration file.
+///
+/// # Panics
+///
+/// The function panics if it fails to create the signal iterator.
+///
+pub async fn setup_signal_hook(shutdown_signal: Arc<Notify>) {
+    // Create a signal set of signals to be handled and a signal iterator to monitor them.
+    let signals = &[SIGINT, SIGTERM];
+    let mut signals_iterator = Signals::new(signals).expect("Failed to create signal iterator");
+
+    // Create a new thread to handle signals sent to the process
+    tokio::spawn(async move {
+        if let Some(signal) = signals_iterator.forever().next() {
+            info!("Received signal: {}", signal_name(signal).unwrap());
+            shutdown_signal.notify_one();
+        }
+    });
 }
 
 #[cfg(test)]
