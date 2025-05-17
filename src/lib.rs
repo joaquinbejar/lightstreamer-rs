@@ -64,7 +64,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lightstreamer-rs = "0.1.1"
+//! lightstreamer-rs = "0.1.2"
 //! ```
 //!
 //! ## Usage
@@ -84,14 +84,14 @@
 //!
 //! impl SubscriptionListener for MySubscriptionListener {
 //!     fn on_subscription(&self) {
-//!         println!("Subscription confirmed by the server");
+//!         info!("Subscription confirmed by the server");
 //!     }
 //!     
 //!     fn on_item_update(&self, update: ItemUpdate) {
-//!         println!("Received update for item: {}", update.get_item_name());
+//!         info!("Received update for item: {}", update.get_item_name());
 //!         for field in update.get_fields() {
 //!             if let Some(value) = update.get_value(field) {
-//!                 println!("  {} = {}", field, value);
+//!                 info!("  {} = {}", field, value);
 //!             }
 //!         }
 //!     }
@@ -159,7 +159,7 @@
 //!         Err(e) => return Err(e),
 //!     };
 //!     
-//!     println!("Subscribed with ID: {}", subscription_id);
+//!     info!("Subscribed with ID: {}", subscription_id);
 //!     
 //!     // Wait for some time (in a real application, you would wait for a shutdown signal)
 //!     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -193,15 +193,15 @@
 //!
 //! impl ClientListener for MyClientListener {
 //!     fn on_status_change(&self, status: &ClientStatus) {
-//!         println!("Client status changed to: {:?}", status);
+//!         info!("Client status changed to: {:?}", status);
 //!     }
 //!     
 //!     fn on_server_error(&self, error_code: i32, error_message: &str) {
-//!         println!("Server error: {} - {}", error_code, error_message);
+//!         info!("Server error: {} - {}", error_code, error_message);
 //!     }
 //!     
 //!     fn on_property_change(&self, property: &str) {
-//!         println!("Property changed: {}", property);
+//!         info!("Property changed: {}", property);
 //!     }
 //! }
 //!

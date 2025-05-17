@@ -293,7 +293,7 @@ impl LightstreamerClient {
     /// See also `ClientListener.onStatusChange()`
     ///
     /// See also `ConnectionDetails.setServerAddress()`
-    #[instrument]
+    #[instrument(level = "trace")]
     pub async fn connect(
         &mut self,
         shutdown_signal: Arc<Notify>,
@@ -467,7 +467,7 @@ impl LightstreamerClient {
                                                 write_stream
                                                     .send(Message::Text(format!("control\r\n{}", encoded_params).into()))
                                                     .await?;
-                                                info!("Sent subscription request: '{}'", encoded_params);
+                                                debug!("Sent subscription request: '{}'", encoded_params);
                                             }
                                         } else {
                                             return Err(Box::new(std::io::Error::new(
@@ -889,7 +889,7 @@ impl LightstreamerClient {
     /// "DISCONNECTED", then nothing will be done.
     ///
     /// See also `connect()`
-    #[instrument]
+    #[instrument(level = "trace")]
     pub async fn disconnect(&mut self) {
         // Implementation for disconnect
         self.make_log(Level::INFO, "Disconnecting from Lightstreamer server");
@@ -1344,7 +1344,7 @@ impl LightstreamerClient {
     pub fn make_log(&mut self, loglevel: Level, log: &str) {
         match self.logging {
             LogType::StdLogs => {
-                info!("{}", log);
+                debug!("{}", log);
             }
             LogType::TracingLogs => match loglevel {
                 Level::INFO => {
