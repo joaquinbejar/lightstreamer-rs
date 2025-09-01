@@ -293,12 +293,13 @@ impl ConnectionDetails {
         server_address: Option<String>,
     ) -> Result<(), IllegalArgumentException> {
         // Validate the server address
-        if let Some(address) = &server_address {
-            if !address.starts_with("http://") && !address.starts_with("https://") {
-                return Err(IllegalArgumentException::new(
-                    "Invalid server address: must start with http:// or https://",
-                ));
-            }
+        if let Some(address) = &server_address
+            && !address.starts_with("http://")
+            && !address.starts_with("https://")
+        {
+            return Err(IllegalArgumentException::new(
+                "Invalid server address: must start with http:// or https://",
+            ));
         }
 
         self.server_address = server_address;
