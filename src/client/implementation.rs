@@ -614,8 +614,8 @@ impl LightstreamerClient {
                                                         }
                                                         'P' | 'T' => {
                                                             let diff_value = serde_urlencoded::from_str(&value[2..]).unwrap_or_else(|_| value[2..].to_string());
-                                                            if let Some(field_name) = subscription_fields.and_then(|fields| fields.get(field_index)) {
-                                                                if let Some(prev_value) = field_map.get(field_name).and_then(|v| v.as_ref()) {
+                                                            if let Some(field_name) = subscription_fields.and_then(|fields| fields.get(field_index))
+                                                                && let Some(prev_value) = field_map.get(field_name).and_then(|v| v.as_ref()) {
                                                                     let new_value = match command {
                                                                         'P' => {
                                                                             // Apply JSON Patch
@@ -634,7 +634,6 @@ impl LightstreamerClient {
                                                                     };
                                                                     field_map.insert(field_name.to_string(), Some(new_value.to_string()));
                                                                 }
-                                                            }
                                                             field_index += 1;
                                                         }
                                                         _ => {
@@ -911,7 +910,7 @@ impl LightstreamerClient {
     ///
     /// A list with the various cookies that can be sent in a HTTP request for the specified URI.
     /// If a `None` URI was supplied, all available non-expired cookies will be returned.
-    pub fn get_cookies(_uri: Option<&str>) -> Cookie {
+    pub fn get_cookies(_uri: Option<&str>) -> Cookie<'_> {
         // Implementation for get_cookies
         unimplemented!()
     }
