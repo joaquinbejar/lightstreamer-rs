@@ -1,5 +1,3 @@
-use signal_hook::low_level::signal_name;
-use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::info;
@@ -62,7 +60,7 @@ pub fn parse_arguments(input: &str) -> Vec<&str> {
     let mut start = 0;
     let mut in_brackets = 0; // Tracks nesting level for curly braces
 
-    for (i, c) in input.chars().enumerate() {
+    for (i, c) in input.char_indices() {
         match c {
             '{' => in_brackets += 1,
             '}' => in_brackets -= 1,
@@ -89,32 +87,55 @@ pub fn parse_arguments(input: &str) -> Vec<&str> {
     arguments
 }
 
-/// Sets up a signal hook for SIGINT and SIGTERM.
-///
-/// Creates a signal hook for the specified signals and spawns a thread to handle them.
-/// When a signal is received, it logs the signal name and performs cleanup before exiting with 0 code
-/// to indicate orderly shutdown.
+/// Sets up cross-platform signal handling for graceful shutdown.
+/// On Unix systems, handles SIGINT and SIGTERM signals.
+/// On Windows, handles Ctrl+C signal.
 ///
 /// # Arguments
 ///
-/// * `full_path` - The full path to the application configuration file.
+/// * `shutdown_signal` - `Arc<Notify>` to signal shutdown to other parts of the application.
 ///
 /// # Panics
 ///
-/// The function panics if it fails to create the signal iterator.
+/// The function panics if it fails to create the signal handlers.
 ///
 pub async fn setup_signal_hook(shutdown_signal: Arc<Notify>) {
-    // Create a signal set of signals to be handled and a signal iterator to monitor them.
-    let signals = &[SIGINT, SIGTERM];
-    let mut signals_iterator = Signals::new(signals).expect("Failed to create signal iterator");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to create SIGINT handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
 
-    // Create a new thread to handle signals sent to the process
-    tokio::spawn(async move {
-        if let Some(signal) = signals_iterator.forever().next() {
-            info!("Received signal: {}", signal_name(signal).unwrap());
-            shutdown_signal.notify_one();
-        }
-    });
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT signal");
+                    shutdown_signal.notify_one();
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM signal");
+                    shutdown_signal.notify_one();
+                }
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::signal;
+        tokio::spawn(async move {
+            match signal::ctrl_c().await {
+                Ok(()) => {
+                    info!("Received Ctrl+C signal");
+                    shutdown_signal.notify_one();
+                }
+                Err(err) => {
+                    error!("Failed to listen for Ctrl+C: {}", err);
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
