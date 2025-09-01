@@ -736,12 +736,12 @@ impl ConnectionOptions {
         &mut self,
         max_bandwidth: Option<f64>,
     ) -> Result<(), IllegalArgumentException> {
-        if let Some(bandwidth) = max_bandwidth {
-            if bandwidth <= 0.0 {
-                return Err(IllegalArgumentException::new(
-                    "Maximum bandwidth should be a positive number or 'unlimited'",
-                ));
-            }
+        if let Some(bandwidth) = max_bandwidth
+            && bandwidth <= 0.0
+        {
+            return Err(IllegalArgumentException::new(
+                "Maximum bandwidth should be a positive number or 'unlimited'",
+            ));
         }
 
         self.requested_max_bandwidth = max_bandwidth;
