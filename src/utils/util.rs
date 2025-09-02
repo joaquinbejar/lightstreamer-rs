@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Notify;
+#[cfg(windows)]
+use tracing::error;
 use tracing::info;
 
 /// Clean the message from newlines and carriage returns and convert it to lowercase. Also remove all brackets.
