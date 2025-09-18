@@ -1,4 +1,5 @@
 use crate::client::Transport;
+use crate::connection::management::{HeartbeatConfig, ReconnectionConfig};
 use crate::utils::{IllegalArgumentException, Proxy};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
@@ -32,6 +33,12 @@ pub struct ConnectionOptions {
     supported_diffs: Option<String>,
     polling: bool,
     ttl_millis: Option<u64>,
+    /// Configuration for automatic reconnection behavior
+    reconnection_config: ReconnectionConfig,
+    /// Configuration for heartbeat monitoring
+    heartbeat_config: HeartbeatConfig,
+    /// Whether automatic reconnection is enabled
+    auto_reconnect_enabled: bool,
 }
 
 impl ConnectionOptions {
@@ -61,6 +68,9 @@ impl ConnectionOptions {
             supported_diffs: None,
             polling: false,
             ttl_millis: None,
+            reconnection_config: ReconnectionConfig::default(),
+            heartbeat_config: HeartbeatConfig::default(),
+            auto_reconnect_enabled: false,
         }
     }
 
@@ -1177,7 +1187,66 @@ impl Default for ConnectionOptions {
             polling: false,
             ttl_millis: None,
             supported_diffs: None,
+            reconnection_config: ReconnectionConfig::default(),
+            heartbeat_config: HeartbeatConfig::default(),
+            auto_reconnect_enabled: false,
         }
+    }
+}
+
+impl ConnectionOptions {
+    /// Gets the current reconnection configuration.
+    ///
+    /// # Returns
+    ///
+    /// The current reconnection configuration
+    pub fn get_reconnection_config(&self) -> &ReconnectionConfig {
+        &self.reconnection_config
+    }
+
+    /// Sets the reconnection configuration.
+    ///
+    /// # Parameters
+    ///
+    /// * `config`: The reconnection configuration to set
+    pub fn set_reconnection_config(&mut self, config: ReconnectionConfig) {
+        self.reconnection_config = config;
+    }
+
+    /// Gets the current heartbeat configuration.
+    ///
+    /// # Returns
+    ///
+    /// The current heartbeat configuration
+    pub fn get_heartbeat_config(&self) -> &HeartbeatConfig {
+        &self.heartbeat_config
+    }
+
+    /// Sets the heartbeat configuration.
+    ///
+    /// # Parameters
+    ///
+    /// * `config`: The heartbeat configuration to set
+    pub fn set_heartbeat_config(&mut self, config: HeartbeatConfig) {
+        self.heartbeat_config = config;
+    }
+
+    /// Gets whether automatic reconnection is enabled.
+    ///
+    /// # Returns
+    ///
+    /// `true` if automatic reconnection is enabled, `false` otherwise
+    pub fn is_auto_reconnect_enabled(&self) -> bool {
+        self.auto_reconnect_enabled
+    }
+
+    /// Enables or disables automatic reconnection.
+    ///
+    /// # Parameters
+    ///
+    /// * `enabled`: Whether to enable automatic reconnection
+    pub fn set_auto_reconnect_enabled(&mut self, enabled: bool) {
+        self.auto_reconnect_enabled = enabled;
     }
 }
 
