@@ -114,10 +114,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut retry_interval_milis: u64 = 0;
     let mut retry_counter: u64 = 0;
     while retry_counter < MAX_CONNECTION_ATTEMPTS {
-        let mut client = client.lock().await;
-        match client.connect(Arc::clone(&shutdown_signal)).await {
+        match LightstreamerClient::connect(client.clone(), Arc::clone(&shutdown_signal)).await {
             Ok(_) => {
-                client.disconnect().await;
+                {
+                    let mut client_guard = client.lock().await;
+                    client_guard.disconnect().await;
+                }
                 break;
             }
             Err(e) => {
