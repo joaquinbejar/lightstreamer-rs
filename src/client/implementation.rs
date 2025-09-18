@@ -7,6 +7,7 @@ use crate::client::model::{ClientStatus, DisconnectionType, LogType};
 use crate::client::request::SubscriptionRequest;
 use crate::client::utils::get_subscription_by_id;
 use crate::connection::{ConnectionDetails, ConnectionOptions};
+use crate::connection::{ConnectionManager, ConnectionState, HeartbeatConfig, ReconnectionConfig};
 use crate::utils::{IllegalStateException, clean_message, parse_arguments};
 use cookie::Cookie;
 use futures_util::{SinkExt, StreamExt};
@@ -16,7 +17,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
 use tokio::sync::{
-    Notify,
+    Mutex, Notify,
     mpsc::{Receiver, Sender},
 };
 use tokio_tungstenite::{
@@ -93,6 +94,14 @@ pub struct LightstreamerClient {
     pub subscription_sender: Sender<SubscriptionRequest>,
     /// The receiver used for subscribe/unsubsribe
     subscription_receiver: Receiver<SubscriptionRequest>,
+    /// Connection manager for automatic reconnection
+    connection_manager: Option<Arc<ConnectionManager>>,
+    /// Configuration for reconnection behavior
+    reconnection_config: ReconnectionConfig,
+    /// Configuration for heartbeat monitoring
+    heartbeat_config: HeartbeatConfig,
+    /// Whether automatic reconnection is enabled
+    auto_reconnect_enabled: bool,
 }
 
 impl Debug for LightstreamerClient {
@@ -295,6 +304,45 @@ impl LightstreamerClient {
     /// See also `ConnectionDetails.setServerAddress()`
     #[instrument(level = "trace")]
     pub async fn connect(
+        client: Arc<Mutex<Self>>,
+        shutdown_signal: Arc<Notify>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // If auto-reconnect is enabled, use ConnectionManager
+        let auto_reconnect_enabled = {
+            let client_guard = client.lock().await;
+            client_guard.auto_reconnect_enabled
+        };
+
+        if auto_reconnect_enabled {
+            let (reconnection_config, heartbeat_config) = {
+                let client_guard = client.lock().await;
+                (
+                    client_guard.reconnection_config.clone(),
+                    client_guard.heartbeat_config.clone(),
+                )
+            };
+
+            let weak_client = Arc::downgrade(&client);
+            let connection_manager: Arc<ConnectionManager> =
+                ConnectionManager::new(weak_client, reconnection_config, heartbeat_config);
+
+            {
+                let mut client_guard = client.lock().await;
+                client_guard.connection_manager = Some(connection_manager.clone());
+            }
+
+            // Use direct connection method
+            return client.lock().await.connect_direct(shutdown_signal).await;
+        }
+
+        // Fallback to direct connection without auto-reconnect
+        let mut client_guard = client.lock().await;
+        client_guard.connect_direct(shutdown_signal).await
+    }
+
+    /// Direct connection method without automatic reconnection
+    #[instrument(level = "trace")]
+    pub async fn connect_direct(
         &mut self,
         shutdown_signal: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -890,8 +938,23 @@ impl LightstreamerClient {
     /// See also `connect()`
     #[instrument(level = "trace")]
     pub async fn disconnect(&mut self) {
-        // Implementation for disconnect
         self.make_log(Level::INFO, "Disconnecting from Lightstreamer server");
+
+        // If auto-reconnect is enabled and we have a connection manager, stop it
+        if self.auto_reconnect_enabled {
+            if let Some(ref manager) = self.connection_manager {
+                manager.shutdown().await;
+            }
+            self.connection_manager = None;
+        }
+
+        // Update status to disconnected
+        self.status = ClientStatus::Disconnected(DisconnectionType::WillRetry);
+
+        // Notify listeners about status change
+        for listener in &self.listeners {
+            listener.on_status_change(&self.status.to_string());
+        }
     }
 
     /// Static inquiry method that can be used to share cookies between connections to the Server
@@ -1011,6 +1074,10 @@ impl LightstreamerClient {
             logging: LogType::StdLogs,
             subscription_sender,
             subscription_receiver,
+            connection_manager: None,
+            reconnection_config: ReconnectionConfig::default(),
+            heartbeat_config: HeartbeatConfig::default(),
+            auto_reconnect_enabled: false,
         })
     }
 
@@ -1364,6 +1431,99 @@ impl LightstreamerClient {
             },
         }
     }
+
+    /// Enables automatic reconnection with default configuration.
+    pub fn enable_auto_reconnect(&mut self) {
+        self.auto_reconnect_enabled = true;
+        // ConnectionManager will be created during connect() to avoid circular dependency
+    }
+
+    /// Enables automatic reconnection with the specified configuration.
+    ///
+    /// # Parameters
+    ///
+    /// * `reconnection_config`: Configuration for reconnection behavior
+    /// * `heartbeat_config`: Configuration for heartbeat monitoring
+    pub fn enable_auto_reconnect_with_config(
+        &mut self,
+        reconnection_config: ReconnectionConfig,
+        heartbeat_config: HeartbeatConfig,
+    ) -> Result<(), Box<dyn Error>> {
+        self.reconnection_config = reconnection_config;
+        self.heartbeat_config = heartbeat_config;
+        self.auto_reconnect_enabled = true;
+        // ConnectionManager will be created during connect() to avoid circular dependency
+        Ok(())
+    }
+
+    /// Disables automatic reconnection.
+    pub async fn disable_auto_reconnect(&mut self) {
+        self.auto_reconnect_enabled = false;
+        if let Some(manager) = &self.connection_manager {
+            manager.shutdown().await;
+        }
+        self.connection_manager = None;
+    }
+
+    /// Returns whether automatic reconnection is currently enabled.
+    pub fn is_auto_reconnect_enabled(&self) -> bool {
+        self.auto_reconnect_enabled
+    }
+
+    /// Gets the current reconnection configuration.
+    pub fn get_reconnection_config(&self) -> &ReconnectionConfig {
+        &self.reconnection_config
+    }
+
+    /// Gets the current heartbeat configuration.
+    pub fn get_heartbeat_config(&self) -> &HeartbeatConfig {
+        &self.heartbeat_config
+    }
+
+    /// Updates the reconnection configuration.
+    pub fn set_reconnection_config(&mut self, config: ReconnectionConfig) {
+        self.reconnection_config = config;
+        // Note: ConnectionManager doesn't support runtime config updates
+        // The configuration is set during ConnectionManager creation
+    }
+
+    /// Updates the heartbeat configuration.
+    pub fn set_heartbeat_config(&mut self, config: HeartbeatConfig) {
+        self.heartbeat_config = config;
+        // Note: ConnectionManager doesn't support runtime config updates
+        // The configuration is set during ConnectionManager creation
+    }
+
+    /// Gets the current connection state from the connection manager.
+    pub async fn get_connection_state(&self) -> ConnectionState {
+        if let Some(manager) = &self.connection_manager {
+            manager.get_connection_state().await
+        } else {
+            ConnectionState::Disconnected
+        }
+    }
+
+    /// Gets connection metrics from the connection manager.
+    pub async fn get_connection_metrics(&self) -> crate::connection::management::ConnectionMetrics {
+        if let Some(manager) = &self.connection_manager {
+            manager.get_metrics().await
+        } else {
+            crate::connection::management::ConnectionMetrics::default()
+        }
+    }
+
+    /// Forces an immediate reconnection attempt if auto-reconnect is enabled.
+    pub async fn force_reconnect(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.auto_reconnect_enabled {
+            return Err("Auto-reconnect is not enabled".into());
+        }
+
+        if let Some(manager) = &mut self.connection_manager {
+            manager.force_reconnect().await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1585,9 +1745,10 @@ mod tests {
     async fn test_connect_with_no_server_address() {
         let result = LightstreamerClient::new(None, Some("DEMO"), None, None);
         assert!(result.is_ok());
-        let mut client = result.unwrap();
+        let client = result.unwrap();
+        let client_arc = Arc::new(tokio::sync::Mutex::new(client));
         let shutdown_signal = Arc::new(Notify::new());
-        let result = client.connect(shutdown_signal).await;
+        let result = LightstreamerClient::connect(client_arc, shutdown_signal).await;
         assert!(result.is_err());
     }
 
@@ -1603,10 +1764,13 @@ mod tests {
         let mut client = result.unwrap();
 
         client.connection_options.set_forced_transport(None);
+        let client_arc = Arc::new(tokio::sync::Mutex::new(client));
         let shutdown_signal = Arc::new(Notify::new());
-        let result = client.connect(shutdown_signal).await;
+        let result = LightstreamerClient::connect(client_arc.clone(), shutdown_signal).await;
         assert!(result.is_err());
-        client
+        client_arc
+            .lock()
+            .await
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
     }
