@@ -1,6 +1,6 @@
 [package]
 name = "lightstreamer-rs"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust client for Lightstreamer, designed to facilitate real-time communication with Lightstreamer servers."
@@ -13,10 +13,12 @@ homepage = "https://github.com/joaquinbejar/lightstreamer-rs"
 cookie = { version = "0.18", features = ["percent-encode"]}
 futures-util = "0.3"
 json-patch = "4.0"
+rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 serde_urlencoded = "0.7"
-tokio = { version = "1.47", features = ["sync", "macros", "rt-multi-thread", "signal"] }
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["sync", "macros", "rt-multi-thread", "signal", "time"] }
 tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 tracing = "0.1"
 url = "2.5"

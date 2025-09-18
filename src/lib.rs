@@ -232,4 +232,4 @@ pub mod client;
 /// Module containing connection-related functionality.
 ///
 /// This module provides types for managing connection details and options.
-mod connection;
+pub mod connection;
