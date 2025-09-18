@@ -73,6 +73,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
+        client
+            .connection_options
+            .set_reconnect_timeout(3000).expect("Failed to set reconnect timeout");
+        client
+            .connection_options
+            .set_keepalive_interval(30000).expect("Failed to set keepalive interval");
+        client
+            .connection_options
+            .set_idle_timeout(120000).expect("Failed to set idle timeout");
     }
 
     // Create a new Notify instance to send a shutdown signal to the signal handler thread.
