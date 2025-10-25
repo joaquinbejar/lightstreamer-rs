@@ -3,13 +3,11 @@ use lightstreamer_rs::subscription::{
     ItemUpdate, Snapshot, Subscription, SubscriptionListener, SubscriptionMode,
 };
 use lightstreamer_rs::utils::{setup_logger, setup_signal_hook};
-use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
 
 const MAX_CONNECTION_ATTEMPTS: u64 = 1;
-
 
 pub struct MySubscriptionListener {}
 
@@ -27,7 +25,7 @@ pub struct Config {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
     //
     // Create a new subscription instance.
@@ -40,14 +38,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ]),
         Some(
             // vec!["BID".to_string(), "OFFER".to_string()]
-            vec!["PNL".to_string()]
+            vec!["PNL".to_string()],
         ),
     )?;
 
     my_subscription.set_data_adapter(None)?;
     my_subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
     my_subscription.add_listener(Box::new(MySubscriptionListener {}));
-    
+
     let config = Config {
         cst: std::env::var("CST")?,
         x_security_token: std::env::var("X_SECURITY_TOKEN")?,
@@ -61,7 +59,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some("https://apd.marketdatasystems.com/lightstreamer"),
         None,
         account_id,
-        Some(&format!("CST-{}|XST-{}", config.cst, config.x_security_token)),
+        Some(&format!(
+            "CST-{}|XST-{}",
+            config.cst, config.x_security_token
+        )),
     )?));
 
     //
@@ -75,13 +76,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .set_forced_transport(Some(Transport::WsStreaming));
         client
             .connection_options
-            .set_reconnect_timeout(3000).expect("Failed to set reconnect timeout");
+            .set_reconnect_timeout(3000)
+            .expect("Failed to set reconnect timeout");
         client
             .connection_options
-            .set_keepalive_interval(30000).expect("Failed to set keepalive interval");
+            .set_keepalive_interval(30000)
+            .expect("Failed to set keepalive interval");
         client
             .connection_options
-            .set_idle_timeout(120000).expect("Failed to set idle timeout");
+            .set_idle_timeout(120000)
+            .expect("Failed to set idle timeout");
     }
 
     // Create a new Notify instance to send a shutdown signal to the signal handler thread.

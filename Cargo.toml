@@ -1,6 +1,6 @@
 [package]
 name = "lightstreamer-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust client for Lightstreamer, designed to facilitate real-time communication with Lightstreamer servers."
@@ -10,16 +10,38 @@ documentation = "https://github.com/joaquinbejar/lightstreamer-rs#readme"
 homepage = "https://github.com/joaquinbejar/lightstreamer-rs"
 
 [dependencies]
+cookie = { workspace = true }
+futures-util = { workspace = true }
+json-patch = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "signal", "time"] }
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+tracing = { workspace = true }
+url = { workspace = true }
+tracing-subscriber ={ workspace = true }
+
+[workspace.dependencies]
+lightstreamer-rs = { path = "." }
 cookie = { version = "0.18", features = ["percent-encode"]}
 futures-util = "0.3"
 json-patch = "4.0"
-rand = "0.8"
+rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 serde_urlencoded = "0.7"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["sync", "macros", "rt-multi-thread", "signal", "time"] }
-tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
+tokio = { version = "1.48", features = ["sync", "macros", "rt-multi-thread", "signal", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tracing = "0.1"
 url = "2.5"
 tracing-subscriber = "0.3"
+colored = "3.0"
+
+[workspace]
+members = [
+    "examples/simple",
+]

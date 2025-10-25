@@ -69,6 +69,48 @@
 //!
 //! ## Usage
 //!
+//! ### Quick Start (Simplified API)
+//!
+//! For most use cases, use the simplified `SimpleClient` API:
+//!
+//! ```ignore
+//! use lightstreamer_rs::client::{ClientConfig, SimpleClient, SubscriptionParams};
+//! use lightstreamer_rs::subscription::SubscriptionMode;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // 1. Create configuration
+//!     let config = ClientConfig::new("http://push.lightstreamer.com/lightstreamer")
+//!         .adapter_set("DEMO");
+//!
+//!     // 2. Create client
+//!     let client = SimpleClient::new(config)?;
+//!
+//!     // 3. Subscribe and get channel receiver
+//!     let params = SubscriptionParams::new(
+//!         SubscriptionMode::Merge,
+//!         vec!["item1".to_string(), "item2".to_string()],
+//!         vec!["last_price".to_string(), "time".to_string()],
+//!     ).data_adapter("QUOTE_ADAPTER");
+//!
+//!     let mut receiver = client.subscribe(params).await?;
+//!
+//!     // 4. Process updates asynchronously
+//!     tokio::spawn(async move {
+//!         while let Some(update) = receiver.recv().await {
+//!             println!("Price: {:?}", update.get_value("last_price"));
+//!         }
+//!     });
+//!
+//!     // 5. Connect and run
+//!     client.connect().await?;
+//!     
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Advanced Usage (Full API)
+//!
 //! Here's a comprehensive example of how to use the Lightstreamer Rust Client SDK:
 //!
 //! ```ignore
@@ -208,6 +250,38 @@
 //! // Then add the listener to your client
 //! // client.add_listener(Box::new(MyClientListener));
 //! ```
+//!
+//! ### Channel-Based Update Processing
+//!
+//! For asynchronous processing of updates in separate tasks, you can use the `ChannelSubscriptionListener`:
+//!
+//! ```ignore
+//! use lightstreamer_rs::subscription::ChannelSubscriptionListener;
+//!
+//! // Create a channel-based listener
+//! let (listener, mut update_receiver) = ChannelSubscriptionListener::create_channel();
+//!
+//! // Add the listener to your subscription
+//! subscription.add_listener(Box::new(listener));
+//!
+//! // Process updates asynchronously in a separate task
+//! tokio::spawn(async move {
+//!     while let Some(update) = update_receiver.recv().await {
+//!         // Process the update
+//!         println!("Item: {:?}", update.get_item_name());
+//!         println!("Fields: {:?}", update.get_fields());
+//!         
+//!         // Perform any async operations
+//!         // e.g., save to database, send to another service, etc.
+//!     }
+//! });
+//! ```
+//!
+//! This approach allows you to:
+//! - Decouple update reception from processing
+//! - Process updates asynchronously without blocking the Lightstreamer event loop
+//! - Easily integrate with other async workflows
+//! - Handle backpressure naturally through channel buffering
 //!
 
 /// Module containing subscription-related functionality.

@@ -1,12 +1,12 @@
-
 use colored::*;
-use std::error::Error;
+use lightstreamer_rs::client::{LightstreamerClient, Transport};
+use lightstreamer_rs::subscription::{
+    ItemUpdate, Snapshot, Subscription, SubscriptionListener, SubscriptionMode,
+};
+use lightstreamer_rs::utils::{setup_logger, setup_signal_hook};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::info;
-use lightstreamer_rs::subscription::{ItemUpdate, Snapshot, Subscription, SubscriptionListener, SubscriptionMode};
-use lightstreamer_rs::client::{LightstreamerClient, Transport};
-use lightstreamer_rs::utils::{setup_logger, setup_signal_hook};
 const MAX_CONNECTION_ATTEMPTS: u64 = 1;
 
 pub struct MySubscriptionListener {}
@@ -44,7 +44,7 @@ impl SubscriptionListener for MySubscriptionListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
     //
     // Create a new subscription instance.

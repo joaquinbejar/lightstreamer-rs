@@ -1,11 +1,10 @@
 use crate::subscription::SubscriptionListener;
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 /// Enum representing the snapshot delivery preferences to be requested to Lightstreamer Server for the items in the Subscription.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, Hash)]
 pub enum Snapshot {
     /// Request the full snapshot for the subscribed items.
     Yes,
@@ -36,7 +35,7 @@ impl fmt::Display for Snapshot {
 }
 
 /// Enum representing the subscription mode.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum SubscriptionMode {
     /// MERGE mode. The server sends an update for a specific item only if the state of at least one of the fields has changed.
     Merge,
@@ -120,7 +119,7 @@ impl Subscription {
         mode: SubscriptionMode,
         items: Option<Vec<String>>,
         fields: Option<Vec<String>>,
-    ) -> Result<Subscription, Box<dyn Error>> {
+    ) -> Result<Subscription, Box<dyn std::error::Error>> {
         if items.is_none() || fields.is_none() {
             return Err("Items and fields must be provided".to_string().into());
         }
