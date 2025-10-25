@@ -226,6 +226,38 @@ impl ClientListener for MyClientListener {
 // client.add_listener(Box::new(MyClientListener));
 ```
 
+#### Channel-Based Update Processing
+
+For asynchronous processing of updates in separate tasks, you can use the `ChannelSubscriptionListener`:
+
+```rust
+use lightstreamer_rs::subscription::ChannelSubscriptionListener;
+
+// Create a channel-based listener
+let (listener, mut update_receiver) = ChannelSubscriptionListener::create_channel();
+
+// Add the listener to your subscription
+subscription.add_listener(Box::new(listener));
+
+// Process updates asynchronously in a separate task
+tokio::spawn(async move {
+    while let Some(update) = update_receiver.recv().await {
+        // Process the update
+        println!("Item: {:?}", update.get_item_name());
+        println!("Fields: {:?}", update.get_fields());
+
+        // Perform any async operations
+        // e.g., save to database, send to another service, etc.
+    }
+});
+```
+
+This approach allows you to:
+- Decouple update reception from processing
+- Process updates asynchronously without blocking the Lightstreamer event loop
+- Easily integrate with other async workflows
+- Handle backpressure naturally through channel buffering
+
 
 
 

@@ -1,4 +1,5 @@
 use crate::subscription::ItemUpdate;
+use tokio::sync::mpsc;
 
 /// Interface to be implemented to listen to Subscription events comprehending notifications
 /// of subscription/unsubscription, updates, errors and others.
@@ -289,6 +290,96 @@ pub trait SubscriptionListener: Send {
     }
 }
 
+/// A subscription listener that forwards item updates to a tokio mpsc channel.
+///
+/// This listener allows decoupling the reception of updates from their processing,
+/// enabling asynchronous consumption of updates by other tasks or components.
+///
+/// # Examples
+///
+/// ```ignore
+/// use lightstreamer_rs::subscription::{ChannelSubscriptionListener, ItemUpdate};
+/// use tokio::sync::mpsc;
+///
+/// let (tx, mut rx) = mpsc::unbounded_channel();
+/// let listener = ChannelSubscriptionListener::new(tx);
+///
+/// // Add listener to subscription
+/// subscription.add_listener(Box::new(listener));
+///
+/// // Process updates in a separate task
+/// tokio::spawn(async move {
+///     while let Some(update) = rx.recv().await {
+///         println!("Received update: {:?}", update);
+///     }
+/// });
+/// ```
+pub struct ChannelSubscriptionListener {
+    /// Channel sender for forwarding item updates.
+    sender: mpsc::UnboundedSender<ItemUpdate>,
+}
+
+impl ChannelSubscriptionListener {
+    /// Creates a new `ChannelSubscriptionListener` with the provided sender.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender` - An unbounded mpsc sender for forwarding `ItemUpdate` events
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `ChannelSubscriptionListener`
+    pub fn new(sender: mpsc::UnboundedSender<ItemUpdate>) -> Self {
+        Self { sender }
+    }
+
+    /// Creates a new channel pair and returns both the listener and receiver.
+    ///
+    /// This is a convenience method that creates both the channel and the listener
+    /// in a single call.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// - The `ChannelSubscriptionListener` instance
+    /// - The receiver end of the channel for consuming updates
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use lightstreamer_rs::subscription::ChannelSubscriptionListener;
+    ///
+    /// let (listener, mut rx) = ChannelSubscriptionListener::create_channel();
+    /// subscription.add_listener(Box::new(listener));
+    ///
+    /// tokio::spawn(async move {
+    ///     while let Some(update) = rx.recv().await {
+    ///         // Process update
+    ///     }
+    /// });
+    /// ```
+    pub fn create_channel() -> (Self, mpsc::UnboundedReceiver<ItemUpdate>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self::new(tx), rx)
+    }
+}
+
+impl SubscriptionListener for ChannelSubscriptionListener {
+    fn on_item_update(&self, update: &ItemUpdate) {
+        // Clone the update and send it through the channel
+        // If send fails, the receiver has been dropped, which is acceptable
+        let _ = self.sender.send(update.clone());
+    }
+
+    fn on_subscription(&mut self) {
+        // Optional: Could send a special message or log this event
+    }
+
+    fn on_unsubscription(&mut self) {
+        // Optional: Could send a special message or log this event
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +633,112 @@ mod tests {
 
         let mut listener = MinimalListener;
         listener.on_subscription_error(1, Some("error"));
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscription_listener_new() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _listener = super::ChannelSubscriptionListener::new(tx);
+        // If we get here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscription_listener_create_channel() {
+        let (_listener, _rx) = super::ChannelSubscriptionListener::create_channel();
+        // If we get here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscription_listener_forwards_updates() {
+        let (listener, mut rx) = super::ChannelSubscriptionListener::create_channel();
+
+        let mut fields = HashMap::new();
+        fields.insert("field1".to_string(), Some("value1".to_string()));
+
+        let mut changed_fields = HashMap::new();
+        changed_fields.insert("field1".to_string(), "value1".to_string());
+
+        let item_update = ItemUpdate {
+            item_name: Some("testItem".to_string()),
+            item_pos: 1,
+            fields,
+            changed_fields,
+            is_snapshot: false,
+        };
+
+        // Send update through listener
+        listener.on_item_update(&item_update);
+
+        // Receive update from channel
+        let received = rx.recv().await.expect("Should receive update");
+
+        assert_eq!(received.item_name, Some("testItem".to_string()));
+        assert_eq!(received.item_pos, 1);
+        assert_eq!(received.get_value("field1"), Some("value1"));
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscription_listener_multiple_updates() {
+        let (listener, mut rx) = super::ChannelSubscriptionListener::create_channel();
+
+        // Send multiple updates
+        for i in 1..=5 {
+            let mut fields = HashMap::new();
+            fields.insert("field1".to_string(), Some(format!("value{}", i)));
+
+            let mut changed_fields = HashMap::new();
+            changed_fields.insert("field1".to_string(), format!("value{}", i));
+
+            let item_update = ItemUpdate {
+                item_name: Some(format!("item{}", i)),
+                item_pos: i,
+                fields,
+                changed_fields,
+                is_snapshot: false,
+            };
+
+            listener.on_item_update(&item_update);
+        }
+
+        // Receive all updates
+        for i in 1..=5 {
+            let received = rx.recv().await.expect("Should receive update");
+            assert_eq!(received.item_name, Some(format!("item{}", i)));
+            assert_eq!(received.item_pos, i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscription_listener_dropped_receiver() {
+        let (listener, rx) = super::ChannelSubscriptionListener::create_channel();
+
+        // Drop the receiver
+        drop(rx);
+
+        let mut fields = HashMap::new();
+        fields.insert("field1".to_string(), Some("value1".to_string()));
+
+        let mut changed_fields = HashMap::new();
+        changed_fields.insert("field1".to_string(), "value1".to_string());
+
+        let item_update = ItemUpdate {
+            item_name: Some("testItem".to_string()),
+            item_pos: 1,
+            fields,
+            changed_fields,
+            is_snapshot: false,
+        };
+
+        // This should not panic even though receiver is dropped
+        listener.on_item_update(&item_update);
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscription_listener_lifecycle_methods() {
+        let (mut listener, _rx) = super::ChannelSubscriptionListener::create_channel();
+
+        // These should not panic
+        listener.on_subscription();
+        listener.on_unsubscription();
     }
 }
