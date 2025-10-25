@@ -4,7 +4,6 @@ use lightstreamer_rs::subscription::{
     ChannelSubscriptionListener, ItemUpdate, Snapshot, Subscription, SubscriptionMode,
 };
 use lightstreamer_rs::utils::{setup_logger, setup_signal_hook};
-use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
@@ -17,7 +16,7 @@ const MAX_CONNECTION_ATTEMPTS: u64 = 1;
 /// item updates through a tokio channel, enabling asynchronous processing
 /// in a separate task.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
 
     info!(
@@ -28,8 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     info!(
         "{}",
-        "This example demonstrates asynchronous update processing using channels"
-            .bright_cyan()
+        "This example demonstrates asynchronous update processing using channels".bright_cyan()
     );
 
     // Create a channel for receiving updates
@@ -42,10 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Spawn a task to process updates asynchronously
     let processor_handle = tokio::spawn(async move {
-        info!(
-            "{}",
-            "📡 Update processor task started".bright_cyan()
-        );
+        info!("{}", "📡 Update processor task started".bright_cyan());
 
         let mut update_count = 0u64;
         let mut items_seen = std::collections::HashSet::new();
@@ -62,7 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             process_update(&update, update_count);
 
             // Log statistics every 10 updates
-            if update_count % 10 == 0 {
+            if update_count.is_multiple_of(10) {
                 info!(
                     "{}",
                     format!(
@@ -166,10 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     while retry_counter < MAX_CONNECTION_ATTEMPTS {
         match LightstreamerClient::connect(client.clone(), Arc::clone(&shutdown_signal)).await {
             Ok(_) => {
-                info!(
-                    "{}",
-                    "🔌 Disconnecting from server...".bright_yellow()
-                );
+                info!("{}", "🔌 Disconnecting from server...".bright_yellow());
                 {
                     let mut client_guard = client.lock().await;
                     client_guard.disconnect().await;
@@ -217,22 +209,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .bold()
     );
     info!("{}", "Key features demonstrated:".dimmed());
-    info!(
-        "{}",
-        "  • Channel-based async update processing".dimmed()
-    );
-    info!(
-        "{}",
-        "  • Decoupled reception and processing".dimmed()
-    );
-    info!(
-        "{}",
-        "  • Non-blocking update handling".dimmed()
-    );
-    info!(
-        "{}",
-        "  • Easy integration with async workflows".dimmed()
-    );
+    info!("{}", "  • Channel-based async update processing".dimmed());
+    info!("{}", "  • Decoupled reception and processing".dimmed());
+    info!("{}", "  • Non-blocking update handling".dimmed());
+    info!("{}", "  • Easy integration with async workflows".dimmed());
 
     std::process::exit(0);
 }

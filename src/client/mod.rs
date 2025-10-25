@@ -7,11 +7,13 @@
 mod listener;
 mod message_listener;
 
+mod builder;
 mod implementation;
 mod model;
 mod request;
 mod utils;
 
+pub use builder::{ClientConfig, SimpleClient, SubscriptionParams};
 pub use implementation::LightstreamerClient;
 pub use listener::ClientListener;
 pub use message_listener::ClientMessageListener;

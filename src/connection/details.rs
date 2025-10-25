@@ -1,6 +1,5 @@
 use crate::client::ClientListener;
 use crate::utils::IllegalArgumentException;
-use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
 
 /// Used by `LightstreamerClient` to provide a basic connection properties data object.
@@ -176,7 +175,7 @@ impl ConnectionDetails {
         adapter_set: Option<&str>,
         user: Option<&str>,
         password: Option<&str>,
-    ) -> Result<ConnectionDetails, Box<dyn Error>> {
+    ) -> Result<ConnectionDetails, Box<dyn std::error::Error>> {
         let mut connection_details = ConnectionDetails::default();
         connection_details.set_server_address(server_address.map(|s| s.to_string()))?;
         connection_details.set_adapter_set(adapter_set.map(|s| s.to_string()));

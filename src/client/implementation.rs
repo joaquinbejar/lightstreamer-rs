@@ -193,7 +193,7 @@ impl LightstreamerClient {
     fn get_subscription_params(
         subscription: &Subscription,
         request_id: usize,
-    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let ls_req_id = request_id.to_string();
         let ls_sub_id = subscription.id.to_string();
         let ls_mode = subscription.get_mode().to_string();
@@ -256,7 +256,7 @@ impl LightstreamerClient {
     fn get_unsubscription_params(
         subscription_id: usize,
         request_id: usize,
-    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let ls_req_id = request_id.to_string();
         let ls_sub_id = subscription_id.to_string();
         //
@@ -306,7 +306,7 @@ impl LightstreamerClient {
     pub async fn connect(
         client: Arc<Mutex<Self>>,
         shutdown_signal: Arc<Notify>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // If auto-reconnect is enabled, use ConnectionManager
         let auto_reconnect_enabled = {
             let client_guard = client.lock().await;
@@ -345,7 +345,7 @@ impl LightstreamerClient {
     pub async fn connect_direct(
         &mut self,
         shutdown_signal: Arc<Notify>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Check if the server address is configured.
         if self.server_address.is_none() {
             return Err(Box::new(IllegalStateException::new(
@@ -1057,7 +1057,7 @@ impl LightstreamerClient {
         adapter_set: Option<&str>,
         username: Option<&str>,
         password: Option<&str>,
-    ) -> Result<LightstreamerClient, Box<dyn Error>> {
+    ) -> Result<LightstreamerClient, Box<dyn std::error::Error>> {
         let connection_details =
             ConnectionDetails::new(server_address, adapter_set, username, password)?;
         let connection_options = ConnectionOptions::default();
@@ -1317,7 +1317,7 @@ impl LightstreamerClient {
     pub async fn subscribe_get_id(
         subscription_sender: Sender<SubscriptionRequest>,
         mut subscription: Subscription,
-    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error>> {
         // Extract the id_receiver before sending the subscription
         let mut id_receiver = subscription.id_receiver;
 
@@ -1342,7 +1342,7 @@ impl LightstreamerClient {
         pub async fn subscribe_get_id(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription: Subscription,
-    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error>> {
         let mut id_receiver = subscription.id_receiver.clone();
         LightstreamerClient::subscribe(subscription_sender.clone(), subscription);
 
@@ -1448,7 +1448,8 @@ impl LightstreamerClient {
         &mut self,
         reconnection_config: ReconnectionConfig,
         heartbeat_config: HeartbeatConfig,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.auto_reconnect_enabled = true;
         self.reconnection_config = reconnection_config;
         self.heartbeat_config = heartbeat_config;
         self.auto_reconnect_enabled = true;

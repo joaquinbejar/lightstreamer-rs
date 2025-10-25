@@ -103,7 +103,7 @@ pub enum LogType {
 /// - HTTP-POLLING: the Stream-Sense algorithm is disabled and the client will only connect
 ///   on Polling over HTTP. If Polling over HTTP is not possible because of the environment
 ///   the client will not connect at all.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]
 pub enum Transport {
     /// WebSocket transport with Stream-Sense algorithm enabled. The client will only use WebSocket-based connections.
     Ws,
