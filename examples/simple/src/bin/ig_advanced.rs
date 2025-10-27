@@ -172,8 +172,8 @@ async fn setup_financial_subscriptions(client: &Arc<Mutex<LightstreamerClient>>)
     let mut market_subscription = Subscription::new(
         SubscriptionMode::Merge,
         Some(vec![
-            "MARKET:OP.D.OTCDAX1.021100P.IP".to_string(),
-            "MARKET:OP.D.FTSE100.021100P.IP".to_string(),
+            "MARKET:OD.D.OTCMT2EJY.38.IP".to_string(),
+            "MARKET:DO.D.OTCDETH.21.IP".to_string(),
         ]),
         Some(vec![
             "BID".to_string(),
