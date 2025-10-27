@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SubscriptionMode::Merge,
         Some(vec![
             // "MARKET:OP.D.OTCDAX1.021100P.IP".to_string(),
-            "ACCOUNT:BSI1I".to_string(),
+            "ACCOUNT:ZR24W".to_string(),
         ]),
         Some(
             // vec!["BID".to_string(), "OFFER".to_string()]

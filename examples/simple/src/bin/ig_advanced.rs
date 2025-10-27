@@ -195,7 +195,7 @@ async fn setup_financial_subscriptions(client: &Arc<Mutex<LightstreamerClient>>)
     // Account data subscription for P&L and positions
     let mut account_subscription = Subscription::new(
         SubscriptionMode::Merge,
-        Some(vec!["ACCOUNT:BSI1I".to_string()]),
+        Some(vec!["ACCOUNT:ZR24W".to_string()]),
         Some(vec![
             "PNL".to_string(),
             "AVAILABLE_CASH".to_string(),
