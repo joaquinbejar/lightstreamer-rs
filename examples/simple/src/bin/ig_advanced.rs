@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Initialize the LightstreamerClient with Arc<Mutex> pattern for thread safety
     let client = Arc::new(Mutex::new(
         LightstreamerClient::new(
-            Some("https://apd.marketdatasystems.com/lightstreamer"),
+            Some("https://demo-apd.marketdatasystems.com/lightstreamer"),
             None,
             account_id,
             Some(&format!(

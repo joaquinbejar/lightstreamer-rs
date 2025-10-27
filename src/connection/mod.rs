@@ -5,14 +5,14 @@
 ******************************************************************************/
 
 mod details;
-pub mod management;
 mod options;
+pub mod management;
 
 pub use self::details::ConnectionDetails;
-pub use self::management::{
-    ConnectionEvent, ConnectionManager, ConnectionMetrics, ConnectionState, DisconnectionReason,
-    HeartbeatConfig, HeartbeatMonitor, LightstreamerError, ReconnectionConfig, ReconnectionError,
-    ReconnectionHandler, SubscriptionError, SubscriptionManager, SubscriptionState,
-    SubscriptionStatistics, SubscriptionStatus,
-};
 pub use self::options::ConnectionOptions;
+pub use self::management::{
+    ConnectionManager, ReconnectionHandler, HeartbeatMonitor, SubscriptionManager,
+    ConnectionState, SubscriptionState, DisconnectionReason, ReconnectionError,
+    ReconnectionConfig, HeartbeatConfig, ConnectionMetrics, SubscriptionStatistics,
+    ConnectionEvent, SubscriptionStatus, LightstreamerError, SubscriptionError,
+};

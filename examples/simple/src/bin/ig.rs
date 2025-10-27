@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a new Lightstreamer client instance and wrap it in an Arc<Mutex<>> so it can be shared across threads.
     let client = Arc::new(Mutex::new(LightstreamerClient::new(
-        Some("https://apd.marketdatasystems.com/lightstreamer"),
+        Some("https://demo-apd.marketdatasystems.com/lightstreamer"),
         None,
         account_id,
         Some(&format!(
