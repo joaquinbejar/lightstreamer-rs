@@ -1,6 +1,6 @@
 [package]
 name = "lightstreamer-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust client for Lightstreamer, designed to facilitate real-time communication with Lightstreamer servers."
