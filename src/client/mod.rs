@@ -19,3 +19,4 @@ pub use listener::ClientListener;
 pub use message_listener::ClientMessageListener;
 pub use model::{ClientStatus, ConnectionType, DisconnectionType, LogType, Transport};
 pub use request::SubscriptionRequest;
+pub use utils::{ChannelBasedClient, ChannelClientConfig, SubscriptionMessage, SubscriptionUpdate};

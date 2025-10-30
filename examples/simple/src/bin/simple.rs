@@ -1,4 +1,3 @@
-
 use colored::*;
 use lightstreamer_rs::client::{LightstreamerClient, Transport};
 use lightstreamer_rs::subscription::{

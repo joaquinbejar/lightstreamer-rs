@@ -5,6 +5,7 @@
 ******************************************************************************/
 
 /// Represents the current status of the `LightstreamerClient`.
+#[derive(Debug, Clone)]
 pub enum ClientStatus {
     /// The client is attempting to connect to the Lightstreamer Server.
     Connecting,
@@ -43,7 +44,7 @@ impl std::fmt::Display for ClientStatus {
 ///
 /// This enum indicates the specific transport protocol and connection mode being used
 /// for communication with the server.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConnectionType {
     /// Connection established using HTTP polling transport.
     HttpPolling,
@@ -62,7 +63,7 @@ pub enum ConnectionType {
 ///
 /// This enum provides information about the disconnection state and what actions
 /// the client will take following the disconnection.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DisconnectionType {
     /// The client will automatically try to reconnect to the server.
     WillRetry,
