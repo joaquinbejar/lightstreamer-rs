@@ -3,7 +3,6 @@ use lightstreamer_rs::subscription::{
     ItemUpdate, Snapshot, Subscription, SubscriptionListener, SubscriptionMode,
 };
 use lightstreamer_rs::utils::{setup_logger, setup_signal_hook};
-use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
@@ -26,7 +25,7 @@ pub struct Config {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
     //
     // Create a new subscription instance.
@@ -35,7 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         SubscriptionMode::Merge,
         Some(vec![
             // "MARKET:OP.D.OTCDAX1.021100P.IP".to_string(),
-            "ACCOUNT:BSI1I".to_string(),
+            "ACCOUNT:ZR24W".to_string(),
         ]),
         Some(
             // vec!["BID".to_string(), "OFFER".to_string()]
@@ -57,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create a new Lightstreamer client instance and wrap it in an Arc<Mutex<>> so it can be shared across threads.
     let client = Arc::new(Mutex::new(LightstreamerClient::new(
-        Some("https://apd.marketdatasystems.com/lightstreamer"),
+        Some("https://demo-apd.marketdatasystems.com/lightstreamer"),
         None,
         account_id,
         Some(&format!(
@@ -75,6 +74,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
+        client
+            .connection_options
+            .set_reconnect_timeout(3000)
+            .expect("Failed to set reconnect timeout");
+        client
+            .connection_options
+            .set_keepalive_interval(30000)
+            .expect("Failed to set keepalive interval");
+        client
+            .connection_options
+            .set_idle_timeout(120000)
+            .expect("Failed to set idle timeout");
     }
 
     // Create a new Notify instance to send a shutdown signal to the signal handler thread.
@@ -90,7 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut retry_counter: u64 = 0;
     while retry_counter < MAX_CONNECTION_ATTEMPTS {
         let mut client = client.lock().await;
-        match client.connect(Arc::clone(&shutdown_signal)).await {
+        match client.connect_direct(Arc::clone(&shutdown_signal)).await {
             Ok(_) => {
                 client.disconnect().await;
                 break;

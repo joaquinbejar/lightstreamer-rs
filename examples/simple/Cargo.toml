@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lightstreamer-rs = { path = "../.." }
-tokio = { version = "1.48", features = ["sync", "macros", "rt-multi-thread", "time"] }
-colored = "3.0"
-serde_json = "1.0"
-tracing = "0.1"
+lightstreamer-rs = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "time"] }
+colored = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

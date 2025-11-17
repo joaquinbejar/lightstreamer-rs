@@ -24,5 +24,5 @@ mod model;
 mod item_update;
 
 pub use item_update::ItemUpdate;
-pub use listener::SubscriptionListener;
+pub use listener::{ChannelSubscriptionListener, SubscriptionListener};
 pub use model::{Snapshot, Subscription, SubscriptionMode};

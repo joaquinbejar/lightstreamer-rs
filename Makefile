@@ -1,7 +1,7 @@
 # Makefile for common tasks in a Rust project
 # Detect current branch
 CURRENT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
-ZIP_NAME = lightstreamer-rs.zip
+
 
 
 # Default target
@@ -35,11 +35,11 @@ fmt-check:
 # Run Clippy for linting
 .PHONY: lint
 lint:
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --all-features --workspace -- -D warnings
 
 .PHONY: lint-fix
 lint-fix: 
-	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged --workspace -- -D warnings
 
 # Clean the project
 .PHONY: clean
@@ -88,7 +88,7 @@ coverage-html:
 	export LOGLEVEL=WARN
 	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --color Always --engine llvm --tests --all-targets --all-features --workspace --timeout 0 --out Html
+	cargo tarpaulin --color Always --tests --all-targets --all-features --workspace --timeout 0 --out Html
 
 .PHONY: open-coverage
 open-coverage:
@@ -117,18 +117,10 @@ check-cargo-readme:
 
 .PHONY: check-spanish
 check-spanish:
-	cd scripts && python3 spanish.py ../src && cd ..
-
-.PHONY: zip
-zip:
-	@echo "Creating $(ZIP_NAME) without any 'target' directories, 'Cargo.lock', and hidden files..."
-	@find . -type f \
-		! -path "*/target/*" \
-		! -path "./.*" \
-		! -name "Cargo.lock" \
-		! -name ".*" \
-		| zip -@ $(ZIP_NAME)
-	@echo "$(ZIP_NAME) created successfully."
+	@rg -n --pcre2 -e '^\s*(//|///|//!|#|/\*|\*).*?[áéíóúÁÉÍÓÚñÑ¿¡]' \
+    	    --glob '!target/*' \
+    	    --glob '!**/*.png' \
+    	    . || (echo "❌  Spanish comments found"; exit 1)
 
 
 .PHONY: check-cargo-criterion
