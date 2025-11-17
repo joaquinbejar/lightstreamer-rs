@@ -1,5 +1,5 @@
 use crate::client::Transport;
-use crate::connection::management::{ReconnectionConfig, HeartbeatConfig};
+use crate::connection::management::{HeartbeatConfig, ReconnectionConfig};
 use crate::utils::{IllegalArgumentException, Proxy};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};

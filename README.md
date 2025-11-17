@@ -19,6 +19,11 @@
 
 This project is a Rust implementation of the Lightstreamer TLCP (Text-based Live Connections Protocol). It provides a robust client SDK to interact with Lightstreamer servers, enabling real-time data streaming for financial applications, IoT systems, and other use cases requiring live data updates. While it was initially developed to support the [ig_trading_api](https://github.com/joaquinbejar/ig_trading_api) project, it has evolved into a more comprehensive SDK with broader applicability.
 
+### Attribution
+
+This project contains code derived from [lightstreamer-client](https://github.com/daniloaz/lightstreamer-client)
+by Daniel López Azaña (@daniloaz), originally published under GPL-3.0-only license in February 2024.
+
 ### About Lightstreamer
 
 Lightstreamer is a high-performance real-time messaging server that provides several key features:
@@ -323,4 +328,4 @@ We appreciate your interest and look forward to your contributions!
 
 ## ✍️ License
 
-Licensed under MIT license
+Licensed under GPL-3.0 license
