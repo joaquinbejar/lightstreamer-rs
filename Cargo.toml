@@ -2,7 +2,7 @@
 name = "lightstreamer-rs"
 version = "0.2.0"
 edition = "2024"
-authors = ["Joaquin Bejar <jb@taunais.com>"]
+authors = ["Joaquin Bejar <jb@taunais.com>", "Daniel López Azaña (original lightstreamer-client author)"]
 description = "A Rust client for Lightstreamer, designed to facilitate real-time communication with Lightstreamer servers."
 license = "GPL-3.0-only"
 repository = "https://github.com/joaquinbejar/lightstreamer-rs"

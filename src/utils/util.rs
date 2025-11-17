@@ -62,7 +62,7 @@ pub fn parse_arguments(input: &str) -> Vec<&str> {
     let mut start = 0;
     let mut in_brackets = 0; // Tracks nesting level for curly braces
 
-    for (i, c) in input.chars().enumerate() {
+    for (i, c) in input.char_indices() {
         match c {
             '{' => in_brackets += 1,
             '}' => in_brackets -= 1,

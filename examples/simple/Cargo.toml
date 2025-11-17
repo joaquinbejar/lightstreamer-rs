@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 lightstreamer-rs = { path = "../.." }
-tokio = { version = "1.45.0", features = ["sync", "macros", "rt-multi-thread", "time"] }
-colored = "3.0.0"
-serde_json = "1.0.140"
-tracing = "0.1.41"
+tokio = { version = "1.48", features = ["sync", "macros", "rt-multi-thread", "time"] }
+colored = "3.0"
+serde_json = "1.0"
+tracing = "0.1"

@@ -24,8 +24,8 @@
 //!
 //! ## Attribution
 //!
-//! This project contains code derived from [lightstreamer-client](https://github.com/daniloaz/lightstreamer-client) 
-//! by Daniel López Azaña, originally published under GPL-3.0-only license in February 2024.
+//! This project contains code derived from [lightstreamer-client](https://github.com/daniloaz/lightstreamer-client)
+//! by Daniel López Azaña (@daniloaz), originally published under GPL-3.0-only license in February 2024.
 //!
 //! ## About Lightstreamer
 //!

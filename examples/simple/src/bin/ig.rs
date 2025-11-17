@@ -10,7 +10,6 @@ use tracing::{error, info, warn};
 
 const MAX_CONNECTION_ATTEMPTS: u64 = 1;
 
-
 pub struct MySubscriptionListener {}
 
 impl SubscriptionListener for MySubscriptionListener {
@@ -40,14 +39,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ]),
         Some(
             // vec!["BID".to_string(), "OFFER".to_string()]
-            vec!["PNL".to_string()]
+            vec!["PNL".to_string()],
         ),
     )?;
 
     my_subscription.set_data_adapter(None)?;
     my_subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
     my_subscription.add_listener(Box::new(MySubscriptionListener {}));
-    
+
     let config = Config {
         cst: std::env::var("CST")?,
         x_security_token: std::env::var("X_SECURITY_TOKEN")?,
@@ -61,7 +60,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some("https://apd.marketdatasystems.com/lightstreamer"),
         None,
         account_id,
-        Some(&format!("CST-{}|XST-{}", config.cst, config.x_security_token)),
+        Some(&format!(
+            "CST-{}|XST-{}",
+            config.cst, config.x_security_token
+        )),
     )?));
 
     //

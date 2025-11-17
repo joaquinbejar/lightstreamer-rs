@@ -2,7 +2,7 @@
 <img src="https://raw.githubusercontent.com/joaquinbejar/lightstreamer-rs/refs/heads/main/doc/images/logo.png" alt="lightstreamer-rs" style="width: 100%; height: 100%;">
 </div>
 
-[![GPL-3.0 License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/lightstreamer-rs.svg)](https://crates.io/crates/lightstreamer-rs)
 [![Downloads](https://img.shields.io/crates/d/lightstreamer-rs.svg)](https://crates.io/crates/lightstreamer-rs)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/lightstreamer-rs.svg)](https://github.com/joaquinbejar/lightstreamer-rs/stargazers)
@@ -21,7 +21,8 @@ This project is a Rust implementation of the Lightstreamer TLCP (Text-based Live
 
 ### Attribution
 
-This project contains code derived from [lightstreamer-client](https://github.com/daniloaz/lightstreamer-client) by Daniel López Azaña, originally published under GPL-3.0-only license in February 2024. We are grateful for Daniel's pioneering work in bringing Lightstreamer support to the Rust ecosystem. Portions of this codebase, including but not limited to the `ItemUpdate` structure and related functionality, are based on or inspired by his original implementation.
+This project contains code derived from [lightstreamer-client](https://github.com/daniloaz/lightstreamer-client)
+by Daniel López Azaña (@daniloaz), originally published under GPL-3.0-only license in February 2024.
 
 ### About Lightstreamer
 
@@ -253,13 +254,4 @@ We appreciate your interest and look forward to your contributions!
 
 ## ✍️ License
 
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only). See the [LICENSE](./LICENSE) file for details.
-
-### Copyright Notices
-
-- Copyright (C) 2024 Joaquín Béjar García
-- Portions derived from [lightstreamer-client](https://github.com/daniloaz/lightstreamer-client) - Copyright (C) 2024 Daniel López Azaña
-
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+Licensed under GPL-3.0 license
