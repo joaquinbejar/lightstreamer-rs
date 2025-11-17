@@ -1,0 +1,35 @@
+lightstreamer-rs
+Copyright (C) 2024 Joaquín Béjar García
+
+This project contains code derived from lightstreamer-client, which is
+Copyright (C) 2024 Daniel López Azaña
+Original project: https://github.com/daniloaz/lightstreamer-client
+
+Both the original work and this derivative work are licensed under the
+GNU General Public License version 3.0 (GPL-3.0-only).
+
+The following portions of this codebase are based on or derived from
+the original lightstreamer-client project:
+
+- src/subscription/item_update.rs - ItemUpdate structure and related functionality
+- src/subscription/listener.rs - SubscriptionListener trait and event handling
+- src/subscription/model.rs - Subscription models and types
+- src/client/mod.rs - Client module structure
+- src/connection/mod.rs - Connection management structure
+- Additional files in the subscription, client, and connection modules
+
+We are grateful to Daniel López Azaña for his pioneering work in bringing
+Lightstreamer support to the Rust ecosystem.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
