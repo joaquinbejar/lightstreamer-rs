@@ -452,7 +452,9 @@ impl LightstreamerClient {
         //
         // Initiate communication with the server by sending a 'wsok' message.
         //
+        debug!("Sending 'wsok' message to server");
         write_stream.send(Message::Text("wsok".into())).await?;
+        debug!("'wsok' message sent successfully");
 
         //
         // Start reading and processing messages from the server.
@@ -793,14 +795,9 @@ impl LightstreamerClient {
                                         //
                                         // Request session creation.
                                         //
-                                        let ls_adapter_set = match self.connection_details.get_adapter_set() {
-                                            Some(adapter_set) => adapter_set,
-                                            None => {
-                                                return Err(Box::new(IllegalStateException::new(
-                                                    "No adapter set found in connection details.",
-                                                )));
-                                            },
-                                        };
+                                        let default_adapter_set = "DEFAULT".to_string();
+                                        let ls_adapter_set = self.connection_details.get_adapter_set()
+                                            .unwrap_or(&default_adapter_set);
                                         let ls_send_sync = self.connection_options.get_send_sync().to_string();
                                         let mut params: Vec<(&str, &str)> = vec![
                                             ("LS_adapter_set", ls_adapter_set),
@@ -831,6 +828,24 @@ impl LightstreamerClient {
                                     },
                                 }
                             }
+                        },
+                        Some(Ok(Message::Close(close_frame))) => {
+                            if let Some(frame) = close_frame {
+                                self.make_log(Level::WARN, &format!(
+                                    "Server closed connection: code={}, reason='{}'",
+                                    frame.code, frame.reason
+                                ));
+                            } else {
+                                self.make_log(Level::WARN, "Server closed connection without reason");
+                            }
+                            break;
+                        },
+                        Some(Ok(Message::Ping(data))) => {
+                            self.make_log(Level::DEBUG, "Received ping from server, sending pong");
+                            write_stream.send(Message::Pong(data)).await?;
+                        },
+                        Some(Ok(Message::Pong(_))) => {
+                            self.make_log(Level::DEBUG, "Received pong from server");
                         },
                         Some(Ok(non_text_message)) => {
                             return Err(Box::new(std::io::Error::new(
