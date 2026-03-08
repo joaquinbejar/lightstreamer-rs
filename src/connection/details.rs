@@ -1,5 +1,5 @@
 use crate::client::ClientListener;
-use crate::utils::IllegalArgumentException;
+use crate::utils::LightstreamerError;
 use std::fmt::{self, Debug, Formatter};
 
 /// Used by `LightstreamerClient` to provide a basic connection properties data object.
@@ -170,12 +170,16 @@ impl ConnectionDetails {
     }
 
     /// Creates a new ConnectionDetails object with default values.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LightstreamerError::InvalidArgument` if the server address is invalid.
     pub fn new(
         server_address: Option<&str>,
         adapter_set: Option<&str>,
         user: Option<&str>,
         password: Option<&str>,
-    ) -> Result<ConnectionDetails, Box<dyn std::error::Error>> {
+    ) -> Result<ConnectionDetails, LightstreamerError> {
         let mut connection_details = ConnectionDetails::default();
         connection_details.set_server_address(server_address.map(|s| s.to_string()))?;
         connection_details.set_adapter_set(adapter_set.map(|s| s.to_string()));
@@ -209,7 +213,7 @@ impl ConnectionDetails {
     /// * `adapter_set`: The name of the Adapter Set to be used. A `None` value is equivalent to
     ///   the "DEFAULT" name.
     pub fn set_adapter_set(&mut self, adapter_set: Option<String>) {
-        self.adapter_set = Some(adapter_set.unwrap_or("DEFAULT".to_string()));
+        self.adapter_set = Some(adapter_set.unwrap_or_else(|| "DEFAULT".to_string()));
 
         // Notify listeners about the property change
         for listener in &self.listeners {
@@ -284,19 +288,19 @@ impl ConnectionDetails {
     /// - `http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]`
     /// - `http://[2001:0db8:85a3::8a2e:0370:7334]:8080`
     ///
-    /// # Raises
+    /// # Errors
     ///
-    /// * `IllegalArgumentException`: if the given address is not valid.
+    /// Returns `LightstreamerError::InvalidArgument` if the given address is not valid.
     pub fn set_server_address(
         &mut self,
         server_address: Option<String>,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         // Validate the server address
         if let Some(address) = &server_address
             && !address.starts_with("http://")
             && !address.starts_with("https://")
         {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Invalid server address: must start with http:// or https://",
             ));
         }

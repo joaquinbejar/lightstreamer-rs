@@ -1,6 +1,6 @@
 use crate::client::Transport;
 use crate::connection::management::{HeartbeatConfig, ReconnectionConfig};
-use crate::utils::{IllegalArgumentException, Proxy};
+use crate::utils::{LightstreamerError, Proxy};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 
@@ -341,13 +341,10 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative or zero value is configured
-    pub fn set_content_length(
-        &mut self,
-        content_length: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    /// * `LightstreamerError`: if a negative or zero value is configured
+    pub fn set_content_length(&mut self, content_length: u64) -> Result<(), LightstreamerError> {
         if content_length == 0 {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Content length cannot be zero",
             ));
         }
@@ -379,13 +376,13 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if a negative or zero value is configured
     pub fn set_first_retry_max_delay(
         &mut self,
         first_retry_max_delay: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if first_retry_max_delay == 0 {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "First retry max delay cannot be zero",
             ));
         }
@@ -443,7 +440,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if the given value is not in the list of the admitted ones.
+    /// * `LightstreamerError`: if the given value is not in the list of the admitted ones.
     pub fn set_forced_transport(&mut self, forced_transport: Option<Transport>) {
         self.forced_transport = forced_transport;
     }
@@ -533,10 +530,12 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative value is configured
-    pub fn set_idle_timeout(&mut self, idle_timeout: u64) -> Result<(), IllegalArgumentException> {
+    /// * `LightstreamerError`: if a negative value is configured
+    pub fn set_idle_timeout(&mut self, idle_timeout: u64) -> Result<(), LightstreamerError> {
         if idle_timeout == 0 {
-            return Err(IllegalArgumentException::new("Idle timeout cannot be zero"));
+            return Err(LightstreamerError::invalid_argument(
+                "Idle timeout cannot be zero",
+            ));
         }
 
         self.idle_timeout = idle_timeout;
@@ -566,7 +565,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative value is configured
+    /// * `LightstreamerError`: if a negative value is configured
     ///
     /// See also `setStalledTimeout()`
     ///
@@ -574,7 +573,7 @@ impl ConnectionOptions {
     pub fn set_keepalive_interval(
         &mut self,
         keepalive_interval: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if keepalive_interval == 0 {
             self.keepalive_interval = keepalive_interval;
             return Ok(());
@@ -582,7 +581,7 @@ impl ConnectionOptions {
 
         if keepalive_interval < self.stalled_timeout || keepalive_interval < self.reconnect_timeout
         {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Keepalive interval should be greater than or equal to stalled timeout and reconnect timeout",
             ));
         }
@@ -632,18 +631,18 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative value is configured
+    /// * `LightstreamerError`: if a negative value is configured
     pub fn set_polling_interval(
         &mut self,
         polling_interval: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if polling_interval == 0 {
             self.polling_interval = polling_interval;
             return Ok(());
         }
 
         if polling_interval < self.idle_timeout {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Polling interval should be greater than or equal to idle timeout",
             ));
         }
@@ -690,7 +689,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if a negative or zero value is configured
     ///
     /// See also `setStalledTimeout()`
     ///
@@ -698,9 +697,9 @@ impl ConnectionOptions {
     pub fn set_reconnect_timeout(
         &mut self,
         reconnect_timeout: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if reconnect_timeout == 0 {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Reconnect timeout cannot be zero",
             ));
         }
@@ -738,18 +737,18 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative, zero, or a not-number value (excluding special
+    /// * `LightstreamerError`: if a negative, zero, or a not-number value (excluding special
     ///   values) is passed.
     ///
     /// See also `get_real_max_bandwidth()`
     pub fn set_requested_max_bandwidth(
         &mut self,
         max_bandwidth: Option<f64>,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if let Some(bandwidth) = max_bandwidth
             && bandwidth <= 0.0
         {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Maximum bandwidth should be a positive number or 'unlimited'",
             ));
         }
@@ -802,12 +801,14 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if a negative or zero value is configured
     ///
     /// See also `setFirstRetryMaxDelay()`
-    pub fn set_retry_delay(&mut self, retry_delay: u64) -> Result<(), IllegalArgumentException> {
+    pub fn set_retry_delay(&mut self, retry_delay: u64) -> Result<(), LightstreamerError> {
         if retry_delay == 0 {
-            return Err(IllegalArgumentException::new("Retry delay cannot be zero"));
+            return Err(LightstreamerError::invalid_argument(
+                "Retry delay cannot be zero",
+            ));
         }
 
         self.retry_delay = retry_delay;
@@ -859,18 +860,18 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative value is configured
+    /// * `LightstreamerError`: if a negative value is configured
     pub fn set_reverse_heartbeat_interval(
         &mut self,
         reverse_heartbeat_interval: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if reverse_heartbeat_interval == 0 {
             self.reverse_heartbeat_interval = reverse_heartbeat_interval;
             return Ok(());
         }
 
         if reverse_heartbeat_interval < self.retry_delay {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Reverse heartbeat interval should be greater than or equal to retry delay",
             ));
         }
@@ -945,18 +946,18 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative value is passed.
+    /// * `LightstreamerError`: if a negative value is passed.
     pub fn set_session_recovery_timeout(
         &mut self,
         session_recovery_timeout: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         if session_recovery_timeout == 0 {
             self.session_recovery_timeout = session_recovery_timeout;
             return Ok(());
         }
 
         if session_recovery_timeout < self.retry_delay {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Session recovery timeout should be greater than or equal to retry delay",
             ));
         }
@@ -1012,29 +1013,26 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `IllegalArgumentException`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if a negative or zero value is configured
     ///
     /// See also `setReconnectTimeout()`
     ///
     /// See also `setKeepaliveInterval()`
-    pub fn set_stalled_timeout(
-        &mut self,
-        stalled_timeout: u64,
-    ) -> Result<(), IllegalArgumentException> {
+    pub fn set_stalled_timeout(&mut self, stalled_timeout: u64) -> Result<(), LightstreamerError> {
         if stalled_timeout == 0 {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Stalled timeout cannot be zero",
             ));
         }
 
         if stalled_timeout >= self.keepalive_interval {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Stalled timeout should be less than keepalive interval",
             ));
         }
 
         if stalled_timeout >= self.reconnect_timeout {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Stalled timeout should be less than reconnect timeout",
             ));
         }

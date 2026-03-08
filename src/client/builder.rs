@@ -13,6 +13,7 @@ use crate::client::{LightstreamerClient, Transport};
 use crate::subscription::{
     ChannelSubscriptionListener, ItemUpdate, Snapshot, Subscription, SubscriptionMode,
 };
+use crate::utils::LightstreamerError;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, mpsc};
 
@@ -190,7 +191,7 @@ impl SimpleClient {
     /// # Errors
     ///
     /// Returns an error if the client cannot be created
-    pub fn new(config: ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: ClientConfig) -> Result<Self, LightstreamerError> {
         let mut client = LightstreamerClient::new(
             Some(&config.server_address),
             config.adapter_set.as_deref(),
@@ -248,7 +249,7 @@ impl SimpleClient {
     pub async fn subscribe(
         &self,
         params: SubscriptionParams,
-    ) -> Result<mpsc::UnboundedReceiver<ItemUpdate>, Box<dyn std::error::Error>> {
+    ) -> Result<mpsc::UnboundedReceiver<ItemUpdate>, LightstreamerError> {
         let mut subscription =
             Subscription::new(params.mode, Some(params.items), Some(params.fields))?;
 
@@ -281,8 +282,10 @@ impl SimpleClient {
     /// # Errors
     ///
     /// Returns an error if the connection fails
-    pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error>> {
-        LightstreamerClient::connect(self.client.clone(), self.shutdown_signal.clone()).await
+    pub async fn connect(&self) -> Result<(), LightstreamerError> {
+        LightstreamerClient::connect(self.client.clone(), self.shutdown_signal.clone())
+            .await
+            .map_err(LightstreamerError::from)
     }
 
     /// Disconnects from the Lightstreamer server.
