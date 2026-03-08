@@ -857,20 +857,26 @@ impl LightstreamerClient {
                         }
 
                         subscription_id += 1;
-                        if let Some(sub) = self.subscriptions.last_mut() {
+                        // SAFETY: We just pushed a subscription, so last_mut() must return Some.
+                        // Using debug_assert to catch invariant violations during development.
+                        let sub = self.subscriptions.last_mut();
+                        debug_assert!(sub.is_some(), "subscriptions.last_mut() returned None after push()");
+                        if let Some(sub) = sub {
                             sub.id = subscription_id;
                             sub.id_sender.try_send(subscription_id)?;
                         }
 
-                        let Some(last_sub) = self.subscriptions.last() else {
-                            continue;
-                        };
-                        let encoded_params = match Self::get_subscription_params(last_sub, request_id)
-                        {
-                            Ok(params) => params,
-                            Err(err) => {
-                                return Err(err);
-                            },
+                        // SAFETY: We just pushed a subscription, so last() must return Some.
+                        // Extract encoded_params in a separate scope to avoid borrow across await.
+                        let encoded_params = {
+                            let last_sub = self.subscriptions.last();
+                            debug_assert!(last_sub.is_some(), "subscriptions.last() returned None after push()");
+                            let Some(last_sub) = last_sub else {
+                                return Err(LightstreamerError::invalid_state(
+                                    "subscriptions.last() returned None immediately after push()"
+                                ));
+                            };
+                            Self::get_subscription_params(last_sub, request_id)?
                         };
 
                         write_stream
@@ -1282,7 +1288,7 @@ impl LightstreamerClient {
     ///
     /// # Parameters
     ///
-    /// * `subsrciption_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
+    /// * `subscription_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
     /// * `subscription`: A `Subscription` object, carrying all the information needed to process real-time
     ///   values.
     ///
@@ -1352,7 +1358,7 @@ impl LightstreamerClient {
     ///
     /// # Parameters
     ///
-    /// * `subsrciption_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
+    /// * `subscription_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
     /// * `subscription_id`: The id of the subscription to be unsubscribed from.
     ///   instance.
     ///

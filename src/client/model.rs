@@ -82,13 +82,13 @@ pub enum DisconnectionType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum LogType {
-    /// Use the tracing crate for logging.
-    /// This provides structured, leveled logging with spans and events.
-    TracingLogs,
     /// Use standard output (stdout/stderr) for logging.
     /// This provides simpler logging directly to the console.
     #[default]
-    StdLogs,
+    StdLogs = 0,
+    /// Use the tracing crate for logging.
+    /// This provides structured, leveled logging with spans and events.
+    TracingLogs = 1,
 }
 
 /// The transport type to be used by the client.
