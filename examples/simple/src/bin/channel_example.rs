@@ -15,7 +15,7 @@ const MAX_CONNECTION_ATTEMPTS: u64 = 1;
 /// item updates through a tokio channel, enabling asynchronous processing
 /// in a separate task.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
 
     info!("🚀 Starting Channel-based Subscription Example");
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut client_guard = client.lock().await;
         LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-            .await;
+            .await?;
         client_guard
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
@@ -160,9 +160,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("✅ Exiting orderly from Lightstreamer client...");
     }
 
-    // Wait for processor to finish
-    info!("⏳ Waiting for update processor to finish...");
-    let _ = processor_handle.await;
+    // Abort the processor task since the channel won't close automatically
+    info!("⏳ Stopping update processor...");
+    processor_handle.abort();
+    // Awaiting an aborted task returns JoinError which we intentionally ignore
+    drop(processor_handle.await);
 
     info!("✨ Channel-based subscription example completed!");
     info!("Key features demonstrated:");

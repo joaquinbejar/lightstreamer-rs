@@ -26,7 +26,7 @@ mod tests {
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
         )
-        .unwrap();
+        .expect("Failed to create test subscription1");
         subscription1.id = 1;
 
         // Create another test subscription with ID 2
@@ -35,7 +35,7 @@ mod tests {
             Some(vec!["item2".to_string()]),
             Some(vec!["field2".to_string()]),
         )
-        .unwrap();
+        .expect("Failed to create test subscription2");
         subscription2.id = 2;
 
         // Create a vector of subscriptions
@@ -43,13 +43,13 @@ mod tests {
 
         // Test finding subscription with ID 1
         let result = get_subscription_by_id(&subscriptions, 1);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().id, 1);
+        assert!(result.is_some(), "Subscription with ID 1 should be found");
+        assert_eq!(result.map(|s| s.id), Some(1));
 
         // Test finding subscription with ID 2
         let result = get_subscription_by_id(&subscriptions, 2);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().id, 2);
+        assert!(result.is_some(), "Subscription with ID 2 should be found");
+        assert_eq!(result.map(|s| s.id), Some(2));
     }
 
     #[test]
@@ -60,7 +60,7 @@ mod tests {
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
         )
-        .unwrap();
+        .expect("Failed to create test subscription");
         subscription.id = 1;
 
         // Create a vector with one subscription

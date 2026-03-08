@@ -126,91 +126,148 @@ mod tests {
 
         // Helper methods to check what was called
         fn was_on_abort_called(&self) -> bool {
-            *self.on_abort_called.lock().unwrap()
+            self.on_abort_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_on_abort_message(&self) -> Option<String> {
-            self.on_abort_message.lock().unwrap().clone()
+            self.on_abort_message.lock().ok().and_then(|g| g.clone())
         }
 
         fn was_sent_on_network(&self) -> bool {
-            *self.on_abort_sent_on_network.lock().unwrap()
+            self.on_abort_sent_on_network
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn was_on_deny_called(&self) -> bool {
-            *self.on_deny_called.lock().unwrap()
+            self.on_deny_called.lock().ok().map(|g| *g).unwrap_or(false)
         }
 
         fn get_on_deny_message(&self) -> Option<String> {
-            self.on_deny_message.lock().unwrap().clone()
+            self.on_deny_message.lock().ok().and_then(|g| g.clone())
         }
 
         fn get_on_deny_code(&self) -> i32 {
-            *self.on_deny_code.lock().unwrap()
+            self.on_deny_code.lock().ok().map(|g| *g).unwrap_or(0)
         }
 
         fn get_on_deny_error(&self) -> Option<String> {
-            self.on_deny_error.lock().unwrap().clone()
+            self.on_deny_error.lock().ok().and_then(|g| g.clone())
         }
 
         fn was_on_discarded_called(&self) -> bool {
-            *self.on_discarded_called.lock().unwrap()
+            self.on_discarded_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_on_discarded_message(&self) -> Option<String> {
-            self.on_discarded_message.lock().unwrap().clone()
+            self.on_discarded_message
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
         }
 
         fn was_on_error_called(&self) -> bool {
-            *self.on_error_called.lock().unwrap()
+            self.on_error_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_on_error_message(&self) -> Option<String> {
-            self.on_error_message.lock().unwrap().clone()
+            self.on_error_message.lock().ok().and_then(|g| g.clone())
         }
 
         fn was_on_processed_called(&self) -> bool {
-            *self.on_processed_called.lock().unwrap()
+            self.on_processed_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_on_processed_message(&self) -> Option<String> {
-            self.on_processed_message.lock().unwrap().clone()
+            self.on_processed_message
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
         }
 
         fn get_on_processed_response(&self) -> Option<String> {
-            self.on_processed_response.lock().unwrap().clone()
+            self.on_processed_response
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
         }
     }
 
     // Implement ClientMessageListener for our test struct
     impl ClientMessageListener for TestClientMessageListener {
         fn on_abort(&self, msg: &str, sent_on_network: bool) {
-            *self.on_abort_called.lock().unwrap() = true;
-            *self.on_abort_message.lock().unwrap() = Some(msg.to_string());
-            *self.on_abort_sent_on_network.lock().unwrap() = sent_on_network;
+            if let Ok(mut guard) = self.on_abort_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.on_abort_message.lock() {
+                *guard = Some(msg.to_string());
+            }
+            if let Ok(mut guard) = self.on_abort_sent_on_network.lock() {
+                *guard = sent_on_network;
+            }
         }
 
         fn on_deny(&self, msg: &str, code: i32, error: &str) {
-            *self.on_deny_called.lock().unwrap() = true;
-            *self.on_deny_message.lock().unwrap() = Some(msg.to_string());
-            *self.on_deny_code.lock().unwrap() = code;
-            *self.on_deny_error.lock().unwrap() = Some(error.to_string());
+            if let Ok(mut guard) = self.on_deny_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.on_deny_message.lock() {
+                *guard = Some(msg.to_string());
+            }
+            if let Ok(mut guard) = self.on_deny_code.lock() {
+                *guard = code;
+            }
+            if let Ok(mut guard) = self.on_deny_error.lock() {
+                *guard = Some(error.to_string());
+            }
         }
 
         fn on_discarded(&self, msg: &str) {
-            *self.on_discarded_called.lock().unwrap() = true;
-            *self.on_discarded_message.lock().unwrap() = Some(msg.to_string());
+            if let Ok(mut guard) = self.on_discarded_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.on_discarded_message.lock() {
+                *guard = Some(msg.to_string());
+            }
         }
 
         fn on_error(&self, msg: &str) {
-            *self.on_error_called.lock().unwrap() = true;
-            *self.on_error_message.lock().unwrap() = Some(msg.to_string());
+            if let Ok(mut guard) = self.on_error_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.on_error_message.lock() {
+                *guard = Some(msg.to_string());
+            }
         }
 
         fn on_processed(&self, msg: &str, response: Option<&str>) {
-            *self.on_processed_called.lock().unwrap() = true;
-            *self.on_processed_message.lock().unwrap() = Some(msg.to_string());
-            *self.on_processed_response.lock().unwrap() = response.map(|s| s.to_string());
+            if let Ok(mut guard) = self.on_processed_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.on_processed_message.lock() {
+                *guard = Some(msg.to_string());
+            }
+            if let Ok(mut guard) = self.on_processed_response.lock() {
+                *guard = response.map(|s| s.to_string());
+            }
         }
     }
 

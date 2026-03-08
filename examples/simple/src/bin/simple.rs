@@ -38,7 +38,7 @@ impl SubscriptionListener for MySubscriptionListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
     //
     // Create a new subscription instance.
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     {
         let mut client = client.lock().await;
-        LightstreamerClient::subscribe(client.subscription_sender.clone(), my_subscription).await;
+        LightstreamerClient::subscribe(client.subscription_sender.clone(), my_subscription).await?;
         client
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));

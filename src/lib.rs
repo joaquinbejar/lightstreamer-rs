@@ -103,7 +103,7 @@
 //! use lightstreamer_rs::subscription::SubscriptionMode;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
 //!     // 1. Create configuration
 //!     let config = ClientConfig::new("http://push.lightstreamer.com/lightstreamer")
 //!         .adapter_set("DEMO");
@@ -332,3 +332,12 @@ pub mod client;
 ///
 /// This module provides types for managing connection details and options.
 pub mod connection;
+
+/// Prelude module for convenient imports.
+///
+/// Import all commonly used types with a single `use` statement:
+///
+/// ```ignore
+/// use lightstreamer_rs::prelude::*;
+/// ```
+pub mod prelude;

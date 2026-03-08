@@ -100,7 +100,7 @@ use lightstreamer_rs::client::{ClientConfig, SimpleClient, SubscriptionParams};
 use lightstreamer_rs::subscription::SubscriptionMode;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     // 1. Create configuration
     let config = ClientConfig::new("http://push.lightstreamer.com/lightstreamer")
         .adapter_set("DEMO");

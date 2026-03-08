@@ -351,9 +351,9 @@ mod tests {
         let fields = update.get_fields();
 
         assert_eq!(fields.len(), 3);
-        assert_eq!(fields.get("field1").unwrap(), &Some("value1".to_string()));
-        assert_eq!(fields.get("field2").unwrap(), &Some("value2".to_string()));
-        assert_eq!(fields.get("field3").unwrap(), &None);
+        assert_eq!(fields.get("field1"), Some(&Some("value1".to_string())));
+        assert_eq!(fields.get("field2"), Some(&Some("value2".to_string())));
+        assert_eq!(fields.get("field3"), Some(&None));
     }
 
     #[test]
@@ -362,8 +362,8 @@ mod tests {
         let changed_fields = update.get_changed_fields();
 
         assert_eq!(changed_fields.len(), 2);
-        assert_eq!(changed_fields.get("field1").unwrap(), "value1");
-        assert_eq!(changed_fields.get("field2").unwrap(), "value2");
+        assert_eq!(changed_fields.get("field1"), Some(&"value1".to_string()));
+        assert_eq!(changed_fields.get("field2"), Some(&"value2".to_string()));
         assert!(!changed_fields.contains_key("field3"));
     }
 

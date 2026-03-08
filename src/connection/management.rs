@@ -25,7 +25,7 @@ pub struct ConnectionManager {
 }
 
 /// Current state of the connection
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     /// Connection is not established
     Disconnected,
@@ -48,7 +48,7 @@ pub enum ConnectionState {
 }
 
 /// Reason for disconnection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisconnectionReason {
     /// Network-related error occurred
     NetworkError(String),
@@ -97,7 +97,7 @@ pub struct HeartbeatConfig {
 }
 
 /// Connection events that can be emitted
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     /// Connection has been established successfully
     Connected,
@@ -596,7 +596,7 @@ pub struct SubscriptionState {
 }
 
 /// Status of a subscription
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionStatus {
     /// Subscription is active and receiving updates
     Active,
@@ -612,19 +612,25 @@ pub enum SubscriptionStatus {
 }
 
 /// General Lightstreamer error type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LightstreamerError {
     /// Connection related errors
+    #[error("connection error: {0}")]
     Connection(String),
     /// Subscription related errors
+    #[error("subscription error: {0}")]
     Subscription(String),
     /// Authentication errors
+    #[error("authentication error: {0}")]
     Authentication(String),
     /// Configuration errors
+    #[error("configuration error: {0}")]
     Configuration(String),
     /// Network errors
+    #[error("network error: {0}")]
     Network(String),
     /// General errors
+    #[error("error: {0}")]
     General(String),
 }
 

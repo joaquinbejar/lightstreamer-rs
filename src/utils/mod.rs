@@ -14,7 +14,7 @@ mod util;
 
 mod logger;
 
-pub use error::{IllegalArgumentException, IllegalStateException};
+pub use error::{LightstreamerError, Result};
 pub use logger::{setup_logger, setup_logger_with_level};
 pub use proxy::Proxy;
 pub use util::{clean_message, parse_arguments, setup_signal_hook};

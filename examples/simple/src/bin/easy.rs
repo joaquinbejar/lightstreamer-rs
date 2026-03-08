@@ -15,7 +15,7 @@ use lightstreamer_rs::utils::setup_logger;
 use tracing::info;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
 
     info!("🚀 Starting Easy Lightstreamer Example");
@@ -83,8 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("✅ Shutdown complete");
 
-    // Wait for tasks to finish
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connect_handle).await;
+    // Wait for tasks to finish (timeout result intentionally ignored)
+    drop(tokio::time::timeout(std::time::Duration::from_secs(2), connect_handle).await);
 
     drop(processor);
 

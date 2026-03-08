@@ -13,6 +13,7 @@ use crate::client::{LightstreamerClient, Transport};
 use crate::subscription::{
     ChannelSubscriptionListener, ItemUpdate, Snapshot, Subscription, SubscriptionMode,
 };
+use crate::utils::LightstreamerError;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, mpsc};
 
@@ -50,6 +51,7 @@ impl ClientConfig {
     /// # Returns
     ///
     /// A new `ClientConfig` with default values
+    #[must_use]
     pub fn new(server_address: impl Into<String>) -> Self {
         Self {
             server_address: server_address.into(),
@@ -140,6 +142,7 @@ impl SubscriptionParams {
     /// # Returns
     ///
     /// A new `SubscriptionParams` instance
+    #[must_use]
     pub fn new(mode: SubscriptionMode, items: Vec<String>, fields: Vec<String>) -> Self {
         Self {
             mode,
@@ -188,7 +191,7 @@ impl SimpleClient {
     /// # Errors
     ///
     /// Returns an error if the client cannot be created
-    pub fn new(config: ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: ClientConfig) -> Result<Self, LightstreamerError> {
         let mut client = LightstreamerClient::new(
             Some(&config.server_address),
             config.adapter_set.as_deref(),
@@ -246,7 +249,7 @@ impl SimpleClient {
     pub async fn subscribe(
         &self,
         params: SubscriptionParams,
-    ) -> Result<mpsc::UnboundedReceiver<ItemUpdate>, Box<dyn std::error::Error>> {
+    ) -> Result<mpsc::UnboundedReceiver<ItemUpdate>, LightstreamerError> {
         let mut subscription =
             Subscription::new(params.mode, Some(params.items), Some(params.fields))?;
 
@@ -265,7 +268,7 @@ impl SimpleClient {
         // Add subscription to client
         let client_guard = self.client.lock().await;
         LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-            .await;
+            .await?;
 
         Ok(receiver)
     }
@@ -279,7 +282,7 @@ impl SimpleClient {
     /// # Errors
     ///
     /// Returns an error if the connection fails
-    pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn connect(&self) -> Result<(), LightstreamerError> {
         LightstreamerClient::connect(self.client.clone(), self.shutdown_signal.clone()).await
     }
 
@@ -292,6 +295,7 @@ impl SimpleClient {
     /// Gets a clone of the shutdown signal.
     ///
     /// This can be used to trigger shutdown from external code.
+    #[must_use]
     pub fn shutdown_signal(&self) -> Arc<Notify> {
         self.shutdown_signal.clone()
     }

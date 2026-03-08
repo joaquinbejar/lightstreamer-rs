@@ -72,7 +72,7 @@ impl SubscriptionListener for ConnectionAwareListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
 
     info!("🚀 Starting ConnectionManager Example");
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_guard
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
-        let _ = client_guard.connection_options.set_keepalive_interval(5);
+        client_guard.connection_options.set_keepalive_interval(5)?;
     }
 
     // Create multiple subscriptions to demonstrate preservation during reconnections
@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client_guard = client.lock().await;
         for subscription in subscriptions {
             LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-                .await;
+                .await?;
         }
     }
 
@@ -220,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn create_stock_subscription(
     name: &str,
     items: Vec<&str>,
-) -> Result<Subscription, Box<dyn std::error::Error>>
+) -> Result<Subscription, lightstreamer_rs::utils::LightstreamerError>
 where
     Subscription: Sized,
 {

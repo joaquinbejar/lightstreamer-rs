@@ -1,5 +1,5 @@
 use crate::client::ClientListener;
-use crate::utils::IllegalArgumentException;
+use crate::utils::LightstreamerError;
 use std::fmt::{self, Debug, Formatter};
 
 /// Used by `LightstreamerClient` to provide a basic connection properties data object.
@@ -170,12 +170,16 @@ impl ConnectionDetails {
     }
 
     /// Creates a new ConnectionDetails object with default values.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LightstreamerError::InvalidArgument` if the server address is invalid.
     pub fn new(
         server_address: Option<&str>,
         adapter_set: Option<&str>,
         user: Option<&str>,
         password: Option<&str>,
-    ) -> Result<ConnectionDetails, Box<dyn std::error::Error>> {
+    ) -> Result<ConnectionDetails, LightstreamerError> {
         let mut connection_details = ConnectionDetails::default();
         connection_details.set_server_address(server_address.map(|s| s.to_string()))?;
         connection_details.set_adapter_set(adapter_set.map(|s| s.to_string()));
@@ -209,7 +213,7 @@ impl ConnectionDetails {
     /// * `adapter_set`: The name of the Adapter Set to be used. A `None` value is equivalent to
     ///   the "DEFAULT" name.
     pub fn set_adapter_set(&mut self, adapter_set: Option<String>) {
-        self.adapter_set = Some(adapter_set.unwrap_or("DEFAULT".to_string()));
+        self.adapter_set = Some(adapter_set.unwrap_or_else(|| "DEFAULT".to_string()));
 
         // Notify listeners about the property change
         for listener in &self.listeners {
@@ -284,19 +288,19 @@ impl ConnectionDetails {
     /// - `http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]`
     /// - `http://[2001:0db8:85a3::8a2e:0370:7334]:8080`
     ///
-    /// # Raises
+    /// # Errors
     ///
-    /// * `IllegalArgumentException`: if the given address is not valid.
+    /// Returns `LightstreamerError::InvalidArgument` if the given address is not valid.
     pub fn set_server_address(
         &mut self,
         server_address: Option<String>,
-    ) -> Result<(), IllegalArgumentException> {
+    ) -> Result<(), LightstreamerError> {
         // Validate the server address
         if let Some(address) = &server_address
             && !address.starts_with("http://")
             && !address.starts_with("https://")
         {
-            return Err(IllegalArgumentException::new(
+            return Err(LightstreamerError::invalid_argument(
                 "Invalid server address: must start with http:// or https://",
             ));
         }
@@ -411,40 +415,37 @@ mod tests {
     }
 
     #[test]
-    fn test_new_connection_details() {
+    fn test_new_connection_details() -> Result<(), LightstreamerError> {
         // Test with all values provided
-        let result = ConnectionDetails::new(
+        let details = ConnectionDetails::new(
             Some("http://test.lightstreamer.com"),
             Some("DEMO"),
             Some("user1"),
             Some("pass1"),
-        );
-        assert!(result.is_ok());
-        let details = result.unwrap();
+        )?;
         assert_eq!(
-            details.get_server_address().unwrap(),
-            "http://test.lightstreamer.com"
+            details.get_server_address(),
+            Some(&"http://test.lightstreamer.com".to_string())
         );
-        assert_eq!(details.get_adapter_set().unwrap(), "DEMO");
-        assert_eq!(details.get_user().unwrap(), "user1");
-        assert_eq!(details.get_password().unwrap(), "pass1");
+        assert_eq!(details.get_adapter_set(), Some(&"DEMO".to_string()));
+        assert_eq!(details.get_user(), Some(&"user1".to_string()));
+        assert_eq!(details.get_password(), Some(&"pass1".to_string()));
 
         // Test with only mandatory values
-        let result =
-            ConnectionDetails::new(Some("http://test.lightstreamer.com"), None, None, None);
-        assert!(result.is_ok());
-        let details = result.unwrap();
+        let details =
+            ConnectionDetails::new(Some("http://test.lightstreamer.com"), None, None, None)?;
         assert_eq!(
-            details.get_server_address().unwrap(),
-            "http://test.lightstreamer.com"
+            details.get_server_address(),
+            Some(&"http://test.lightstreamer.com".to_string())
         );
-        assert_eq!(details.get_adapter_set().unwrap(), "DEFAULT"); // Default value
+        assert_eq!(details.get_adapter_set(), Some(&"DEFAULT".to_string())); // Default value
         assert_eq!(details.get_user(), None);
         assert_eq!(details.get_password(), None);
 
         // Test with invalid server address
         let result = ConnectionDetails::new(Some("invalid-url"), None, None, None);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
@@ -458,8 +459,8 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(
-            details.get_server_address().unwrap(),
-            "http://test.lightstreamer.com"
+            details.get_server_address(),
+            Some(&"http://test.lightstreamer.com".to_string())
         );
 
         // Test valid HTTPS URL
@@ -469,8 +470,8 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(
-            details.get_server_address().unwrap(),
-            "https://test.lightstreamer.com"
+            details.get_server_address(),
+            Some(&"https://test.lightstreamer.com".to_string())
         );
 
         // Test with port
@@ -480,8 +481,8 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(
-            details.get_server_address().unwrap(),
-            "https://test.lightstreamer.com:8080"
+            details.get_server_address(),
+            Some(&"https://test.lightstreamer.com:8080".to_string())
         );
 
         // Test invalid URL (missing http:// or https://)
@@ -502,11 +503,11 @@ mod tests {
 
         // Test setting adapter set
         details.set_adapter_set(Some("TEST_ADAPTER".to_string()));
-        assert_eq!(details.get_adapter_set().unwrap(), "TEST_ADAPTER");
+        assert_eq!(details.get_adapter_set(), Some(&"TEST_ADAPTER".to_string()));
 
         // Test setting None (should default to "DEFAULT")
         details.set_adapter_set(None);
-        assert_eq!(details.get_adapter_set().unwrap(), "DEFAULT");
+        assert_eq!(details.get_adapter_set(), Some(&"DEFAULT".to_string()));
     }
 
     #[test]
@@ -515,7 +516,7 @@ mod tests {
 
         // Test setting user
         details.set_user(Some("test_user".to_string()));
-        assert_eq!(details.get_user().unwrap(), "test_user");
+        assert_eq!(details.get_user(), Some(&"test_user".to_string()));
 
         // Test setting None for user
         details.set_user(None);
@@ -523,7 +524,7 @@ mod tests {
 
         // Test setting password
         details.set_password(Some("test_password".to_string()));
-        assert_eq!(details.get_password().unwrap(), "test_password");
+        assert_eq!(details.get_password(), Some(&"test_password".to_string()));
 
         // Test setting None for password
         details.set_password(None);

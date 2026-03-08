@@ -10,7 +10,7 @@
 /// * `port`: the proxy port
 /// * `user`: the user name to be used to validate against the proxy. Optional.
 /// * `password`: the password to be used to validate against the proxy. Optional.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proxy {
     proxy_type: ProxyType,
     host: String,
@@ -29,6 +29,7 @@ impl Proxy {
     /// * `port`: the proxy port
     /// * `user`: the user name to be used to validate against the proxy. Optional.
     /// * `password`: the password to be used to validate against the proxy. Optional.
+    #[must_use]
     pub fn new(
         proxy_type: ProxyType,
         host: String,
@@ -46,33 +47,44 @@ impl Proxy {
     }
 
     /// Returns the proxy type.
+    #[inline]
+    #[must_use]
     pub fn get_proxy_type(&self) -> &ProxyType {
         &self.proxy_type
     }
 
     /// Returns the proxy host.
+    #[inline]
+    #[must_use]
     pub fn get_host(&self) -> &str {
         &self.host
     }
 
     /// Returns the proxy port.
+    #[inline]
+    #[must_use]
     pub fn get_port(&self) -> u16 {
         self.port
     }
 
     /// Returns the proxy user name.
+    #[inline]
+    #[must_use]
     pub fn get_user(&self) -> Option<&String> {
         self.user.as_ref()
     }
 
     /// Returns the proxy password.
+    #[inline]
+    #[must_use]
     pub fn get_password(&self) -> Option<&String> {
         self.password.as_ref()
     }
 }
 
 /// Represents the type of proxy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum ProxyType {
     /// HTTP proxy.
     Http,
@@ -99,8 +111,8 @@ mod tests {
         assert_eq!(*proxy.get_proxy_type(), ProxyType::Http);
         assert_eq!(proxy.get_host(), "proxy.example.com");
         assert_eq!(proxy.get_port(), 8080);
-        assert_eq!(proxy.get_user().unwrap(), "username");
-        assert_eq!(proxy.get_password().unwrap(), "password");
+        assert_eq!(proxy.get_user(), Some(&"username".to_string()));
+        assert_eq!(proxy.get_password(), Some(&"password".to_string()));
     }
 
     #[test]
@@ -133,7 +145,7 @@ mod tests {
         assert_eq!(*proxy.get_proxy_type(), ProxyType::Socks4);
         assert_eq!(proxy.get_host(), "proxy.example.com");
         assert_eq!(proxy.get_port(), 1080);
-        assert_eq!(proxy.get_user().unwrap(), "username");
+        assert_eq!(proxy.get_user(), Some(&"username".to_string()));
         assert_eq!(proxy.get_password(), None);
     }
 

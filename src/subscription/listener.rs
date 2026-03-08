@@ -388,7 +388,9 @@ impl SubscriptionListener for ChannelSubscriptionListener {
     fn on_item_update(&self, update: &ItemUpdate) {
         // Clone the update and send it through the channel
         // If send fails, the receiver has been dropped, which is acceptable
-        let _ = self.sender.send(update.clone());
+        if self.sender.send(update.clone()).is_err() {
+            tracing::debug!("Channel receiver dropped, update discarded");
+        }
     }
 
     fn on_subscription(&mut self) {
@@ -436,32 +438,54 @@ mod tests {
 
     impl SubscriptionListener for TestSubscriptionListener {
         fn on_clear_snapshot(&mut self, item_name: Option<&str>, item_pos: usize) {
-            *self.on_clear_snapshot_called.lock().unwrap() = true;
-            *self.item_name.lock().unwrap() = item_name.map(|s| s.to_string());
-            *self.item_pos.lock().unwrap() = item_pos;
+            if let Ok(mut guard) = self.on_clear_snapshot_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.item_name.lock() {
+                *guard = item_name.map(|s| s.to_string());
+            }
+            if let Ok(mut guard) = self.item_pos.lock() {
+                *guard = item_pos;
+            }
         }
 
         fn on_end_of_snapshot(&mut self, item_name: Option<&str>, item_pos: usize) {
-            *self.on_end_of_snapshot_called.lock().unwrap() = true;
-            *self.item_name.lock().unwrap() = item_name.map(|s| s.to_string());
-            *self.item_pos.lock().unwrap() = item_pos;
+            if let Ok(mut guard) = self.on_end_of_snapshot_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.item_name.lock() {
+                *guard = item_name.map(|s| s.to_string());
+            }
+            if let Ok(mut guard) = self.item_pos.lock() {
+                *guard = item_pos;
+            }
         }
 
         fn on_item_update(&self, _update: &ItemUpdate) {
-            *self.on_item_update_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.on_item_update_called.lock() {
+                *guard = true;
+            }
         }
 
         fn on_subscription(&mut self) {
-            *self.on_subscription_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.on_subscription_called.lock() {
+                *guard = true;
+            }
         }
 
         fn on_unsubscription(&mut self) {
-            *self.on_unsubscription_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.on_unsubscription_called.lock() {
+                *guard = true;
+            }
         }
 
         fn on_real_max_frequency(&mut self, frequency: Option<f64>) {
-            *self.on_real_max_frequency_called.lock().unwrap() = true;
-            *self.max_frequency.lock().unwrap() = frequency;
+            if let Ok(mut guard) = self.on_real_max_frequency_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.max_frequency.lock() {
+                *guard = frequency;
+            }
         }
     }
 
@@ -471,12 +495,19 @@ mod tests {
 
         listener.on_clear_snapshot(Some("testItem"), 42);
 
-        assert!(*listener.on_clear_snapshot_called.lock().unwrap());
+        assert!(
+            listener
+                .on_clear_snapshot_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
+        );
         assert_eq!(
-            *listener.item_name.lock().unwrap(),
+            listener.item_name.lock().ok().and_then(|g| g.clone()),
             Some("testItem".to_string())
         );
-        assert_eq!(*listener.item_pos.lock().unwrap(), 42);
+        assert_eq!(listener.item_pos.lock().ok().map(|g| *g).unwrap_or(0), 42);
     }
 
     #[test]
@@ -485,12 +516,19 @@ mod tests {
 
         listener.on_end_of_snapshot(Some("testItem"), 42);
 
-        assert!(*listener.on_end_of_snapshot_called.lock().unwrap());
+        assert!(
+            listener
+                .on_end_of_snapshot_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
+        );
         assert_eq!(
-            *listener.item_name.lock().unwrap(),
+            listener.item_name.lock().ok().and_then(|g| g.clone()),
             Some("testItem".to_string())
         );
-        assert_eq!(*listener.item_pos.lock().unwrap(), 42);
+        assert_eq!(listener.item_pos.lock().ok().map(|g| *g).unwrap_or(0), 42);
     }
 
     #[test]
@@ -513,7 +551,14 @@ mod tests {
 
         listener.on_item_update(&item_update);
 
-        assert!(*listener.on_item_update_called.lock().unwrap());
+        assert!(
+            listener
+                .on_item_update_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -522,7 +567,14 @@ mod tests {
 
         listener.on_subscription();
 
-        assert!(*listener.on_subscription_called.lock().unwrap());
+        assert!(
+            listener
+                .on_subscription_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -531,7 +583,14 @@ mod tests {
 
         listener.on_unsubscription();
 
-        assert!(*listener.on_unsubscription_called.lock().unwrap());
+        assert!(
+            listener
+                .on_unsubscription_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -540,11 +599,21 @@ mod tests {
 
         listener.on_real_max_frequency(Some(10.5));
 
-        assert!(*listener.on_real_max_frequency_called.lock().unwrap());
-        assert_eq!(*listener.max_frequency.lock().unwrap(), Some(10.5));
+        assert!(
+            listener
+                .on_real_max_frequency_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            listener.max_frequency.lock().ok().and_then(|g| *g),
+            Some(10.5)
+        );
 
         listener.on_real_max_frequency(None);
-        assert_eq!(*listener.max_frequency.lock().unwrap(), None);
+        assert_eq!(listener.max_frequency.lock().ok().and_then(|g| *g), None);
     }
 
     #[test]
