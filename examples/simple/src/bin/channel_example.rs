@@ -161,8 +161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("✅ Exiting orderly from Lightstreamer client...");
     }
 
-    // Wait for processor to finish
-    info!("⏳ Waiting for update processor to finish...");
+    // Abort the processor task since the channel won't close automatically
+    info!("⏳ Stopping update processor...");
+    processor_handle.abort();
     let _ = processor_handle.await;
 
     info!("✨ Channel-based subscription example completed!");
