@@ -351,15 +351,9 @@ mod tests {
         let fields = update.get_fields();
 
         assert_eq!(fields.len(), 3);
-        if let Some(v) = fields.get("field1") {
-            assert_eq!(v, &Some("value1".to_string()));
-        }
-        if let Some(v) = fields.get("field2") {
-            assert_eq!(v, &Some("value2".to_string()));
-        }
-        if let Some(v) = fields.get("field3") {
-            assert_eq!(v, &None);
-        }
+        assert_eq!(fields.get("field1"), Some(&Some("value1".to_string())));
+        assert_eq!(fields.get("field2"), Some(&Some("value2".to_string())));
+        assert_eq!(fields.get("field3"), Some(&None));
     }
 
     #[test]
@@ -368,12 +362,8 @@ mod tests {
         let changed_fields = update.get_changed_fields();
 
         assert_eq!(changed_fields.len(), 2);
-        if let Some(v) = changed_fields.get("field1") {
-            assert_eq!(v, "value1");
-        }
-        if let Some(v) = changed_fields.get("field2") {
-            assert_eq!(v, "value2");
-        }
+        assert_eq!(changed_fields.get("field1"), Some(&"value1".to_string()));
+        assert_eq!(changed_fields.get("field2"), Some(&"value2".to_string()));
         assert!(!changed_fields.contains_key("field3"));
     }
 

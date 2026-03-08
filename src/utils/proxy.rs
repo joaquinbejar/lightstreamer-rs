@@ -111,12 +111,8 @@ mod tests {
         assert_eq!(*proxy.get_proxy_type(), ProxyType::Http);
         assert_eq!(proxy.get_host(), "proxy.example.com");
         assert_eq!(proxy.get_port(), 8080);
-        if let Some(user) = proxy.get_user() {
-            assert_eq!(user, "username");
-        }
-        if let Some(pass) = proxy.get_password() {
-            assert_eq!(pass, "password");
-        }
+        assert_eq!(proxy.get_user(), Some(&"username".to_string()));
+        assert_eq!(proxy.get_password(), Some(&"password".to_string()));
     }
 
     #[test]
@@ -149,9 +145,7 @@ mod tests {
         assert_eq!(*proxy.get_proxy_type(), ProxyType::Socks4);
         assert_eq!(proxy.get_host(), "proxy.example.com");
         assert_eq!(proxy.get_port(), 1080);
-        if let Some(user) = proxy.get_user() {
-            assert_eq!(user, "username");
-        }
+        assert_eq!(proxy.get_user(), Some(&"username".to_string()));
         assert_eq!(proxy.get_password(), None);
     }
 

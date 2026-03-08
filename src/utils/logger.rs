@@ -241,7 +241,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_default_log_level() {
-        let _lock = TEST_MUTEX.lock().ok();
+        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
         unsafe {
             env::remove_var("LOGLEVEL");
         }
@@ -259,7 +259,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_debug_log_level() {
-        let _lock = TEST_MUTEX.lock().ok();
+        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
         unsafe {
             env::set_var("LOGLEVEL", "DEBUG");
         }
@@ -280,7 +280,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_error_log_level() {
-        let _lock = TEST_MUTEX.lock().ok();
+        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
         unsafe {
             env::set_var("LOGLEVEL", "ERROR");
         }
@@ -301,7 +301,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_warn_log_level() {
-        let _lock = TEST_MUTEX.lock().ok();
+        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
         unsafe {
             env::set_var("LOGLEVEL", "WARN");
         }
@@ -321,7 +321,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_trace_log_level() {
-        let _lock = TEST_MUTEX.lock().ok();
+        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
         unsafe {
             env::set_var("LOGLEVEL", "TRACE");
         }
@@ -343,7 +343,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_invalid_log_level() {
-        let _lock = TEST_MUTEX.lock().ok();
+        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
         unsafe {
             env::set_var("LOGLEVEL", "INVALID");
         }

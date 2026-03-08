@@ -423,28 +423,22 @@ mod tests {
             Some("user1"),
             Some("pass1"),
         )?;
-        if let Some(addr) = details.get_server_address() {
-            assert_eq!(addr, "http://test.lightstreamer.com");
-        }
-        if let Some(adapter) = details.get_adapter_set() {
-            assert_eq!(adapter, "DEMO");
-        }
-        if let Some(user) = details.get_user() {
-            assert_eq!(user, "user1");
-        }
-        if let Some(pass) = details.get_password() {
-            assert_eq!(pass, "pass1");
-        }
+        assert_eq!(
+            details.get_server_address(),
+            Some(&"http://test.lightstreamer.com".to_string())
+        );
+        assert_eq!(details.get_adapter_set(), Some(&"DEMO".to_string()));
+        assert_eq!(details.get_user(), Some(&"user1".to_string()));
+        assert_eq!(details.get_password(), Some(&"pass1".to_string()));
 
         // Test with only mandatory values
         let details =
             ConnectionDetails::new(Some("http://test.lightstreamer.com"), None, None, None)?;
-        if let Some(addr) = details.get_server_address() {
-            assert_eq!(addr, "http://test.lightstreamer.com");
-        }
-        if let Some(adapter) = details.get_adapter_set() {
-            assert_eq!(adapter, "DEFAULT"); // Default value
-        }
+        assert_eq!(
+            details.get_server_address(),
+            Some(&"http://test.lightstreamer.com".to_string())
+        );
+        assert_eq!(details.get_adapter_set(), Some(&"DEFAULT".to_string())); // Default value
         assert_eq!(details.get_user(), None);
         assert_eq!(details.get_password(), None);
 
@@ -464,9 +458,10 @@ mod tests {
                 .set_server_address(Some("http://test.lightstreamer.com".to_string()))
                 .is_ok()
         );
-        if let Some(addr) = details.get_server_address() {
-            assert_eq!(addr, "http://test.lightstreamer.com");
-        }
+        assert_eq!(
+            details.get_server_address(),
+            Some(&"http://test.lightstreamer.com".to_string())
+        );
 
         // Test valid HTTPS URL
         assert!(
@@ -474,9 +469,10 @@ mod tests {
                 .set_server_address(Some("https://test.lightstreamer.com".to_string()))
                 .is_ok()
         );
-        if let Some(addr) = details.get_server_address() {
-            assert_eq!(addr, "https://test.lightstreamer.com");
-        }
+        assert_eq!(
+            details.get_server_address(),
+            Some(&"https://test.lightstreamer.com".to_string())
+        );
 
         // Test with port
         assert!(
@@ -484,9 +480,10 @@ mod tests {
                 .set_server_address(Some("https://test.lightstreamer.com:8080".to_string()))
                 .is_ok()
         );
-        if let Some(addr) = details.get_server_address() {
-            assert_eq!(addr, "https://test.lightstreamer.com:8080");
-        }
+        assert_eq!(
+            details.get_server_address(),
+            Some(&"https://test.lightstreamer.com:8080".to_string())
+        );
 
         // Test invalid URL (missing http:// or https://)
         assert!(
@@ -506,15 +503,11 @@ mod tests {
 
         // Test setting adapter set
         details.set_adapter_set(Some("TEST_ADAPTER".to_string()));
-        if let Some(adapter) = details.get_adapter_set() {
-            assert_eq!(adapter, "TEST_ADAPTER");
-        }
+        assert_eq!(details.get_adapter_set(), Some(&"TEST_ADAPTER".to_string()));
 
         // Test setting None (should default to "DEFAULT")
         details.set_adapter_set(None);
-        if let Some(adapter) = details.get_adapter_set() {
-            assert_eq!(adapter, "DEFAULT");
-        }
+        assert_eq!(details.get_adapter_set(), Some(&"DEFAULT".to_string()));
     }
 
     #[test]
@@ -523,9 +516,7 @@ mod tests {
 
         // Test setting user
         details.set_user(Some("test_user".to_string()));
-        if let Some(user) = details.get_user() {
-            assert_eq!(user, "test_user");
-        }
+        assert_eq!(details.get_user(), Some(&"test_user".to_string()));
 
         // Test setting None for user
         details.set_user(None);
@@ -533,9 +524,7 @@ mod tests {
 
         // Test setting password
         details.set_password(Some("test_password".to_string()));
-        if let Some(pass) = details.get_password() {
-            assert_eq!(pass, "test_password");
-        }
+        assert_eq!(details.get_password(), Some(&"test_password".to_string()));
 
         // Test setting None for password
         details.set_password(None);

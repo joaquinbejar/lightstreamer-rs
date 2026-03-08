@@ -341,7 +341,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if zero is configured (value must be > 0)
     pub fn set_content_length(&mut self, content_length: u64) -> Result<(), LightstreamerError> {
         if content_length == 0 {
             return Err(LightstreamerError::invalid_argument(
@@ -376,7 +376,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if zero is configured (value must be > 0)
     pub fn set_first_retry_max_delay(
         &mut self,
         first_retry_max_delay: u64,
@@ -530,7 +530,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative value is configured
+    /// * `LightstreamerError`: if zero is configured (value must be > 0)
     pub fn set_idle_timeout(&mut self, idle_timeout: u64) -> Result<(), LightstreamerError> {
         if idle_timeout == 0 {
             return Err(LightstreamerError::invalid_argument(
@@ -565,7 +565,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative value is configured
+    /// * `LightstreamerError`: if zero is configured (value must be > 0)
     ///
     /// See also `setStalledTimeout()`
     ///
@@ -631,7 +631,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative value is configured
+    /// * `LightstreamerError`: if the value violates timeout constraints
     pub fn set_polling_interval(
         &mut self,
         polling_interval: u64,
@@ -689,7 +689,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if zero is configured (value must be > 0)
     ///
     /// See also `setStalledTimeout()`
     ///
@@ -737,8 +737,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative, zero, or a not-number value (excluding special
-    ///   values) is passed.
+    /// * `LightstreamerError`: if zero or an invalid value (excluding special values) is passed.
     ///
     /// See also `get_real_max_bandwidth()`
     pub fn set_requested_max_bandwidth(
@@ -801,7 +800,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if zero is configured (value must be > 0)
     ///
     /// See also `setFirstRetryMaxDelay()`
     pub fn set_retry_delay(&mut self, retry_delay: u64) -> Result<(), LightstreamerError> {
@@ -860,7 +859,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative value is configured
+    /// * `LightstreamerError`: if the value is invalid
     pub fn set_reverse_heartbeat_interval(
         &mut self,
         reverse_heartbeat_interval: u64,
@@ -946,7 +945,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative value is passed.
+    /// * `LightstreamerError`: if the value is invalid
     pub fn set_session_recovery_timeout(
         &mut self,
         session_recovery_timeout: u64,
@@ -1013,7 +1012,7 @@ impl ConnectionOptions {
     ///
     /// # Raises
     ///
-    /// * `LightstreamerError`: if a negative or zero value is configured
+    /// * `LightstreamerError`: if zero is configured or value violates timeout constraints
     ///
     /// See also `setReconnectTimeout()`
     ///
@@ -1346,9 +1345,7 @@ mod tests {
         headers.insert("X-Another-Header".to_string(), "AnotherValue".to_string());
 
         options.set_http_extra_headers(Some(headers.clone()));
-        if let Some(h) = options.get_http_extra_headers() {
-            assert_eq!(h, &headers);
-        }
+        assert_eq!(options.get_http_extra_headers(), Some(&headers));
 
         // Test setting None
         options.set_http_extra_headers(None);

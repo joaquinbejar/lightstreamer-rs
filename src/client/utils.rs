@@ -21,25 +21,21 @@ mod tests {
     #[test]
     fn test_get_subscription_by_id_found() {
         // Create a test subscription with ID 1
-        let subscription1 = Subscription::new(
+        let mut subscription1 = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        );
-        let Ok(mut subscription1) = subscription1 else {
-            return;
-        };
+        )
+        .expect("Failed to create test subscription1");
         subscription1.id = 1;
 
         // Create another test subscription with ID 2
-        let subscription2 = Subscription::new(
+        let mut subscription2 = Subscription::new(
             SubscriptionMode::Distinct,
             Some(vec!["item2".to_string()]),
             Some(vec!["field2".to_string()]),
-        );
-        let Ok(mut subscription2) = subscription2 else {
-            return;
-        };
+        )
+        .expect("Failed to create test subscription2");
         subscription2.id = 2;
 
         // Create a vector of subscriptions
@@ -47,30 +43,24 @@ mod tests {
 
         // Test finding subscription with ID 1
         let result = get_subscription_by_id(&subscriptions, 1);
-        assert!(result.is_some());
-        if let Some(sub) = result {
-            assert_eq!(sub.id, 1);
-        }
+        assert!(result.is_some(), "Subscription with ID 1 should be found");
+        assert_eq!(result.map(|s| s.id), Some(1));
 
         // Test finding subscription with ID 2
         let result = get_subscription_by_id(&subscriptions, 2);
-        assert!(result.is_some());
-        if let Some(sub) = result {
-            assert_eq!(sub.id, 2);
-        }
+        assert!(result.is_some(), "Subscription with ID 2 should be found");
+        assert_eq!(result.map(|s| s.id), Some(2));
     }
 
     #[test]
     fn test_get_subscription_by_id_not_found() {
         // Create a test subscription with ID 1
-        let subscription = Subscription::new(
+        let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        );
-        let Ok(mut subscription) = subscription else {
-            return;
-        };
+        )
+        .expect("Failed to create test subscription");
         subscription.id = 1;
 
         // Create a vector with one subscription

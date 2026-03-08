@@ -1307,9 +1307,7 @@ impl LightstreamerClient {
                 subscription_id: None,
             })
             .await
-            .map_err(|e| {
-                LightstreamerError::invalid_state(format!("Failed to send subscription: {}", e))
-            })
+            .map_err(|e| LightstreamerError::channel(format!("Failed to send subscription: {}", e)))
     }
 
     /// If you want to be able to unsubscribe from a subscription, you need to keep track of the id
@@ -1376,7 +1374,7 @@ impl LightstreamerClient {
             })
             .await
             .map_err(|e| {
-                LightstreamerError::invalid_state(format!("Failed to send unsubscription: {}", e))
+                LightstreamerError::channel(format!("Failed to send unsubscription: {}", e))
             })
     }
 
