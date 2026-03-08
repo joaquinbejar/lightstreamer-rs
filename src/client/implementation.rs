@@ -856,9 +856,9 @@ impl LightstreamerClient {
                 Some(subscription_request) = self.subscription_receiver.recv() => {
                     request_id += 1;
                     // Process subscription requests.
-                    if subscription_request.subscription.is_some()
+                    if let Some(subscription) = subscription_request.subscription
                     {
-                        self.subscriptions.push(subscription_request.subscription.unwrap());
+                        self.subscriptions.push(subscription);
 
                         // if we are not connected yet, we will subscribe later
                         if !is_connected {
@@ -884,9 +884,8 @@ impl LightstreamerClient {
                         self.make_log( Level::INFO, &format!("Sent subscription request: '{}'", encoded_params) );
                     }
                     // Process unsubscription requests.
-                    else if subscription_request.subscription_id.is_some()
+                    else if let Some(unsubscription_id) = subscription_request.subscription_id
                     {
-                        let unsubscription_id = subscription_request.subscription_id.unwrap();
                         let encoded_params = match Self::get_unsubscription_params(unsubscription_id, request_id)
                         {
                             Ok(params) => params,

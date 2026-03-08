@@ -1,4 +1,3 @@
-use colored::*;
 use lightstreamer_rs::client::{LightstreamerClient, Transport};
 use lightstreamer_rs::subscription::{
     ItemUpdate, Snapshot, Subscription, SubscriptionListener, SubscriptionMode,
@@ -32,12 +31,7 @@ impl SubscriptionListener for MySubscriptionListener {
         let mut output = String::new();
         for field in fields {
             let value = update.get_value(field).unwrap_or(&not_available);
-            let value_str = if update.changed_fields.contains_key(field) {
-                value.yellow().to_string()
-            } else {
-                value.to_string()
-            };
-            output.push_str(&format!("{}: {}, ", field, value_str));
+            output.push_str(&format!("{}: {}, ", field, value));
         }
         info!("{}, {}", item_name, output);
     }

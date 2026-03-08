@@ -11,7 +11,6 @@
 //! - Connection metrics and state monitoring
 //! - Graceful shutdown handling
 
-use colored::*;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -57,28 +56,18 @@ impl SubscriptionListener for ConnectionAwareListener {
         let mut output = String::new();
         for field in fields {
             let value = update.get_value(field).unwrap_or(&not_available);
-            let value_str = if update.changed_fields.contains_key(field) {
-                value.bright_yellow().to_string()
-            } else {
-                value.dimmed().to_string()
-            };
-            output.push_str(&format!("{}: {}, ", field, value_str));
+            output.push_str(&format!("{}: {}, ", field, value));
         }
 
-        info!(
-            "[{}] {}: {}",
-            self.name.bright_blue(),
-            item_name.bright_green(),
-            output
-        );
+        info!("[{}] {}: {}", self.name, item_name, output);
     }
 
     fn on_subscription(&mut self) {
-        info!("📡 {} subscription activated", self.name.bright_green());
+        info!("📡 {} subscription activated", self.name);
     }
 
     fn on_unsubscription(&mut self) {
-        info!("📡 {} subscription deactivated", self.name.bright_red());
+        info!("📡 {} subscription deactivated", self.name);
     }
 }
 
@@ -86,16 +75,8 @@ impl SubscriptionListener for ConnectionAwareListener {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
 
-    info!(
-        "{}",
-        "🚀 Starting ConnectionManager Example"
-            .bright_magenta()
-            .bold()
-    );
-    info!(
-        "{}",
-        "This example demonstrates advanced connection management features.".dimmed()
-    );
+    info!("🚀 Starting ConnectionManager Example");
+    info!("This example demonstrates advanced connection management features.");
 
     // Configure reconnection settings
     let reconnection_config = ReconnectionConfig::default()
@@ -164,10 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info!(
-        "{}",
-        "📡 Subscriptions added - they will be preserved during reconnections".bright_green()
-    );
+    info!("📡 Subscriptions added - they will be preserved during reconnections");
 
     // Setup graceful shutdown
     let shutdown_signal = Arc::new(Notify::new());
@@ -177,35 +155,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In a real application, you would handle these in separate threads or tasks
 
     // Connect with auto-reconnection
-    info!(
-        "{}",
-        "🔌 Connecting with auto-reconnection enabled...".bright_cyan()
-    );
+    info!("🔌 Connecting with auto-reconnection enabled...");
 
     let connect_result =
         LightstreamerClient::connect(Arc::clone(&client), Arc::clone(&shutdown_signal)).await;
 
     match connect_result {
         Ok(_) => {
-            info!("{}", "✅ Initial connection successful".bright_green());
+            info!("✅ Initial connection successful");
 
             // Simulate some runtime to observe reconnection behavior
-            info!(
-                "{}",
-                "🕐 Running for 60 seconds to demonstrate reconnection features...".bright_blue()
-            );
-            info!(
-                "{}",
-                "   Try disconnecting your network to see auto-reconnection in action!".dimmed()
-            );
+            info!("🕐 Running for 60 seconds to demonstrate reconnection features...");
+            info!("   Try disconnecting your network to see auto-reconnection in action!");
 
             // Wait for shutdown signal or timeout
             tokio::select! {
                 _ = shutdown_signal.notified() => {
-                    info!("{}", "🛑 Shutdown signal received".bright_yellow());
+                    info!("🛑 Shutdown signal received");
                 }
                 _ = sleep(Duration::from_secs(60)) => {
-                    info!("{}", "⏰ Demo timeout reached".bright_blue());
+                    info!("⏰ Demo timeout reached");
                 }
             }
         }
@@ -215,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Graceful shutdown
-    info!("{}", "🔄 Initiating graceful shutdown...".bright_yellow());
+    info!("🔄 Initiating graceful shutdown...");
 
     {
         let mut client_guard = client.lock().await;
@@ -229,40 +198,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let final_metrics = client_guard.get_connection_metrics().await;
         info!(
             "📊 Final Metrics - Total: {}, Successful reconnections: {}, Failed reconnections: {}, Heartbeat failures: {}",
-            final_metrics.total_connections.to_string().bright_cyan(),
-            final_metrics
-                .successful_reconnections
-                .to_string()
-                .bright_green(),
-            final_metrics.failed_reconnections.to_string().bright_red(),
-            final_metrics.heartbeat_failures.to_string().bright_yellow()
+            final_metrics.total_connections,
+            final_metrics.successful_reconnections,
+            final_metrics.failed_reconnections,
+            final_metrics.heartbeat_failures
         );
     }
 
-    info!(
-        "{}",
-        "✅ ConnectionManager example completed successfully!"
-            .bright_green()
-            .bold()
-    );
-    info!("{}", "Key features demonstrated:".dimmed());
-    info!(
-        "{}",
-        "  • Automatic reconnection with exponential backoff".dimmed()
-    );
-    info!(
-        "{}",
-        "  • Heartbeat monitoring for connection health".dimmed()
-    );
-    info!(
-        "{}",
-        "  • Subscription preservation during reconnections".dimmed()
-    );
-    info!(
-        "{}",
-        "  • Real-time connection state and metrics monitoring".dimmed()
-    );
-    info!("{}", "  • Graceful shutdown handling".dimmed());
+    info!("✅ ConnectionManager example completed successfully!");
+    info!("Key features demonstrated:");
+    info!("  • Automatic reconnection with exponential backoff");
+    info!("  • Heartbeat monitoring for connection health");
+    info!("  • Subscription preservation during reconnections");
+    info!("  • Real-time connection state and metrics monitoring");
+    info!("  • Graceful shutdown handling");
 
     Ok(())
 }

@@ -1,4 +1,3 @@
-use colored::*;
 use lightstreamer_rs::client::{LightstreamerClient, Transport};
 use lightstreamer_rs::subscription::{
     ChannelSubscriptionListener, ItemUpdate, Snapshot, Subscription, SubscriptionMode,
@@ -19,28 +18,17 @@ const MAX_CONNECTION_ATTEMPTS: u64 = 1;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
 
-    info!(
-        "{}",
-        "🚀 Starting Channel-based Subscription Example"
-            .bright_green()
-            .bold()
-    );
-    info!(
-        "{}",
-        "This example demonstrates asynchronous update processing using channels".bright_cyan()
-    );
+    info!("🚀 Starting Channel-based Subscription Example");
+    info!("This example demonstrates asynchronous update processing using channels");
 
     // Create a channel for receiving updates
     let (listener, mut update_receiver) = ChannelSubscriptionListener::create_channel();
 
-    info!(
-        "{}",
-        "✅ Channel created for async update processing".bright_green()
-    );
+    info!("✅ Channel created for async update processing");
 
     // Spawn a task to process updates asynchronously
     let processor_handle = tokio::spawn(async move {
-        info!("{}", "📡 Update processor task started".bright_cyan());
+        info!("📡 Update processor task started");
 
         let mut update_count = 0u64;
         let mut items_seen = std::collections::HashSet::new();
@@ -59,26 +47,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Log statistics every 10 updates
             if update_count.is_multiple_of(10) {
                 info!(
-                    "{}",
-                    format!(
-                        "📊 Stats: {} updates processed, {} unique items",
-                        update_count,
-                        items_seen.len()
-                    )
-                    .bright_yellow()
+                    "📊 Stats: {} updates processed, {} unique items",
+                    update_count,
+                    items_seen.len()
                 );
             }
         }
 
         info!(
-            "{}",
-            format!(
-                "📈 Final Stats: {} total updates, {} unique items",
-                update_count,
-                items_seen.len()
-            )
-            .bright_yellow()
-            .bold()
+            "📈 Final Stats: {} total updates, {} unique items",
+            update_count,
+            items_seen.len()
         );
     });
 
@@ -117,10 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
     subscription.add_listener(Box::new(listener));
 
-    info!(
-        "{}",
-        "✅ Subscription configured with ChannelSubscriptionListener".bright_green()
-    );
+    info!("✅ Subscription configured with ChannelSubscriptionListener");
 
     // Create Lightstreamer client
     let client = Arc::new(Mutex::new(LightstreamerClient::new(
@@ -140,19 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set_forced_transport(Some(Transport::WsStreaming));
     }
 
-    info!(
-        "{}",
-        "✅ Client configured and subscription added".bright_green()
-    );
+    info!("✅ Client configured and subscription added");
 
     // Setup shutdown signal
     let shutdown_signal = Arc::new(Notify::new());
     setup_signal_hook(Arc::clone(&shutdown_signal)).await;
 
-    info!(
-        "{}",
-        "🔌 Connecting to Lightstreamer server...".bright_cyan()
-    );
+    info!("🔌 Connecting to Lightstreamer server...");
 
     // Connection loop
     let mut retry_interval_millis: u64 = 0;
@@ -161,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while retry_counter < MAX_CONNECTION_ATTEMPTS {
         match LightstreamerClient::connect(client.clone(), Arc::clone(&shutdown_signal)).await {
             Ok(_) => {
-                info!("{}", "🔌 Disconnecting from server...".bright_yellow());
+                info!("🔌 Disconnecting from server...");
                 {
                     let mut client_guard = client.lock().await;
                     client_guard.disconnect().await;
@@ -187,32 +157,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             retry_counter
         );
     } else {
-        info!(
-            "{}",
-            "✅ Exiting orderly from Lightstreamer client..."
-                .bright_green()
-                .bold()
-        );
+        info!("✅ Exiting orderly from Lightstreamer client...");
     }
 
     // Wait for processor to finish
-    info!(
-        "{}",
-        "⏳ Waiting for update processor to finish...".bright_yellow()
-    );
+    info!("⏳ Waiting for update processor to finish...");
     let _ = processor_handle.await;
 
-    info!(
-        "{}",
-        "✨ Channel-based subscription example completed!"
-            .bright_green()
-            .bold()
-    );
-    info!("{}", "Key features demonstrated:".dimmed());
-    info!("{}", "  • Channel-based async update processing".dimmed());
-    info!("{}", "  • Decoupled reception and processing".dimmed());
-    info!("{}", "  • Non-blocking update handling".dimmed());
-    info!("{}", "  • Easy integration with async workflows".dimmed());
+    info!("✨ Channel-based subscription example completed!");
+    info!("Key features demonstrated:");
+    info!("  • Channel-based async update processing");
+    info!("  • Decoupled reception and processing");
+    info!("  • Non-blocking update handling");
+    info!("  • Easy integration with async workflows");
 
     std::process::exit(0);
 }
@@ -242,18 +199,8 @@ fn process_update(update: &ItemUpdate, count: u64) {
     let mut output = String::new();
     for field in fields {
         let value = update.get_value(field).unwrap_or(&not_available);
-        let value_str = if update.changed_fields.contains_key(field) {
-            value.yellow().to_string()
-        } else {
-            value.to_string()
-        };
-        output.push_str(&format!("{}: {}, ", field, value_str));
+        output.push_str(&format!("{}: {}, ", field, value));
     }
 
-    info!(
-        "[{}] {} - {}",
-        format!("#{}", count).bright_blue(),
-        item_name.bright_cyan(),
-        output
-    );
+    info!("[#{}] {} - {}", count, item_name, output);
 }
