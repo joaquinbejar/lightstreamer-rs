@@ -72,7 +72,7 @@ impl SubscriptionListener for ConnectionAwareListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
 
     info!("🚀 Starting ConnectionManager Example");
@@ -223,7 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn create_stock_subscription(
     name: &str,
     items: Vec<&str>,
-) -> Result<Subscription, Box<dyn std::error::Error>>
+) -> Result<Subscription, lightstreamer_rs::utils::LightstreamerError>
 where
     Subscription: Sized,
 {

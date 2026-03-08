@@ -15,7 +15,7 @@ use lightstreamer_rs::utils::setup_logger;
 use tracing::info;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
 
     info!("🚀 Starting Easy Lightstreamer Example");

@@ -38,7 +38,7 @@ impl SubscriptionListener for MySubscriptionListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
     //
     // Create a new subscription instance.

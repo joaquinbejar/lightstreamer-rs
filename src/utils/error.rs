@@ -199,6 +199,12 @@ impl From<crate::connection::ReconnectionError> for LightstreamerError {
     }
 }
 
+impl From<std::env::VarError> for LightstreamerError {
+    fn from(e: std::env::VarError) -> Self {
+        LightstreamerError::Configuration(e.to_string())
+    }
+}
+
 /// Legacy exception type for backward compatibility.
 /// Prefer using `LightstreamerError::InvalidArgument` directly.
 #[deprecated(

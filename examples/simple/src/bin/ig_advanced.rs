@@ -44,7 +44,7 @@ impl SubscriptionListener for AdvancedFinancialListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     setup_logger();
     info!("🚀 Starting IG Markets Advanced Lightstreamer Client with ConnectionManager");
 
