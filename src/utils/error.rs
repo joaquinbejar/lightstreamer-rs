@@ -155,6 +155,50 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for LightstreamerError {
     }
 }
 
+impl From<tokio_tungstenite::tungstenite::http::Error> for LightstreamerError {
+    fn from(e: tokio_tungstenite::tungstenite::http::Error) -> Self {
+        LightstreamerError::InvalidState(e.to_string())
+    }
+}
+
+impl From<serde_urlencoded::ser::Error> for LightstreamerError {
+    fn from(e: serde_urlencoded::ser::Error) -> Self {
+        LightstreamerError::InvalidArgument(e.to_string())
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for LightstreamerError {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        LightstreamerError::Connection(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for LightstreamerError {
+    fn from(e: std::io::Error) -> Self {
+        LightstreamerError::Connection(e.to_string())
+    }
+}
+
+impl From<tokio::sync::mpsc::error::SendError<crate::client::SubscriptionRequest>>
+    for LightstreamerError
+{
+    fn from(e: tokio::sync::mpsc::error::SendError<crate::client::SubscriptionRequest>) -> Self {
+        LightstreamerError::InvalidState(e.to_string())
+    }
+}
+
+impl From<tokio::sync::mpsc::error::TrySendError<usize>> for LightstreamerError {
+    fn from(e: tokio::sync::mpsc::error::TrySendError<usize>) -> Self {
+        LightstreamerError::Channel(e.to_string())
+    }
+}
+
+impl From<crate::connection::ReconnectionError> for LightstreamerError {
+    fn from(e: crate::connection::ReconnectionError) -> Self {
+        LightstreamerError::Connection(e.to_string())
+    }
+}
+
 /// Legacy exception type for backward compatibility.
 /// Prefer using `LightstreamerError::InvalidArgument` directly.
 #[deprecated(

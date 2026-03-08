@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -45,7 +44,7 @@ impl SubscriptionListener for AdvancedFinancialListener {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
     info!("🚀 Starting IG Markets Advanced Lightstreamer Client with ConnectionManager");
 

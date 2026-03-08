@@ -19,6 +19,7 @@
 // along with lightstreamer-rs. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::subscription::SubscriptionListener;
+use crate::utils::LightstreamerError;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -141,9 +142,11 @@ impl Subscription {
         mode: SubscriptionMode,
         items: Option<Vec<String>>,
         fields: Option<Vec<String>>,
-    ) -> Result<Subscription, Box<dyn std::error::Error>> {
+    ) -> Result<Subscription, LightstreamerError> {
         if items.is_none() || fields.is_none() {
-            return Err("Items and fields must be provided".to_string().into());
+            return Err(LightstreamerError::invalid_argument(
+                "Items and fields must be provided",
+            ));
         }
 
         let (id_sender, id_receiver) = channel(1);

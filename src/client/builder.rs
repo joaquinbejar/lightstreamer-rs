@@ -283,9 +283,7 @@ impl SimpleClient {
     ///
     /// Returns an error if the connection fails
     pub async fn connect(&self) -> Result<(), LightstreamerError> {
-        LightstreamerClient::connect(self.client.clone(), self.shutdown_signal.clone())
-            .await
-            .map_err(LightstreamerError::from)
+        LightstreamerClient::connect(self.client.clone(), self.shutdown_signal.clone()).await
     }
 
     /// Disconnects from the Lightstreamer server.

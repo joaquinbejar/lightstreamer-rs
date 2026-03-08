@@ -12,7 +12,6 @@ use crate::utils::{LightstreamerError, clean_message, parse_arguments};
 use cookie::Cookie;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
@@ -193,7 +192,7 @@ impl LightstreamerClient {
     fn get_subscription_params(
         subscription: &Subscription,
         request_id: usize,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, LightstreamerError> {
         let ls_req_id = request_id.to_string();
         let ls_sub_id = subscription.id.to_string();
         let ls_mode = subscription.get_mode().to_string();
@@ -202,10 +201,9 @@ impl LightstreamerClient {
             None => match subscription.get_items() {
                 Some(items) => items.join(" "),
                 None => {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    return Err(LightstreamerError::invalid_argument(
                         "No item group or items found in subscription.",
-                    )));
+                    ));
                 }
             },
         };
@@ -214,10 +212,9 @@ impl LightstreamerClient {
             None => match subscription.get_fields() {
                 Some(fields) => fields.join(" "),
                 None => {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    return Err(LightstreamerError::invalid_argument(
                         "No field schema or fields found in subscription.",
-                    )));
+                    ));
                 }
             },
         };
@@ -256,7 +253,7 @@ impl LightstreamerClient {
     fn get_unsubscription_params(
         subscription_id: usize,
         request_id: usize,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, LightstreamerError> {
         let ls_req_id = request_id.to_string();
         let ls_sub_id = subscription_id.to_string();
         //
@@ -306,7 +303,7 @@ impl LightstreamerClient {
     pub async fn connect(
         client: Arc<Mutex<Self>>,
         shutdown_signal: Arc<Notify>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), LightstreamerError> {
         // If auto-reconnect is enabled, use ConnectionManager
         let auto_reconnect_enabled = {
             let client_guard = client.lock().await;
@@ -345,21 +342,21 @@ impl LightstreamerClient {
     pub async fn connect_direct(
         &mut self,
         shutdown_signal: Arc<Notify>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), LightstreamerError> {
         // Check if the server address is configured.
         if self.server_address.is_none() {
-            return Err(Box::new(LightstreamerError::invalid_state(
+            return Err(LightstreamerError::invalid_state(
                 "No server address was configured.",
-            )));
+            ));
         }
         //
         // Only WebSocket streaming transport is currently supported.
         //
         let forced_transport = self.connection_options.get_forced_transport();
         if forced_transport.is_none_or(|t| *t != Transport::WsStreaming) {
-            return Err(Box::new(LightstreamerError::invalid_state(
+            return Err(LightstreamerError::invalid_state(
                 "Only WebSocket streaming transport is currently supported.",
-            )));
+            ));
         }
         //
         // Convert the HTTP URL to a WebSocket URL.
@@ -367,16 +364,9 @@ impl LightstreamerClient {
         let http_url = self
             .connection_details
             .get_server_address()
-            .ok_or_else(|| {
-                Box::new(LightstreamerError::invalid_state(
-                    "Server address is not set.",
-                )) as Box<dyn Error>
-            })?;
+            .ok_or_else(|| LightstreamerError::invalid_state("Server address is not set."))?;
         let mut url = Url::parse(http_url).map_err(|e| {
-            Box::new(LightstreamerError::invalid_state(format!(
-                "Failed to parse server address URL: {}",
-                e
-            ))) as Box<dyn Error>
+            LightstreamerError::invalid_state(format!("Failed to parse server address URL: {}", e))
         })?;
         match url.scheme() {
             "http" => url.set_scheme("ws").map_err(|()| {
@@ -386,10 +376,10 @@ impl LightstreamerClient {
                 LightstreamerError::invalid_state("Failed to set scheme to wss for WebSocket URL.")
             })?,
             invalid_scheme => {
-                return Err(Box::new(LightstreamerError::invalid_state(format!(
+                return Err(LightstreamerError::invalid_state(format!(
                     "Unsupported scheme '{}' found when converting HTTP URL to WebSocket URL.",
                     invalid_scheme
-                ))));
+                )));
             }
         }
         let ws_url = url.as_str();
@@ -445,12 +435,9 @@ impl LightstreamerClient {
                 ws_stream
             }
             Err(err) => {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!(
-                        "Failed to connect to Lightstreamer server with WebSocket: {}",
-                        err
-                    ),
+                return Err(LightstreamerError::connection(format!(
+                    "Failed to connect to Lightstreamer server with WebSocket: {}",
+                    err
                 )));
             }
         };
@@ -527,10 +514,9 @@ impl LightstreamerClient {
                                                 debug!("Sent subscription request: '{}'", encoded_params);
                                             }
                                         } else {
-                                            return Err(Box::new(std::io::Error::new(
-                                                std::io::ErrorKind::InvalidData,
+                                            return Err(LightstreamerError::protocol(
                                                 "Session ID not found in 'conok' message from server",
-                                            )));
+                                            ));
                                         }
                                     },
                                     //
@@ -805,9 +791,9 @@ impl LightstreamerClient {
                                         let ls_adapter_set = match self.connection_details.get_adapter_set() {
                                             Some(adapter_set) => adapter_set,
                                             None => {
-                                                return Err(Box::new(LightstreamerError::invalid_state(
+                                                return Err(LightstreamerError::invalid_state(
                                                     "No adapter set found in connection details.",
-                                                )));
+                                                ));
                                             },
                                         };
                                         let ls_send_sync = self.connection_options.get_send_sync().to_string();
@@ -830,30 +816,24 @@ impl LightstreamerClient {
                                         self.make_log( Level::DEBUG, &format!("Sent create session request: '{}'", encoded_params) );
                                     },
                                     unexpected_message => {
-                                        return Err(Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            format!(
-                                                "Unexpected message received from server: '{:?}'",
-                                                unexpected_message
-                                            ),
+                                        return Err(LightstreamerError::protocol(format!(
+                                            "Unexpected message received from server: '{:?}'",
+                                            unexpected_message
                                         )));
                                     },
                                 }
                             }
                         },
                         Some(Ok(non_text_message)) => {
-                            return Err(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "Unexpected non-text message from server: {:?}",
-                                    non_text_message
-                                ),
+                            return Err(LightstreamerError::protocol(format!(
+                                "Unexpected non-text message from server: {:?}",
+                                non_text_message
                             )));
                         },
                         Some(Err(err)) => {
-                            return Err(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Error reading message from server: {}", err),
+                            return Err(LightstreamerError::protocol(format!(
+                                "Error reading message from server: {}",
+                                err
                             )));
                         },
                         None => {
@@ -1070,7 +1050,7 @@ impl LightstreamerClient {
         adapter_set: Option<&str>,
         username: Option<&str>,
         password: Option<&str>,
-    ) -> Result<LightstreamerClient, Box<dyn std::error::Error>> {
+    ) -> Result<LightstreamerClient, LightstreamerError> {
         let connection_details =
             ConnectionDetails::new(server_address, adapter_set, username, password)?;
         let connection_options = ConnectionOptions::default();
@@ -1312,7 +1292,7 @@ impl LightstreamerClient {
     pub async fn subscribe(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription: Subscription,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), LightstreamerError> {
         subscription_sender
             .send(SubscriptionRequest {
                 subscription: Some(subscription),
@@ -1320,10 +1300,7 @@ impl LightstreamerClient {
             })
             .await
             .map_err(|e| {
-                Box::new(LightstreamerError::invalid_state(format!(
-                    "Failed to send subscription: {}",
-                    e
-                ))) as Box<dyn std::error::Error>
+                LightstreamerError::invalid_state(format!("Failed to send subscription: {}", e))
             })
     }
 
@@ -1339,7 +1316,7 @@ impl LightstreamerClient {
     pub async fn subscribe_get_id(
         subscription_sender: Sender<SubscriptionRequest>,
         mut subscription: Subscription,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
+    ) -> Result<usize, LightstreamerError> {
         // Extract the id_receiver before sending the subscription
         let mut id_receiver = subscription.id_receiver;
 
@@ -1353,29 +1330,11 @@ impl LightstreamerClient {
         // Wait for the ID to be updated through the channel
         match id_receiver.recv().await {
             Some(id) => Ok(id),
-            None => Err(Box::new(LightstreamerError::invalid_state(
+            None => Err(LightstreamerError::invalid_state(
                 "Failed to get subscription id",
-            ))),
+            )),
         }
     }
-
-    /*
-
-        pub async fn subscribe_get_id(
-        subscription_sender: Sender<SubscriptionRequest>,
-        subscription: Subscription,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        let mut id_receiver = subscription.id_receiver.clone();
-        LightstreamerClient::subscribe(subscription_sender.clone(), subscription);
-
-        match id_receiver.changed().await {
-            Ok(_) => Ok(*id_receiver.borrow()),
-            Err(_) => Err(Box::new(LightstreamerError::invalid_state(
-                "Failed to get subscription id",
-            ))),
-        }
-    }
-     */
 
     /// Operation method that removes a `Subscription` that is currently in the "active" state.
     ///
@@ -1401,7 +1360,7 @@ impl LightstreamerClient {
     pub async fn unsubscribe(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription_id: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), LightstreamerError> {
         subscription_sender
             .send(SubscriptionRequest {
                 subscription: None,
@@ -1409,10 +1368,7 @@ impl LightstreamerClient {
             })
             .await
             .map_err(|e| {
-                Box::new(LightstreamerError::invalid_state(format!(
-                    "Failed to send unsubscription: {}",
-                    e
-                ))) as Box<dyn std::error::Error>
+                LightstreamerError::invalid_state(format!("Failed to send unsubscription: {}", e))
             })
     }
 
@@ -1479,7 +1435,7 @@ impl LightstreamerClient {
         &mut self,
         reconnection_config: ReconnectionConfig,
         heartbeat_config: HeartbeatConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), LightstreamerError> {
         self.auto_reconnect_enabled = true;
         self.reconnection_config = reconnection_config;
         self.heartbeat_config = heartbeat_config;
@@ -1545,9 +1501,11 @@ impl LightstreamerClient {
     }
 
     /// Forces an immediate reconnection attempt if auto-reconnect is enabled.
-    pub async fn force_reconnect(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn force_reconnect(&mut self) -> Result<(), LightstreamerError> {
         if !self.auto_reconnect_enabled {
-            return Err("Auto-reconnect is not enabled".into());
+            return Err(LightstreamerError::invalid_state(
+                "Auto-reconnect is not enabled",
+            ));
         }
 
         if let Some(manager) = &mut self.connection_manager {
@@ -1562,7 +1520,7 @@ impl LightstreamerClient {
 mod tests {
     use super::*;
     use crate::subscription::{Subscription, SubscriptionListener, SubscriptionMode};
-    use std::error::Error;
+
     use std::fmt::Debug;
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
@@ -1642,7 +1600,7 @@ mod tests {
 
     impl LightstreamerClientTestContext {
         #[allow(dead_code)]
-        fn new() -> Result<Self, Box<dyn Error>> {
+        fn new() -> Result<Self, LightstreamerError> {
             let property_changes = Arc::new(Mutex::new(Vec::new()));
             let status_changes = Arc::new(Mutex::new(Vec::new()));
             let server_errors = Arc::new(Mutex::new(Vec::new()));
