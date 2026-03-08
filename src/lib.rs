@@ -332,3 +332,12 @@ pub mod client;
 ///
 /// This module provides types for managing connection details and options.
 pub mod connection;
+
+/// Prelude module for convenient imports.
+///
+/// Import all commonly used types with a single `use` statement:
+///
+/// ```ignore
+/// use lightstreamer_rs::prelude::*;
+/// ```
+pub mod prelude;
