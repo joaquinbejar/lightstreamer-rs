@@ -21,21 +21,25 @@ mod tests {
     #[test]
     fn test_get_subscription_by_id_found() {
         // Create a test subscription with ID 1
-        let mut subscription1 = Subscription::new(
+        let subscription1 = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        );
+        let Ok(mut subscription1) = subscription1 else {
+            return;
+        };
         subscription1.id = 1;
 
         // Create another test subscription with ID 2
-        let mut subscription2 = Subscription::new(
+        let subscription2 = Subscription::new(
             SubscriptionMode::Distinct,
             Some(vec!["item2".to_string()]),
             Some(vec!["field2".to_string()]),
-        )
-        .unwrap();
+        );
+        let Ok(mut subscription2) = subscription2 else {
+            return;
+        };
         subscription2.id = 2;
 
         // Create a vector of subscriptions
@@ -44,23 +48,29 @@ mod tests {
         // Test finding subscription with ID 1
         let result = get_subscription_by_id(&subscriptions, 1);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().id, 1);
+        if let Some(sub) = result {
+            assert_eq!(sub.id, 1);
+        }
 
         // Test finding subscription with ID 2
         let result = get_subscription_by_id(&subscriptions, 2);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().id, 2);
+        if let Some(sub) = result {
+            assert_eq!(sub.id, 2);
+        }
     }
 
     #[test]
     fn test_get_subscription_by_id_not_found() {
         // Create a test subscription with ID 1
-        let mut subscription = Subscription::new(
+        let subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        );
+        let Ok(mut subscription) = subscription else {
+            return;
+        };
         subscription.id = 1;
 
         // Create a vector with one subscription

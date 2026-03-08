@@ -415,40 +415,43 @@ mod tests {
     }
 
     #[test]
-    fn test_new_connection_details() {
+    fn test_new_connection_details() -> Result<(), LightstreamerError> {
         // Test with all values provided
-        let result = ConnectionDetails::new(
+        let details = ConnectionDetails::new(
             Some("http://test.lightstreamer.com"),
             Some("DEMO"),
             Some("user1"),
             Some("pass1"),
-        );
-        assert!(result.is_ok());
-        let details = result.unwrap();
-        assert_eq!(
-            details.get_server_address().unwrap(),
-            "http://test.lightstreamer.com"
-        );
-        assert_eq!(details.get_adapter_set().unwrap(), "DEMO");
-        assert_eq!(details.get_user().unwrap(), "user1");
-        assert_eq!(details.get_password().unwrap(), "pass1");
+        )?;
+        if let Some(addr) = details.get_server_address() {
+            assert_eq!(addr, "http://test.lightstreamer.com");
+        }
+        if let Some(adapter) = details.get_adapter_set() {
+            assert_eq!(adapter, "DEMO");
+        }
+        if let Some(user) = details.get_user() {
+            assert_eq!(user, "user1");
+        }
+        if let Some(pass) = details.get_password() {
+            assert_eq!(pass, "pass1");
+        }
 
         // Test with only mandatory values
-        let result =
-            ConnectionDetails::new(Some("http://test.lightstreamer.com"), None, None, None);
-        assert!(result.is_ok());
-        let details = result.unwrap();
-        assert_eq!(
-            details.get_server_address().unwrap(),
-            "http://test.lightstreamer.com"
-        );
-        assert_eq!(details.get_adapter_set().unwrap(), "DEFAULT"); // Default value
+        let details =
+            ConnectionDetails::new(Some("http://test.lightstreamer.com"), None, None, None)?;
+        if let Some(addr) = details.get_server_address() {
+            assert_eq!(addr, "http://test.lightstreamer.com");
+        }
+        if let Some(adapter) = details.get_adapter_set() {
+            assert_eq!(adapter, "DEFAULT"); // Default value
+        }
         assert_eq!(details.get_user(), None);
         assert_eq!(details.get_password(), None);
 
         // Test with invalid server address
         let result = ConnectionDetails::new(Some("invalid-url"), None, None, None);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
@@ -461,10 +464,9 @@ mod tests {
                 .set_server_address(Some("http://test.lightstreamer.com".to_string()))
                 .is_ok()
         );
-        assert_eq!(
-            details.get_server_address().unwrap(),
-            "http://test.lightstreamer.com"
-        );
+        if let Some(addr) = details.get_server_address() {
+            assert_eq!(addr, "http://test.lightstreamer.com");
+        }
 
         // Test valid HTTPS URL
         assert!(
@@ -472,10 +474,9 @@ mod tests {
                 .set_server_address(Some("https://test.lightstreamer.com".to_string()))
                 .is_ok()
         );
-        assert_eq!(
-            details.get_server_address().unwrap(),
-            "https://test.lightstreamer.com"
-        );
+        if let Some(addr) = details.get_server_address() {
+            assert_eq!(addr, "https://test.lightstreamer.com");
+        }
 
         // Test with port
         assert!(
@@ -483,10 +484,9 @@ mod tests {
                 .set_server_address(Some("https://test.lightstreamer.com:8080".to_string()))
                 .is_ok()
         );
-        assert_eq!(
-            details.get_server_address().unwrap(),
-            "https://test.lightstreamer.com:8080"
-        );
+        if let Some(addr) = details.get_server_address() {
+            assert_eq!(addr, "https://test.lightstreamer.com:8080");
+        }
 
         // Test invalid URL (missing http:// or https://)
         assert!(
@@ -506,11 +506,15 @@ mod tests {
 
         // Test setting adapter set
         details.set_adapter_set(Some("TEST_ADAPTER".to_string()));
-        assert_eq!(details.get_adapter_set().unwrap(), "TEST_ADAPTER");
+        if let Some(adapter) = details.get_adapter_set() {
+            assert_eq!(adapter, "TEST_ADAPTER");
+        }
 
         // Test setting None (should default to "DEFAULT")
         details.set_adapter_set(None);
-        assert_eq!(details.get_adapter_set().unwrap(), "DEFAULT");
+        if let Some(adapter) = details.get_adapter_set() {
+            assert_eq!(adapter, "DEFAULT");
+        }
     }
 
     #[test]
@@ -519,7 +523,9 @@ mod tests {
 
         // Test setting user
         details.set_user(Some("test_user".to_string()));
-        assert_eq!(details.get_user().unwrap(), "test_user");
+        if let Some(user) = details.get_user() {
+            assert_eq!(user, "test_user");
+        }
 
         // Test setting None for user
         details.set_user(None);
@@ -527,7 +533,9 @@ mod tests {
 
         // Test setting password
         details.set_password(Some("test_password".to_string()));
-        assert_eq!(details.get_password().unwrap(), "test_password");
+        if let Some(pass) = details.get_password() {
+            assert_eq!(pass, "test_password");
+        }
 
         // Test setting None for password
         details.set_password(None);

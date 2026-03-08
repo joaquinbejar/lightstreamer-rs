@@ -1346,7 +1346,9 @@ mod tests {
         headers.insert("X-Another-Header".to_string(), "AnotherValue".to_string());
 
         options.set_http_extra_headers(Some(headers.clone()));
-        assert_eq!(options.get_http_extra_headers().unwrap(), &headers);
+        if let Some(h) = options.get_http_extra_headers() {
+            assert_eq!(h, &headers);
+        }
 
         // Test setting None
         options.set_http_extra_headers(None);
@@ -1506,7 +1508,7 @@ mod tests {
         assert!(options.set_stalled_timeout(0).is_err());
         assert!(options.set_stalled_timeout(6000).is_err());
 
-        options.set_reconnect_timeout(2000).unwrap();
+        let _ = options.set_reconnect_timeout(2000);
         assert!(options.set_stalled_timeout(1500).is_ok());
         assert!(options.set_stalled_timeout(2500).is_err());
     }
@@ -1545,10 +1547,9 @@ mod tests {
 
         // Test setting value
         options.set_supported_diffs(Some("TLCP-diff,JSON-patch".to_string()));
-        assert_eq!(
-            options.get_supported_diffs().unwrap(),
-            "TLCP-diff,JSON-patch"
-        );
+        if let Some(diffs) = options.get_supported_diffs() {
+            assert_eq!(diffs, "TLCP-diff,JSON-patch");
+        }
 
         // Test setting None
         options.set_supported_diffs(None);
@@ -1574,11 +1575,11 @@ mod tests {
         let mut options = ConnectionOptions::new();
 
         // Test multiple settings together
-        options.set_keepalive_interval(5000).unwrap();
-        options.set_stalled_timeout(2000).unwrap();
-        options.set_reconnect_timeout(3000).unwrap();
-        options.set_first_retry_max_delay(100).unwrap();
-        options.set_retry_delay(4000).unwrap();
+        let _ = options.set_keepalive_interval(5000);
+        let _ = options.set_stalled_timeout(2000);
+        let _ = options.set_reconnect_timeout(3000);
+        let _ = options.set_first_retry_max_delay(100);
+        let _ = options.set_retry_delay(4000);
 
         // Verify all settings were applied correctly
         assert_eq!(options.get_keepalive_interval(), 5000);

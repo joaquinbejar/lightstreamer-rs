@@ -223,8 +223,9 @@ mod tests_setup_logger_bis {
         S: tracing::Subscriber,
     {
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-            let mut level = self.level.lock().unwrap();
-            *level = Some(*event.metadata().level());
+            if let Ok(mut level) = self.level.lock() {
+                *level = Some(*event.metadata().level());
+            }
         }
     }
 
@@ -240,7 +241,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_default_log_level() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().ok();
         unsafe {
             env::remove_var("LOGLEVEL");
         }
@@ -253,12 +254,12 @@ mod tests_setup_logger_bis {
             tracing::info!("Test log");
         });
 
-        assert_eq!(*level.lock().unwrap(), Some(Level::INFO));
+        assert_eq!(level.lock().ok().and_then(|g| *g), Some(Level::INFO));
     }
 
     #[test]
     fn test_debug_log_level() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().ok();
         unsafe {
             env::set_var("LOGLEVEL", "DEBUG");
         }
@@ -271,7 +272,7 @@ mod tests_setup_logger_bis {
             tracing::debug!("Test log");
         });
 
-        assert_eq!(*level.lock().unwrap(), Some(Level::DEBUG));
+        assert_eq!(level.lock().ok().and_then(|g| *g), Some(Level::DEBUG));
         unsafe {
             env::remove_var("LOGLEVEL");
         }
@@ -279,7 +280,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_error_log_level() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().ok();
         unsafe {
             env::set_var("LOGLEVEL", "ERROR");
         }
@@ -292,7 +293,7 @@ mod tests_setup_logger_bis {
             tracing::error!("Test log");
         });
 
-        assert_eq!(*level.lock().unwrap(), Some(Level::ERROR));
+        assert_eq!(level.lock().ok().and_then(|g| *g), Some(Level::ERROR));
         unsafe {
             env::remove_var("LOGLEVEL");
         }
@@ -300,7 +301,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_warn_log_level() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().ok();
         unsafe {
             env::set_var("LOGLEVEL", "WARN");
         }
@@ -312,7 +313,7 @@ mod tests_setup_logger_bis {
             tracing::warn!("Test log");
         });
 
-        assert_eq!(*level.lock().unwrap(), Some(Level::WARN));
+        assert_eq!(level.lock().ok().and_then(|g| *g), Some(Level::WARN));
         unsafe {
             env::remove_var("LOGLEVEL");
         }
@@ -320,7 +321,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_trace_log_level() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().ok();
         unsafe {
             env::set_var("LOGLEVEL", "TRACE");
         }
@@ -333,7 +334,7 @@ mod tests_setup_logger_bis {
             tracing::trace!("Test log");
         });
 
-        assert_eq!(*level.lock().unwrap(), Some(Level::TRACE));
+        assert_eq!(level.lock().ok().and_then(|g| *g), Some(Level::TRACE));
 
         unsafe {
             env::remove_var("LOGLEVEL");
@@ -342,7 +343,7 @@ mod tests_setup_logger_bis {
 
     #[test]
     fn test_invalid_log_level() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().ok();
         unsafe {
             env::set_var("LOGLEVEL", "INVALID");
         }
@@ -355,7 +356,7 @@ mod tests_setup_logger_bis {
             tracing::info!("Test log");
         });
 
-        assert_eq!(*level.lock().unwrap(), Some(Level::INFO));
+        assert_eq!(level.lock().ok().and_then(|g| *g), Some(Level::INFO));
         unsafe {
             env::remove_var("LOGLEVEL");
         }

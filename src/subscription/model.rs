@@ -1072,7 +1072,10 @@ mod tests {
         assert!(result.is_ok());
 
         if let Some(items) = subscription.get_items() {
-            assert_eq!(items, &vec!["new_item1".to_string(), "new_item2".to_string()]);
+            assert_eq!(
+                items,
+                &vec!["new_item1".to_string(), "new_item2".to_string()]
+            );
         }
 
         subscription.is_active = true;
@@ -1095,7 +1098,10 @@ mod tests {
         assert!(result.is_ok());
 
         if let Some(fields) = subscription.get_fields() {
-            assert_eq!(fields, &vec!["new_field1".to_string(), "new_field2".to_string()]);
+            assert_eq!(
+                fields,
+                &vec!["new_field1".to_string(), "new_field2".to_string()]
+            );
         }
 
         subscription.is_active = true;
@@ -1541,7 +1547,8 @@ mod tests {
     }
 
     #[test]
-    fn test_command_second_level_field_methods_with_invalid_inputs() -> Result<(), LightstreamerError> {
+    fn test_command_second_level_field_methods_with_invalid_inputs()
+    -> Result<(), LightstreamerError> {
         // Test with non-COMMAND subscription
         let mut non_command_subscription = Subscription::new(
             SubscriptionMode::Merge,

@@ -229,72 +229,120 @@ mod tests {
 
         // Helper methods to check if methods were called
         fn was_on_property_change_called(&self) -> bool {
-            *self.on_property_change_called.lock().unwrap()
+            self.on_property_change_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_property_changes(&self) -> Vec<String> {
-            self.property_changes.lock().unwrap().clone()
+            self.property_changes
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_default()
         }
 
         fn was_on_server_error_called(&self) -> bool {
-            *self.on_server_error_called.lock().unwrap()
+            self.on_server_error_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_error_codes(&self) -> Vec<i32> {
-            self.error_codes.lock().unwrap().clone()
+            self.error_codes
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_default()
         }
 
         fn get_error_messages(&self) -> Vec<String> {
-            self.error_messages.lock().unwrap().clone()
+            self.error_messages
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_default()
         }
 
         fn was_on_status_change_called(&self) -> bool {
-            *self.on_status_change_called.lock().unwrap()
+            self.on_status_change_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn get_status_changes(&self) -> Vec<String> {
-            self.status_changes.lock().unwrap().clone()
+            self.status_changes
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_default()
         }
 
         fn was_on_listen_start_called(&self) -> bool {
-            *self.on_listen_start_called.lock().unwrap()
+            self.on_listen_start_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
 
         fn was_on_listen_end_called(&self) -> bool {
-            *self.on_listen_end_called.lock().unwrap()
+            self.on_listen_end_called
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(false)
         }
     }
 
     // Implement ClientListener for our test struct
     impl ClientListener for TestClientListener {
         fn on_property_change(&self, property: &str) {
-            *self.on_property_change_called.lock().unwrap() = true;
-            self.property_changes
-                .lock()
-                .unwrap()
-                .push(property.to_string());
+            if let Ok(mut guard) = self.on_property_change_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.property_changes.lock() {
+                guard.push(property.to_string());
+            }
         }
 
         fn on_server_error(&self, code: i32, message: &str) {
-            *self.on_server_error_called.lock().unwrap() = true;
-            self.error_codes.lock().unwrap().push(code);
-            self.error_messages
-                .lock()
-                .unwrap()
-                .push(message.to_string());
+            if let Ok(mut guard) = self.on_server_error_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.error_codes.lock() {
+                guard.push(code);
+            }
+            if let Ok(mut guard) = self.error_messages.lock() {
+                guard.push(message.to_string());
+            }
         }
 
         fn on_status_change(&self, status: &str) {
-            *self.on_status_change_called.lock().unwrap() = true;
-            self.status_changes.lock().unwrap().push(status.to_string());
+            if let Ok(mut guard) = self.on_status_change_called.lock() {
+                *guard = true;
+            }
+            if let Ok(mut guard) = self.status_changes.lock() {
+                guard.push(status.to_string());
+            }
         }
 
         fn on_listen_start(&self) {
-            *self.on_listen_start_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.on_listen_start_called.lock() {
+                *guard = true;
+            }
         }
 
         fn on_listen_end(&self) {
-            *self.on_listen_end_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.on_listen_end_called.lock() {
+                *guard = true;
+            }
         }
     }
 
