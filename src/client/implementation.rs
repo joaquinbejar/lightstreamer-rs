@@ -665,7 +665,9 @@ impl LightstreamerClient {
                                                                             let patch: serde_json::Value = serde_json::from_str(&diff_value).unwrap_or(serde_json::Value::Null);
                                                                             let mut prev_json: serde_json::Value = serde_json::from_str(prev_value).unwrap_or(serde_json::Value::Null);
                                                                             let patch_operations: Vec<json_patch::PatchOperation> = serde_json::from_value(patch).unwrap_or_default();
-                                                                            let _ = json_patch::patch(&mut prev_json, &patch_operations);
+                                                                            if let Err(e) = json_patch::patch(&mut prev_json, &patch_operations) {
+                                                                                tracing::warn!("Failed to apply JSON patch: {}", e);
+                                                                            }
                                                                             prev_json.to_string()
                                                                         }
                                                                         'T' => {

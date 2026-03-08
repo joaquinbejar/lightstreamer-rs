@@ -126,7 +126,7 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
         client_guard
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
-        let _ = client_guard.connection_options.set_keepalive_interval(5);
+        client_guard.connection_options.set_keepalive_interval(5)?;
     }
 
     // Create multiple subscriptions to demonstrate preservation during reconnections
@@ -140,11 +140,8 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     {
         let client_guard = client.lock().await;
         for subscription in subscriptions {
-            let _ = LightstreamerClient::subscribe(
-                client_guard.subscription_sender.clone(),
-                subscription,
-            )
-            .await;
+            LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
+                .await?;
         }
     }
 

@@ -83,8 +83,8 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
 
     info!("✅ Shutdown complete");
 
-    // Wait for tasks to finish
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connect_handle).await;
+    // Wait for tasks to finish (timeout result intentionally ignored)
+    drop(tokio::time::timeout(std::time::Duration::from_secs(2), connect_handle).await);
 
     drop(processor);
 

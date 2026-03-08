@@ -109,9 +109,8 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     // Configure client
     {
         let mut client_guard = client.lock().await;
-        let _ =
-            LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-                .await;
+        LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
+            .await?;
         client_guard
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
@@ -164,7 +163,8 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     // Abort the processor task since the channel won't close automatically
     info!("⏳ Stopping update processor...");
     processor_handle.abort();
-    let _ = processor_handle.await;
+    // Awaiting an aborted task returns JoinError which we intentionally ignore
+    drop(processor_handle.await);
 
     info!("✨ Channel-based subscription example completed!");
     info!("Key features demonstrated:");

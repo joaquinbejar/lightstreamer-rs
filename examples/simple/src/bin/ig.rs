@@ -70,8 +70,7 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     //
     {
         let mut client = client.lock().await;
-        let _ = LightstreamerClient::subscribe(client.subscription_sender.clone(), my_subscription)
-            .await;
+        LightstreamerClient::subscribe(client.subscription_sender.clone(), my_subscription).await?;
         client
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));

@@ -1508,7 +1508,7 @@ mod tests {
         assert!(options.set_stalled_timeout(0).is_err());
         assert!(options.set_stalled_timeout(6000).is_err());
 
-        let _ = options.set_reconnect_timeout(2000);
+        assert!(options.set_reconnect_timeout(2000).is_ok());
         assert!(options.set_stalled_timeout(1500).is_ok());
         assert!(options.set_stalled_timeout(2500).is_err());
     }
@@ -1575,11 +1575,11 @@ mod tests {
         let mut options = ConnectionOptions::new();
 
         // Test multiple settings together
-        let _ = options.set_keepalive_interval(5000);
-        let _ = options.set_stalled_timeout(2000);
-        let _ = options.set_reconnect_timeout(3000);
-        let _ = options.set_first_retry_max_delay(100);
-        let _ = options.set_retry_delay(4000);
+        assert!(options.set_keepalive_interval(5000).is_ok());
+        assert!(options.set_stalled_timeout(2000).is_ok());
+        assert!(options.set_reconnect_timeout(3000).is_ok());
+        assert!(options.set_first_retry_max_delay(100).is_ok());
+        assert!(options.set_retry_delay(4000).is_ok());
 
         // Verify all settings were applied correctly
         assert_eq!(options.get_keepalive_interval(), 5000);

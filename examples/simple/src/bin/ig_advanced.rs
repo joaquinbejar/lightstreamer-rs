@@ -119,13 +119,12 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
             .expect("Failed to set idle timeout");
 
         // Enable auto-reconnection with advanced configuration
-        let _ =
-            client_guard.enable_auto_reconnect_with_config(reconnection_config, heartbeat_config);
+        client_guard.enable_auto_reconnect_with_config(reconnection_config, heartbeat_config)?;
         info!("🔄 Auto-reconnection enabled with advanced financial market settings");
     }
 
     // Setup financial subscriptions with error handling
-    setup_financial_subscriptions(&client).await;
+    setup_financial_subscriptions(&client).await?;
 
     // Create shutdown signal for graceful termination
     let shutdown_signal = Arc::new(Notify::new());
@@ -164,7 +163,9 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     Ok(())
 }
 
-async fn setup_financial_subscriptions(client: &Arc<Mutex<LightstreamerClient>>) {
+async fn setup_financial_subscriptions(
+    client: &Arc<Mutex<LightstreamerClient>>,
+) -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
     info!("📡 Setting up multiple financial data subscriptions...");
 
     // Market data subscription for price updates
@@ -214,16 +215,16 @@ async fn setup_financial_subscriptions(client: &Arc<Mutex<LightstreamerClient>>)
     // Add subscriptions to client and configure connection options
     {
         let mut client_guard = client.lock().await;
-        let _ = LightstreamerClient::subscribe(
+        LightstreamerClient::subscribe(
             client_guard.subscription_sender.clone(),
             market_subscription,
         )
-        .await;
-        let _ = LightstreamerClient::subscribe(
+        .await?;
+        LightstreamerClient::subscribe(
             client_guard.subscription_sender.clone(),
             account_subscription,
         )
-        .await;
+        .await?;
 
         // Configure connection options for financial data streaming
         client_guard
@@ -244,6 +245,7 @@ async fn setup_financial_subscriptions(client: &Arc<Mutex<LightstreamerClient>>)
     }
 
     info!("✅ Financial subscriptions configured: Market Data + Account Data");
+    Ok(())
 }
 
 /// Monitor connection metrics and log periodic updates

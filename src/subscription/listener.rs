@@ -388,7 +388,9 @@ impl SubscriptionListener for ChannelSubscriptionListener {
     fn on_item_update(&self, update: &ItemUpdate) {
         // Clone the update and send it through the channel
         // If send fails, the receiver has been dropped, which is acceptable
-        let _ = self.sender.send(update.clone());
+        if self.sender.send(update.clone()).is_err() {
+            tracing::debug!("Channel receiver dropped, update discarded");
+        }
     }
 
     fn on_subscription(&mut self) {
