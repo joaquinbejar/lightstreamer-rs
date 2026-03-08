@@ -24,7 +24,8 @@ use std::fmt::{self, Debug, Formatter};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 /// Enum representing the snapshot delivery preferences to be requested to Lightstreamer Server for the items in the Subscription.
-#[derive(Debug, Default, Clone, Copy, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Snapshot {
     /// Request the full snapshot for the subscribed items.
     Yes,
@@ -55,7 +56,8 @@ impl fmt::Display for Snapshot {
 }
 
 /// Enum representing the subscription mode.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum SubscriptionMode {
     /// MERGE mode. The server sends an update for a specific item only if the state of at least one of the fields has changed.
     Merge,

@@ -356,9 +356,7 @@ impl LightstreamerClient {
         // Only WebSocket streaming transport is currently supported.
         //
         let forced_transport = self.connection_options.get_forced_transport();
-        if forced_transport.is_none()
-            || *forced_transport.unwrap() /* unwrap() is safe here */ != Transport::WsStreaming
-        {
+        if forced_transport.is_none_or(|t| *t != Transport::WsStreaming) {
             return Err(Box::new(IllegalStateException::new(
                 "Only WebSocket streaming transport is currently supported.",
             )));
@@ -366,9 +364,18 @@ impl LightstreamerClient {
         //
         // Convert the HTTP URL to a WebSocket URL.
         //
-        let http_url = self.connection_details.get_server_address().unwrap(); // unwrap() is safe here.
-        let mut url = Url::parse(http_url)
-            .expect("Failed to parse server address URL from connection details.");
+        let http_url = self
+            .connection_details
+            .get_server_address()
+            .ok_or_else(|| {
+                Box::new(IllegalStateException::new("Server address is not set.")) as Box<dyn Error>
+            })?;
+        let mut url = Url::parse(http_url).map_err(|e| {
+            Box::new(IllegalStateException::new(&format!(
+                "Failed to parse server address URL: {}",
+                e
+            ))) as Box<dyn Error>
+        })?;
         match url.scheme() {
             "http" => url
                 .set_scheme("ws")
@@ -866,10 +873,15 @@ impl LightstreamerClient {
                         }
 
                         subscription_id += 1;
-                        self.subscriptions.last_mut().unwrap().id = subscription_id;
-                        self.subscriptions.last().unwrap().id_sender.try_send(subscription_id)?;
+                        if let Some(sub) = self.subscriptions.last_mut() {
+                            sub.id = subscription_id;
+                            sub.id_sender.try_send(subscription_id)?;
+                        }
 
-                        let encoded_params = match Self::get_subscription_params(self.subscriptions.last().unwrap(), request_id)
+                        let Some(last_sub) = self.subscriptions.last() else {
+                            continue;
+                        };
+                        let encoded_params = match Self::get_subscription_params(last_sub, request_id)
                         {
                             Ok(params) => params,
                             Err(err) => {
@@ -1291,17 +1303,26 @@ impl LightstreamerClient {
     ///   values.
     ///
     /// See also `unsubscribe()`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription channel is closed.
     pub async fn subscribe(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription: Subscription,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         subscription_sender
             .send(SubscriptionRequest {
                 subscription: Some(subscription),
                 subscription_id: None,
             })
             .await
-            .unwrap()
+            .map_err(|e| {
+                Box::new(IllegalStateException::new(&format!(
+                    "Failed to send subscription: {}",
+                    e
+                ))) as Box<dyn std::error::Error>
+            })
     }
 
     /// If you want to be able to unsubscribe from a subscription, you need to keep track of the id
@@ -1325,7 +1346,7 @@ impl LightstreamerClient {
         subscription.id_receiver = new_receiver;
 
         // Send the subscription
-        LightstreamerClient::subscribe(subscription_sender, subscription).await;
+        LightstreamerClient::subscribe(subscription_sender, subscription).await?;
 
         // Wait for the ID to be updated through the channel
         match id_receiver.recv().await {
@@ -1371,17 +1392,26 @@ impl LightstreamerClient {
     /// * `subsrciption_sender`: A `Sender` object that sends a `SubscriptionRequest` to the `LightstreamerClient`
     /// * `subscription_id`: The id of the subscription to be unsubscribed from.
     ///   instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription channel is closed.
     pub async fn unsubscribe(
         subscription_sender: Sender<SubscriptionRequest>,
         subscription_id: usize,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         subscription_sender
             .send(SubscriptionRequest {
                 subscription: None,
                 subscription_id: Some(subscription_id),
             })
             .await
-            .unwrap()
+            .map_err(|e| {
+                Box::new(IllegalStateException::new(&format!(
+                    "Failed to send unsubscription: {}",
+                    e
+                ))) as Box<dyn std::error::Error>
+            })
     }
 
     /// Method setting enum for the logging of this instance.

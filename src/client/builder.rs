@@ -50,6 +50,7 @@ impl ClientConfig {
     /// # Returns
     ///
     /// A new `ClientConfig` with default values
+    #[must_use]
     pub fn new(server_address: impl Into<String>) -> Self {
         Self {
             server_address: server_address.into(),
@@ -140,6 +141,7 @@ impl SubscriptionParams {
     /// # Returns
     ///
     /// A new `SubscriptionParams` instance
+    #[must_use]
     pub fn new(mode: SubscriptionMode, items: Vec<String>, fields: Vec<String>) -> Self {
         Self {
             mode,
@@ -265,7 +267,7 @@ impl SimpleClient {
         // Add subscription to client
         let client_guard = self.client.lock().await;
         LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-            .await;
+            .await?;
 
         Ok(receiver)
     }
@@ -292,6 +294,7 @@ impl SimpleClient {
     /// Gets a clone of the shutdown signal.
     ///
     /// This can be used to trigger shutdown from external code.
+    #[must_use]
     pub fn shutdown_signal(&self) -> Arc<Notify> {
         self.shutdown_signal.clone()
     }

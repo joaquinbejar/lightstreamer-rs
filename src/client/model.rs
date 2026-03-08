@@ -5,6 +5,8 @@
 ******************************************************************************/
 
 /// Represents the current status of the `LightstreamerClient`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ClientStatus {
     /// The client is attempting to connect to the Lightstreamer Server.
     Connecting,
@@ -43,7 +45,8 @@ impl std::fmt::Display for ClientStatus {
 ///
 /// This enum indicates the specific transport protocol and connection mode being used
 /// for communication with the server.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum ConnectionType {
     /// Connection established using HTTP polling transport.
     HttpPolling,
@@ -62,7 +65,8 @@ pub enum ConnectionType {
 ///
 /// This enum provides information about the disconnection state and what actions
 /// the client will take following the disconnection.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum DisconnectionType {
     /// The client will automatically try to reconnect to the server.
     WillRetry,
@@ -75,12 +79,15 @@ pub enum DisconnectionType {
 /// Represents the type of logging to be used by the LightstreamerClient.
 ///
 /// This enum determines how log messages from the client will be handled and output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
 pub enum LogType {
     /// Use the tracing crate for logging.
     /// This provides structured, leveled logging with spans and events.
     TracingLogs,
     /// Use standard output (stdout/stderr) for logging.
     /// This provides simpler logging directly to the console.
+    #[default]
     StdLogs,
 }
 
@@ -103,7 +110,8 @@ pub enum LogType {
 /// - HTTP-POLLING: the Stream-Sense algorithm is disabled and the client will only connect
 ///   on Polling over HTTP. If Polling over HTTP is not possible because of the environment
 ///   the client will not connect at all.
-#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Transport {
     /// WebSocket transport with Stream-Sense algorithm enabled. The client will only use WebSocket-based connections.
     Ws,

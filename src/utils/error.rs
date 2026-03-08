@@ -1,11 +1,9 @@
-use std::error::Error;
-use std::fmt;
-
 /// Exception thrown when an illegal or inappropriate argument is passed to a method.
 ///
 /// This exception indicates that a method has been passed an illegal or inappropriate argument.
 /// It is similar to Java's IllegalArgumentException.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct IllegalArgumentException(String);
 
 impl IllegalArgumentException {
@@ -16,20 +14,10 @@ impl IllegalArgumentException {
     ///
     /// # Returns
     /// A new IllegalArgumentException instance with the specified message
+    #[cold]
+    #[must_use]
     pub fn new(msg: &str) -> IllegalArgumentException {
         IllegalArgumentException(msg.to_string())
-    }
-}
-
-impl fmt::Display for IllegalArgumentException {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Error for IllegalArgumentException {
-    fn description(&self) -> &str {
-        &self.0
     }
 }
 
@@ -38,7 +26,8 @@ impl Error for IllegalArgumentException {
 /// This exception indicates that a method has been invoked at an inappropriate time
 /// or that the object is in an inappropriate state for the requested operation.
 /// It is similar to Java's IllegalStateException.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{details}")]
 pub struct IllegalStateException {
     details: String,
 }
@@ -51,22 +40,12 @@ impl IllegalStateException {
     ///
     /// # Returns
     /// A new IllegalStateException instance with the specified message
+    #[cold]
+    #[must_use]
     pub fn new(msg: &str) -> IllegalStateException {
         IllegalStateException {
             details: msg.to_string(),
         }
-    }
-}
-
-impl fmt::Display for IllegalStateException {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.details)
-    }
-}
-
-impl Error for IllegalStateException {
-    fn description(&self) -> &str {
-        &self.details
     }
 }
 
