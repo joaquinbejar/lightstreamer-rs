@@ -86,7 +86,7 @@ To use this SDK in your Rust project, add the following dependency to your `Carg
 
 ```toml
 [dependencies]
-lightstreamer-rs = "0.1.4"
+lightstreamer-rs = "0.3.0"
 ```
 
 ### Usage

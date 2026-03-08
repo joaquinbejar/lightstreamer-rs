@@ -89,7 +89,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lightstreamer-rs = "0.1.4"
+//! lightstreamer-rs = "0.3.0"
 //! ```
 //!
 //! ## Usage
