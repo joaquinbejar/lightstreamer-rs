@@ -149,7 +149,9 @@ impl Subscription {
             ));
         }
 
-        let (id_sender, id_receiver) = channel(1);
+        // Channel capacity of 2 ensures subscription ID updates are not lost even if
+        // processing is slightly delayed. The ID is sent once per subscription lifecycle.
+        let (id_sender, id_receiver) = channel(2);
 
         Ok(Subscription {
             mode,
