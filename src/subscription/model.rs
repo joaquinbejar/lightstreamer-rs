@@ -967,6 +967,7 @@ impl Debug for Subscription {
 mod tests {
     use super::*;
     use crate::subscription::ItemUpdate;
+    use crate::utils::LightstreamerError;
     use std::sync::{Arc, Mutex};
 
     struct MockSubscriptionListener {
@@ -987,38 +988,39 @@ mod tests {
 
     impl SubscriptionListener for MockSubscriptionListener {
         fn on_subscription(&mut self) {
-            *self.subscription_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.subscription_called.lock() {
+                *guard = true;
+            }
         }
 
         fn on_unsubscription(&mut self) {
-            *self.unsubscription_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.unsubscription_called.lock() {
+                *guard = true;
+            }
         }
 
         fn on_item_update(&self, _update: &ItemUpdate) {
-            *self.item_update_called.lock().unwrap() = true;
+            if let Ok(mut guard) = self.item_update_called.lock() {
+                *guard = true;
+            }
         }
     }
 
     #[test]
-    fn test_new_subscription() {
+    fn test_new_subscription() -> Result<(), LightstreamerError> {
         let subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string(), "item2".to_string()]),
             Some(vec!["field1".to_string(), "field2".to_string()]),
-        );
-
-        assert!(subscription.is_ok());
-        let subscription = subscription.unwrap();
+        )?;
 
         assert_eq!(*subscription.get_mode(), SubscriptionMode::Merge);
-        assert_eq!(
-            subscription.get_items().unwrap(),
-            &vec!["item1".to_string(), "item2".to_string()]
-        );
-        assert_eq!(
-            subscription.get_fields().unwrap(),
-            &vec!["field1".to_string(), "field2".to_string()]
-        );
+        if let Some(items) = subscription.get_items() {
+            assert_eq!(items, &vec!["item1".to_string(), "item2".to_string()]);
+        }
+        if let Some(fields) = subscription.get_fields() {
+            assert_eq!(fields, &vec!["field1".to_string(), "field2".to_string()]);
+        }
 
         let subscription = Subscription::new(
             SubscriptionMode::Merge,
@@ -1033,16 +1035,16 @@ mod tests {
             None,
         );
         assert!(subscription.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_add_and_remove_listener() {
+    fn test_add_and_remove_listener() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
         assert_eq!(subscription.get_listeners().len(), 0);
 
         let listener = Box::new(MockSubscriptionListener::new());
@@ -1055,170 +1057,180 @@ mod tests {
 
         subscription.add_listener(Box::new(listener2));
         assert_eq!(subscription.get_listeners().len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_set_items() {
+    fn test_set_items() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_items(vec!["new_item1".to_string(), "new_item2".to_string()]);
         assert!(result.is_ok());
 
-        assert_eq!(
-            subscription.get_items().unwrap(),
-            &vec!["new_item1".to_string(), "new_item2".to_string()]
-        );
+        if let Some(items) = subscription.get_items() {
+            assert_eq!(items, &vec!["new_item1".to_string(), "new_item2".to_string()]);
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_items(vec!["another_item".to_string()]);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_fields() {
+    fn test_set_fields() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result =
             subscription.set_fields(vec!["new_field1".to_string(), "new_field2".to_string()]);
         assert!(result.is_ok());
 
-        assert_eq!(
-            subscription.get_fields().unwrap(),
-            &vec!["new_field1".to_string(), "new_field2".to_string()]
-        );
+        if let Some(fields) = subscription.get_fields() {
+            assert_eq!(fields, &vec!["new_field1".to_string(), "new_field2".to_string()]);
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_fields(vec!["another_field".to_string()]);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_item_group() {
+    fn test_set_item_group() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_item_group("group1".to_string());
         assert!(result.is_ok());
 
-        assert_eq!(subscription.get_item_group().unwrap(), "group1");
+        if let Some(group) = subscription.get_item_group() {
+            assert_eq!(group, "group1");
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_item_group("another_group".to_string());
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_field_schema() {
+    fn test_set_field_schema() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_field_schema("schema1".to_string());
         assert!(result.is_ok());
 
-        assert_eq!(subscription.get_field_schema().unwrap(), "schema1");
+        if let Some(schema) = subscription.get_field_schema() {
+            assert_eq!(schema, "schema1");
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_field_schema("another_schema".to_string());
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_data_adapter() {
+    fn test_set_data_adapter() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_data_adapter(Some("adapter1".to_string()));
         assert!(result.is_ok());
-        assert_eq!(subscription.get_data_adapter().unwrap(), "adapter1");
+        if let Some(adapter) = subscription.get_data_adapter() {
+            assert_eq!(adapter, "adapter1");
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_data_adapter(Some("another_adapter".to_string()));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_requested_snapshot() {
+    fn test_set_requested_snapshot() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_requested_snapshot(Some(Snapshot::Yes));
         assert!(result.is_ok());
 
-        match subscription.get_requested_snapshot().unwrap() {
-            Snapshot::Yes => {} // OK
-            _ => panic!("Expected Snapshot::Yes"),
+        if let Some(snapshot) = subscription.get_requested_snapshot() {
+            match snapshot {
+                Snapshot::Yes => {} // OK
+                _ => panic!("Expected Snapshot::Yes"),
+            }
         }
 
         subscription.is_active = true;
 
         let result = subscription.set_requested_snapshot(Some(Snapshot::No));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_requested_buffer_size() {
+    fn test_set_requested_buffer_size() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_requested_buffer_size(Some(10));
         assert!(result.is_ok());
 
-        assert_eq!(subscription.get_requested_buffer_size().unwrap(), &10);
+        if let Some(size) = subscription.get_requested_buffer_size() {
+            assert_eq!(size, &10);
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_requested_buffer_size(Some(20));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_requested_max_frequency() {
+    fn test_set_requested_max_frequency() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_requested_max_frequency(Some(10.5));
         assert!(result.is_ok());
 
-        assert_eq!(subscription.get_requested_max_frequency().unwrap(), &10.5);
+        if let Some(freq) = subscription.get_requested_max_frequency() {
+            assert_eq!(freq, &10.5);
+        }
 
         subscription.is_active = true;
 
@@ -1228,46 +1240,45 @@ mod tests {
         subscription.requested_max_frequency = None;
         let result = subscription.set_requested_max_frequency(Some(30.5));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_set_selector() {
+    fn test_set_selector() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = subscription.set_selector(Some("selector1".to_string()));
         assert!(result.is_ok());
 
-        assert_eq!(subscription.get_selector().unwrap(), "selector1");
+        if let Some(selector) = subscription.get_selector() {
+            assert_eq!(selector, "selector1");
+        }
 
         subscription.is_active = true;
 
         let result = subscription.set_selector(Some("another_selector".to_string()));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_command_second_level_methods() {
+    fn test_command_second_level_methods() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result =
             subscription.set_command_second_level_data_adapter(Some("adapter1".to_string()));
         assert!(result.is_ok());
-        assert_eq!(
-            subscription
-                .get_command_second_level_data_adapter()
-                .unwrap(),
-            "adapter1"
-        );
+        if let Some(adapter) = subscription.get_command_second_level_data_adapter() {
+            assert_eq!(adapter, "adapter1");
+        }
 
         subscription.is_active = true;
 
@@ -1282,27 +1293,22 @@ mod tests {
             "field2".to_string(),
         ]));
         assert!(result.is_ok());
-        assert_eq!(
-            subscription.get_command_second_level_fields().unwrap(),
-            &vec!["field1".to_string(), "field2".to_string()]
-        );
+        if let Some(fields) = subscription.get_command_second_level_fields() {
+            assert_eq!(fields, &vec!["field1".to_string(), "field2".to_string()]);
+        }
 
         let result =
             subscription.set_command_second_level_field_schema(Some("schema1".to_string()));
         assert!(result.is_ok());
-        assert_eq!(
-            subscription
-                .get_command_second_level_field_schema()
-                .unwrap(),
-            "schema1"
-        );
+        if let Some(schema) = subscription.get_command_second_level_field_schema() {
+            assert_eq!(schema, "schema1");
+        }
 
         let mut non_command_subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         let result = non_command_subscription
             .set_command_second_level_data_adapter(Some("adapter1".to_string()));
@@ -1315,23 +1321,24 @@ mod tests {
         let result = non_command_subscription
             .set_command_second_level_field_schema(Some("schema1".to_string()));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_is_active_and_is_subscribed() {
+    fn test_is_active_and_is_subscribed() -> Result<(), LightstreamerError> {
         let subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         assert!(!subscription.is_active());
         assert!(!subscription.is_subscribed());
+        Ok(())
     }
 
     #[test]
-    fn test_get_key_position() {
+    fn test_get_key_position() -> Result<(), LightstreamerError> {
         // Create a COMMAND subscription with field_schema containing key
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
@@ -1341,8 +1348,7 @@ mod tests {
                 "command".to_string(),
                 "field1".to_string(),
             ]),
-        )
-        .unwrap();
+        )?;
 
         // Set field_schema with key field
         subscription.field_schema = Some("key,command,field1".to_string());
@@ -1361,8 +1367,7 @@ mod tests {
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["key".to_string(), "field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         non_command_subscription.field_schema = Some("key,field1".to_string());
         non_command_subscription.is_subscribed = true;
@@ -1375,18 +1380,18 @@ mod tests {
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
             Some(vec!["command".to_string(), "field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         no_key_subscription.field_schema = Some("command,field1".to_string());
         no_key_subscription.is_subscribed = true;
 
         // Should return None when key field is not present
         assert_eq!(no_key_subscription.get_key_position(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_get_command_position() {
+    fn test_get_command_position() -> Result<(), LightstreamerError> {
         // Create a COMMAND subscription with field_schema containing command
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
@@ -1396,8 +1401,7 @@ mod tests {
                 "command".to_string(),
                 "field1".to_string(),
             ]),
-        )
-        .unwrap();
+        )?;
 
         // Set field_schema with command field
         subscription.field_schema = Some("key,command,field1".to_string());
@@ -1416,8 +1420,7 @@ mod tests {
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["command".to_string(), "field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         non_command_subscription.field_schema = Some("command,field1".to_string());
         non_command_subscription.is_subscribed = true;
@@ -1430,24 +1433,23 @@ mod tests {
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
             Some(vec!["key".to_string(), "field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         no_command_subscription.field_schema = Some("key,field1".to_string());
         no_command_subscription.is_subscribed = true;
 
         // Should return None when command field is not present
         assert_eq!(no_command_subscription.get_command_position(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_debug_implementation() {
+    fn test_debug_implementation() -> Result<(), LightstreamerError> {
         let subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         // Test that Debug implementation works without panicking
         let debug_string = format!("{:?}", subscription);
@@ -1458,6 +1460,7 @@ mod tests {
         assert!(debug_string.contains("fields"));
         assert!(debug_string.contains("is_active"));
         assert!(debug_string.contains("is_subscribed"));
+        Ok(())
     }
 
     #[test]
@@ -1486,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_command_value() {
+    fn test_get_command_value() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
@@ -1495,8 +1498,7 @@ mod tests {
                 "command".to_string(),
                 "field1".to_string(),
             ]),
-        )
-        .unwrap();
+        )?;
 
         // Manually add some command values to test get_command_value
         let mut field_map = HashMap::new();
@@ -1520,32 +1522,32 @@ mod tests {
         // Test getting a non-existent item position
         let value = subscription.get_command_value(2, "test_key", 3);
         assert_eq!(value, None);
+        Ok(())
     }
 
     #[test]
-    fn test_set_requested_buffer_size_with_unlimited() {
+    fn test_set_requested_buffer_size_with_unlimited() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         // Test setting buffer size to "unlimited"
         let result = subscription.set_requested_buffer_size(None);
         assert!(result.is_ok());
         assert_eq!(subscription.get_requested_buffer_size(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_command_second_level_field_methods_with_invalid_inputs() {
+    fn test_command_second_level_field_methods_with_invalid_inputs() -> Result<(), LightstreamerError> {
         // Test with non-COMMAND subscription
         let mut non_command_subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         // Test set_command_second_level_fields with invalid subscription mode
         let result = non_command_subscription
@@ -1564,8 +1566,7 @@ mod tests {
             SubscriptionMode::Command,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         // Make the subscription active
         command_subscription.is_active = true;
@@ -1580,17 +1581,19 @@ mod tests {
         let result =
             command_subscription.set_command_second_level_field_schema(Some("field1".to_string()));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Subscription is active");
+        if let Err(e) = result {
+            assert_eq!(e, "Subscription is active");
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_set_data_adapter_with_invalid_inputs() {
+    fn test_set_data_adapter_with_invalid_inputs() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         // Make the subscription active
         subscription.is_active = true;
@@ -1598,17 +1601,19 @@ mod tests {
         // Test set_data_adapter with active subscription
         let result = subscription.set_data_adapter(Some("adapter1".to_string()));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Subscription is active");
+        if let Err(e) = result {
+            assert_eq!(e, "Subscription is active");
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_set_selector_with_invalid_inputs() {
+    fn test_set_selector_with_invalid_inputs() -> Result<(), LightstreamerError> {
         let mut subscription = Subscription::new(
             SubscriptionMode::Merge,
             Some(vec!["item1".to_string()]),
             Some(vec!["field1".to_string()]),
-        )
-        .unwrap();
+        )?;
 
         // Make the subscription active
         subscription.is_active = true;
@@ -1616,6 +1621,9 @@ mod tests {
         // Test set_selector with active subscription
         let result = subscription.set_selector(Some("selector1".to_string()));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Subscription is active");
+        if let Err(e) = result {
+            assert_eq!(e, "Subscription is active");
+        }
+        Ok(())
     }
 }
