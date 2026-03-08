@@ -140,8 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let client_guard = client.lock().await;
         for subscription in subscriptions {
-            LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-                .await;
+            let _ = LightstreamerClient::subscribe(
+                client_guard.subscription_sender.clone(),
+                subscription,
+            )
+            .await;
         }
     }
 

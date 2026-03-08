@@ -215,12 +215,12 @@ async fn setup_financial_subscriptions(client: &Arc<Mutex<LightstreamerClient>>)
     // Add subscriptions to client and configure connection options
     {
         let mut client_guard = client.lock().await;
-        LightstreamerClient::subscribe(
+        let _ = LightstreamerClient::subscribe(
             client_guard.subscription_sender.clone(),
             market_subscription,
         )
         .await;
-        LightstreamerClient::subscribe(
+        let _ = LightstreamerClient::subscribe(
             client_guard.subscription_sender.clone(),
             account_subscription,
         )

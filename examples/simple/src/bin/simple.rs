@@ -90,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     {
         let mut client = client.lock().await;
-        LightstreamerClient::subscribe(client.subscription_sender.clone(), my_subscription).await;
+        let _ = LightstreamerClient::subscribe(client.subscription_sender.clone(), my_subscription)
+            .await;
         client
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));

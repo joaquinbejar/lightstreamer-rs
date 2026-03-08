@@ -109,8 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure client
     {
         let mut client_guard = client.lock().await;
-        LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
-            .await;
+        let _ =
+            LightstreamerClient::subscribe(client_guard.subscription_sender.clone(), subscription)
+                .await;
         client_guard
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
