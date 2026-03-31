@@ -4,28 +4,47 @@ use tokio::sync::Notify;
 use tracing::error;
 use tracing::info;
 
-/// Clean the message from newlines and carriage returns and convert it to lowercase. Also remove all brackets.
+/// Clean the message from newlines and carriage returns.
+///
+/// Only the **message type prefix** (the portion before the first comma) is
+/// lowercased so that downstream `match` arms can use lowercase literals
+/// (`"u"`, `"conok"`, …). The rest of the message — including field values,
+/// session identifiers and protocol tokens — is preserved verbatim so that
+/// casing‑sensitive data (e.g. `DEAL`, `^P`, `^T`) is not corrupted.
+///
+/// Content inside curly braces `{}` is always preserved as‑is.
 pub fn clean_message(text: &str) -> String {
-    let mut result = String::new();
-    let mut inside_braces = false;
+    let chars_to_replace = ['\n', '\r'];
+    let stripped = text.replace(chars_to_replace, "");
 
-    for part in text.split_inclusive(&['{', '}']) {
-        if part.starts_with('{') && part.ends_with('}') {
-            // Part is fully inside braces
-            inside_braces = true;
-            result.push_str(part);
-        } else if inside_braces {
-            // We're processing a segment after an opening brace
-            inside_braces = false;
-            result.push_str(part);
-        } else {
-            // Process the part outside braces
-            let chars_to_replace = ['\n', '\r']; // Using an array of chars to replace
-            result.push_str(&part.replace(chars_to_replace, "").to_lowercase());
+    // Find the first comma that is outside curly braces.
+    let mut in_brackets: usize = 0;
+    let mut first_comma: Option<usize> = None;
+    for (i, c) in stripped.char_indices() {
+        match c {
+            '{' => in_brackets += 1,
+            '}' => in_brackets = in_brackets.saturating_sub(1),
+            ',' if in_brackets == 0 => {
+                first_comma = Some(i);
+                break;
+            }
+            _ => {}
         }
     }
 
-    result
+    match first_comma {
+        Some(pos) => {
+            // Lowercase only the message‑type prefix.
+            let mut result = String::with_capacity(stripped.len());
+            result.push_str(&stripped[..pos].to_lowercase());
+            result.push_str(&stripped[pos..]);
+            result
+        }
+        None => {
+            // No comma found — the whole string is the prefix (e.g. "PROBE").
+            stripped.to_lowercase()
+        }
+    }
 }
 
 /// Parses a comma-separated string input into a vector of string slices (`Vec<&str>`).
@@ -149,6 +168,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_basic() {
+            // No comma → entire string is the prefix → lowercased
             let text = "Hello\nWorld";
             let result = clean_message(text);
             assert_eq!(result, "helloworld");
@@ -156,7 +176,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_with_partial_braces() {
-            // This tests the case where a part starts with '{' but doesn't end with '}'
+            // No comma → entire string is the prefix → lowercased
             let text = "{partial brace content} followed by text";
             let result = clean_message(text);
             assert_eq!(result, "{partial brace content} followed by text");
@@ -164,7 +184,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_with_ending_brace() {
-            // This tests the case where a part ends with '}' but doesn't start with '{'
+            // No comma → entire string is the prefix → lowercased
             let text = "text followed by {partial brace content}";
             let result = clean_message(text);
             assert_eq!(result, "text followed by {partial brace content}");
@@ -172,6 +192,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_with_carriage_return() {
+            // No comma → entire string is the prefix → lowercased
             let text = "Hello\r\nWorld";
             let result = clean_message(text);
             assert_eq!(result, "helloworld");
@@ -179,6 +200,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_lowercase_conversion() {
+            // No comma → entire string is the prefix → lowercased
             let text = "Hello WORLD";
             let result = clean_message(text);
             assert_eq!(result, "hello world");
@@ -193,6 +215,8 @@ mod tests {
 
         #[test]
         fn test_clean_message_preserve_braces_content() {
+            // No comma → entire string is the prefix → lowercased (braces don't matter
+            // when the whole message is a single token).
             let text = "Message with {Preserved\nContent} and not preserved\nContent";
             let result = clean_message(text);
             assert_eq!(
@@ -203,6 +227,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_nested_braces() {
+            // No comma → entire string is the prefix → lowercased
             let text = "Message with {Outer{Inner\nContent}Outer} and regular\nContent";
             let result = clean_message(text);
             assert_eq!(
@@ -213,6 +238,7 @@ mod tests {
 
         #[test]
         fn test_clean_message_unbalanced_braces() {
+            // No comma → entire string is the prefix → lowercased
             let text = "Message with {Unbalanced and regular\nContent";
             let result = clean_message(text);
             assert_eq!(result, "message with {unbalanced and regularcontent");
@@ -220,14 +246,36 @@ mod tests {
 
         #[test]
         fn test_clean_message_protocol_example() {
-            // Typical TLCP message examples
+            // Only the prefix is lowercased; the session ID preserves casing.
             let text = "CONOK,S8f4aec42c3c14ad0,50000,5000,*\r\n";
             let result = clean_message(text);
-            assert_eq!(result, "conok,s8f4aec42c3c14ad0,50000,5000,*");
+            assert_eq!(result, "conok,S8f4aec42c3c14ad0,50000,5000,*");
 
             let text = "PROBE\r\n";
             let result = clean_message(text);
             assert_eq!(result, "probe");
+        }
+
+        #[test]
+        fn test_clean_message_update_preserves_field_values() {
+            // Update messages: only "U" → "u", field values are preserved.
+            let text = "U,1,1,DEAL|1.32|#|^P\r\n";
+            let result = clean_message(text);
+            assert_eq!(result, "u,1,1,DEAL|1.32|#|^P");
+        }
+
+        #[test]
+        fn test_clean_message_update_preserves_caret_commands() {
+            let text = "U,1,1,^5|CLOSED|-0.5\r\n";
+            let result = clean_message(text);
+            assert_eq!(result, "u,1,1,^5|CLOSED|-0.5");
+        }
+
+        #[test]
+        fn test_clean_message_reqerr_preserves_details() {
+            let text = "REQERR,21,InvalidField\r\n";
+            let result = clean_message(text);
+            assert_eq!(result, "reqerr,21,InvalidField");
         }
     }
 
