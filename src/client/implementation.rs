@@ -464,7 +464,7 @@ impl LightstreamerClient {
         //
         let mut is_connected = false;
         let mut request_id: usize = 0;
-        let mut _session_id: Option<String> = None;
+        let mut session_id: Option<String> = None;
         let mut subscription_id: usize = 0;
         let mut subscription_item_updates: HashMap<usize, HashMap<usize, ItemUpdate>> =
             HashMap::new();
@@ -553,9 +553,10 @@ impl LightstreamerClient {
                                             );
                                             self.make_log( Level::DEBUG, &format!("Server-declared keepalive interval: {} ms", server_keepalive_ms) );
                                         }
-                                        if let Some(session_id) = submessage_fields.get(1) {
+                                        if let Some(conok_session_id) = submessage_fields.get(1) {
+                                            session_id = Some((*conok_session_id).to_string());
                                             self.make_log( Level::DEBUG, &format!("Session creation confirmed by server: {}", clean_text) );
-                                            self.make_log( Level::DEBUG, &format!("Session created with ID: {:?}", session_id) );
+                                            self.make_log( Level::DEBUG, &format!("Session created with ID: {:?}", conok_session_id) );
                                             //
                                             // Subscribe to the desired items.
                                             //
@@ -895,8 +896,8 @@ impl LightstreamerClient {
                                     },
                                     unexpected_message => {
                                         return Err(LightstreamerError::protocol(format!(
-                                            "Unexpected message received from server: '{:?}'",
-                                            unexpected_message
+                                            "Unexpected message received from server: '{:?}' (full message: '{}')",
+                                            unexpected_message, clean_text
                                         )));
                                     },
                                 }
@@ -1018,9 +1019,17 @@ impl LightstreamerClient {
                         Some(timer) => { timer.tick().await; },
                         None => std::future::pending::<()>().await,
                     }
-                }, if is_connected => {
-                    write_stream.send(Message::Text("heartbeat\r\n".into())).await?;
-                    self.make_log(Level::DEBUG, "Sent reverse heartbeat to server");
+                }, if is_connected && session_id.is_some() => {
+                    // TLCP requires every request to carry at least one
+                    // parameter — an empty body is rejected with
+                    // "error,67,Empty request unexpected".
+                    if let Some(id) = session_id.as_deref() {
+                        let params = serde_urlencoded::to_string([("LS_session", id)])?;
+                        write_stream
+                            .send(Message::Text(format!("heartbeat\r\n{}", params).into()))
+                            .await?;
+                        self.make_log(Level::DEBUG, "Sent reverse heartbeat to server");
+                    }
                 },
             }
         }

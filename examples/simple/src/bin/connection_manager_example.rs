@@ -126,7 +126,11 @@ async fn main() -> Result<(), lightstreamer_rs::utils::LightstreamerError> {
         client_guard
             .connection_options
             .set_forced_transport(Some(Transport::WsStreaming));
-        client_guard.connection_options.set_keepalive_interval(5)?;
+        // Keepalive interval is in milliseconds and must be >= stalled (2000ms)
+        // and reconnect (3000ms) timeouts.
+        client_guard
+            .connection_options
+            .set_keepalive_interval(5000)?;
     }
 
     // Create multiple subscriptions to demonstrate preservation during reconnections
