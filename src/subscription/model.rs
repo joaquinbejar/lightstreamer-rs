@@ -705,15 +705,11 @@ impl Subscription {
             return Err("Subscription is active".to_string());
         }
         match snapshot {
-            Some(Snapshot::None) => {
-                if self.mode == SubscriptionMode::Raw {
-                    return Err("Cannot request snapshot for Raw mode".to_string());
-                }
+            Some(Snapshot::None) if self.mode == SubscriptionMode::Raw => {
+                return Err("Cannot request snapshot for Raw mode".to_string());
             }
-            Some(Snapshot::Number(_)) => {
-                if self.mode != SubscriptionMode::Distinct {
-                    return Err("Cannot specify snapshot length for non-Distinct mode".to_string());
-                }
+            Some(Snapshot::Number(_)) if self.mode != SubscriptionMode::Distinct => {
+                return Err("Cannot specify snapshot length for non-Distinct mode".to_string());
             }
             _ => {}
         }

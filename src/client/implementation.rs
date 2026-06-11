@@ -14,11 +14,13 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::{
     Mutex, Notify,
     mpsc::{Receiver, Sender},
 };
+use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -144,6 +146,13 @@ impl LightstreamerClient {
 
     /// A constant string representing the version of the TLCP protocol used by the library.
     pub const TLCP_VERSION: &'static str = "TLCP-2.4.0";
+
+    /// Grace period (milliseconds) added on top of the keepalive interval before
+    /// the connection is considered dead by the liveness watchdog.
+    ///
+    /// The server guarantees a message (data or `probe`) at least every keepalive
+    /// interval; the grace absorbs network jitter and scheduling delays.
+    pub const KEEPALIVE_GRACE_MS: u64 = 5_000;
 
     /// Static method that can be used to share cookies between connections to the Server (performed by
     /// this library) and connections to other sites that are performed by the application. With this
@@ -459,9 +468,39 @@ impl LightstreamerClient {
         let mut subscription_id: usize = 0;
         let mut subscription_item_updates: HashMap<usize, HashMap<usize, ItemUpdate>> =
             HashMap::new();
+
+        //
+        // Liveness enforcement and reverse heartbeat.
+        //
+        // The server guarantees that some message (data or `probe`) is sent at
+        // least every keepalive interval. If nothing arrives within the
+        // effective keepalive window plus a grace period, the connection is
+        // considered dead (half-open TCP) and an error is returned so the
+        // caller can reconnect. The window starts from the configured
+        // keepalive interval (if any) and is widened to the server-declared
+        // keepalive from the `conok` message once known.
+        //
+        let configured_keepalive_ms = self.connection_options.get_keepalive_interval();
+        let reverse_heartbeat_ms = self.connection_options.get_reverse_heartbeat_interval();
+        let mut keepalive_timeout_ms: u64 = configured_keepalive_ms;
+        let mut last_message_at = TokioInstant::now();
+
+        let mut heartbeat_timer = if reverse_heartbeat_ms > 0 {
+            let mut timer = tokio::time::interval(Duration::from_millis(reverse_heartbeat_ms));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(timer)
+        } else {
+            None
+        };
+
         loop {
+            let liveness_deadline = last_message_at
+                + Duration::from_millis(
+                    keepalive_timeout_ms.saturating_add(Self::KEEPALIVE_GRACE_MS),
+                );
             tokio::select! {
                 message = read_stream.next() => {
+                    last_message_at = TokioInstant::now();
                     match message {
                         Some(Ok(Message::Text(text))) => {
                             // Messages could include multiple submessages separated by /r/n.
@@ -476,15 +515,44 @@ impl LightstreamerClient {
                                     //
                                     // Errors from server.
                                     //
-                                    "conerr" | "reqerr" => {
+                                    //
+                                    // Session-level error: the session is not usable — fail the
+                                    // connection so the caller can reconnect. (The previous
+                                    // `break` only exited the submessage loop, leaving a dead
+                                    // session looping forever.)
+                                    //
+                                    "conerr" => {
                                         self.make_log( Level::ERROR, &format!("Received connection error from Lightstreamer server: {}", clean_text) );
-                                        break;
+                                        return Err(LightstreamerError::connection(format!(
+                                            "connection error from server: {}",
+                                            clean_text
+                                        )));
+                                    },
+                                    //
+                                    // Request-level error: the session survives — log and continue.
+                                    //
+                                    "reqerr" => {
+                                        self.make_log( Level::ERROR, &format!("Received request error from Lightstreamer server: {}", clean_text) );
                                     },
                                     //
                                     // Session created successfully.
                                     //
                                     "conok" => {
                                         is_connected = true;
+                                        // CONOK,<session-ID>,<request-limit>,<keep-alive>,<control-link>
+                                        // Widen the liveness window to the server-declared keepalive
+                                        // so enforcement works even when no keepalive was configured.
+                                        if let Some(server_keepalive_ms) = submessage_fields
+                                            .get(3)
+                                            .and_then(|v| v.trim().parse::<u64>().ok())
+                                            .filter(|v| *v > 0)
+                                        {
+                                            keepalive_timeout_ms = widen_keepalive_timeout(
+                                                keepalive_timeout_ms,
+                                                server_keepalive_ms,
+                                            );
+                                            self.make_log( Level::DEBUG, &format!("Server-declared keepalive interval: {} ms", server_keepalive_ms) );
+                                        }
                                         if let Some(session_id) = submessage_fields.get(1) {
                                             self.make_log( Level::DEBUG, &format!("Session creation confirmed by server: {}", clean_text) );
                                             self.make_log( Level::DEBUG, &format!("Session created with ID: {:?}", session_id) );
@@ -799,11 +867,19 @@ impl LightstreamerClient {
                                             },
                                         };
                                         let ls_send_sync = self.connection_options.get_send_sync().to_string();
+                                        let ls_keepalive_millis = configured_keepalive_ms.to_string();
+                                        let ls_inactivity_millis = reverse_heartbeat_ms.to_string();
                                         let mut params: Vec<(&str, &str)> = vec![
                                             ("LS_adapter_set", ls_adapter_set),
                                             ("LS_cid", "mgQkwtwdysogQz2BJ4Ji kOj2Bg"),
                                             ("LS_send_sync", &ls_send_sync),
                                         ];
+                                        if configured_keepalive_ms > 0 {
+                                            params.push(("LS_keepalive_millis", &ls_keepalive_millis));
+                                        }
+                                        if reverse_heartbeat_ms > 0 {
+                                            params.push(("LS_inactivity_millis", &ls_inactivity_millis));
+                                        }
                                         if let Some(user) = &self.connection_details.get_user() {
                                             params.push(("LS_user", user));
                                         }
@@ -914,6 +990,37 @@ impl LightstreamerClient {
                 _ = shutdown_signal.notified() => {
                     self.make_log( Level::INFO, "Received shutdown signal" );
                     break;
+                },
+                //
+                // Liveness watchdog: nothing received within the keepalive
+                // window plus grace — the connection is half-open / dead.
+                //
+                _ = tokio::time::sleep_until(liveness_deadline), if keepalive_timeout_ms > 0 => {
+                    let idle_ms = keepalive_timeout_ms.saturating_add(Self::KEEPALIVE_GRACE_MS);
+                    self.make_log(
+                        Level::ERROR,
+                        &format!(
+                            "No message received from server within {} ms (keepalive + grace); connection considered dead",
+                            idle_ms
+                        ),
+                    );
+                    return Err(LightstreamerError::connection(format!(
+                        "no message received from server within {} ms (keepalive + grace)",
+                        idle_ms
+                    )));
+                },
+                //
+                // Reverse heartbeat: prove client liveness to the server and
+                // surface write errors promptly on a dead connection.
+                //
+                _ = async {
+                    match heartbeat_timer.as_mut() {
+                        Some(timer) => { timer.tick().await; },
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if is_connected => {
+                    write_stream.send(Message::Text("heartbeat\r\n".into())).await?;
+                    self.make_log(Level::DEBUG, "Sent reverse heartbeat to server");
                 },
             }
         }
@@ -1522,6 +1629,23 @@ impl LightstreamerClient {
     }
 }
 
+/// Computes the effective liveness window after the server declares its
+/// keepalive interval in the `conok` message.
+///
+/// Returns the server-declared value when no window was configured
+/// (`current_ms == 0`), otherwise the larger of the two — the window may only
+/// widen, never shrink, so a server declaring a longer keepalive cannot cause
+/// false-positive disconnects.
+#[must_use]
+#[inline]
+fn widen_keepalive_timeout(current_ms: u64, server_declared_ms: u64) -> u64 {
+    if current_ms == 0 {
+        server_declared_ms
+    } else {
+        current_ms.max(server_declared_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,5 +1971,30 @@ mod tests {
     fn test_get_cookies() {
         // Test the static method get_cookies
         LightstreamerClient::get_cookies(Some("http://test.lightstreamer.com"));
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::widen_keepalive_timeout;
+
+    #[test]
+    fn test_widen_keepalive_timeout_unconfigured_adopts_server_value() {
+        assert_eq!(widen_keepalive_timeout(0, 5_000), 5_000);
+    }
+
+    #[test]
+    fn test_widen_keepalive_timeout_server_longer_widens() {
+        assert_eq!(widen_keepalive_timeout(15_000, 30_000), 30_000);
+    }
+
+    #[test]
+    fn test_widen_keepalive_timeout_server_shorter_never_shrinks() {
+        assert_eq!(widen_keepalive_timeout(15_000, 5_000), 15_000);
+    }
+
+    #[test]
+    fn test_widen_keepalive_timeout_equal_values_unchanged() {
+        assert_eq!(widen_keepalive_timeout(15_000, 15_000), 15_000);
     }
 }
