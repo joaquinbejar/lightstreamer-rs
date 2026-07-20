@@ -1,0 +1,16 @@
+/target
+**/target
+Cargo.lock
+.idea/
+.run/
+.DS_Store
+*.profraw
+cobertura.xml
+tarpaulin-report.html
+
+# Local agent working assets (not published repo content)
+.claude/
+rules/
+CLAUDE.md
+AGENTS.md
+docs/
