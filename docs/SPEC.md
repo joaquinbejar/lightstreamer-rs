@@ -62,38 +62,30 @@ material, cites it, and is tested against the fixtures quoted there.
 | §05 the code catalog and recoverability classification | `src/error.rs` | `api-expert` |
 | §06 MPN | *(none — out of scope for v1)* | — |
 
-## What must be decided before code
+## What the specification does not decide — now recorded as ADRs
 
-The distillation surfaced decisions the specification does not make for us.
-Each needs an ADR under `docs/adr/` before the module that depends on it is
-written:
+The distillation surfaced five decisions the specification leaves to the
+implementer. All are settled; see [`README.md`](README.md) for the full ADR
+inventory.
 
-1. **Which diff algorithms to advertise.** The session-creation request carries
-   `LS_supported_diffs` (§03), and the server will only send a diff-encoded
-   value whose algorithm the client declared. So the value advertised in
-   `request.rs` and the decoders implemented in `update.rs` are one decision,
-   not two — advertising an algorithm we cannot decode is a protocol violation
-   waiting to happen. Decide the set, and make the advertisement *derive* from
-   the implemented decoder set in code rather than being a parallel constant.
-2. **Transport scope for 1.0.0.** WebSocket is the primary transport. HTTP
-   streaming and long polling (§02 ch.7) are fully specified here, but each is
-   a distinct code path with its own liveness and rebind behavior. Ship both,
-   or ship WebSocket first behind a port that provably admits the other?
-3. **The event surface.** Whether the caller receives a `Stream` of typed
-   events, registers listener traits, or both. The spec constrains what must be
-   *delivered* (§04), not how; this is where the v1 API most deliberately
-   departs from the prior implementation's Java-derived shape.
-4. **How recovery is surfaced.** §02 ch.5 distinguishes recoverable
-   interruption from definitive loss (§02 ch.6), and §04 says whether a
-   snapshot is re-delivered. A caller rebuilding state needs to know which
-   happened — that visibility is an API decision, not a protocol one.
-5. **Ambiguity policy.** 91 `⚠️ Spec unclear:` flags are recorded across the
-   chapters, each with its own per-chapter index. Any flag that affects
-   observable behavior must be resolved **empirically against a real
-   Lightstreamer server** and the finding recorded in the chapter — never
-   resolved by intuition, and never by looking at how the old implementation
-   did it. The flags are not defects in the chapters; they are the honest edge
-   of what the document determines.
+1. **Which diff algorithms to advertise** — [ADR-0004](adr/0004-supported-diffs-derived-from-decoders.md).
+   Implement every algorithm the spec defines, and *derive* the
+   `LS_supported_diffs` value from the decoder registry so the advertisement
+   and the implementation cannot drift.
+2. **Transport scope for 1.0.0** — [ADR-0002](adr/0002-all-three-transports-in-1-0-0.md).
+   WebSocket, HTTP streaming, and long polling all ship, behind one port.
+3. **The event surface** — [ADR-0003](adr/0003-typed-event-stream-as-delivery-surface.md).
+   A typed `Stream` of exhaustively-matchable events; no listener traits.
+4. **How recovery is surfaced** — [ADR-0005](adr/0005-recovery-is-visible-in-the-event-stream.md).
+   Reconnection is automatic, its consequences are explicit: continuity
+   preserved vs session re-established vs definitively lost.
+5. **Ambiguity policy** — [ADR-0006](adr/0006-empirical-resolution-of-spec-ambiguities.md).
+   The 91 `⚠️ Spec unclear:` flags are resolved by experiment against a real
+   server (`push.lightstreamer.com` with `LS_adapter_set=DEMO`, a local
+   `WELCOME` instance, or an IG demo account) and the finding recorded next to
+   the flag — never by intuition, never by consulting the old implementation.
+   The flags are not defects in these chapters; they are the honest edge of
+   what the document determines.
 
 ## Implementation order
 
@@ -110,7 +102,9 @@ the next begins:
    Tested as a state machine against the §02 transcripts, not against a socket.
 5. **Subscription manager** — control operations, id allocation, resubscribe.
 6. **Public API** — client façade, config, error taxonomy, rustdoc, examples.
-7. **HTTP transport** — if it is in the 1.0.0 scope decided above.
+7. **HTTP streaming and long polling** — the second and third transports
+   against the now-proven port (ADR-0002), each re-running the full lifecycle
+   test suite from step 4.
 
 Steps 1 and 2 are the foundation everything else rests on, and they are the two
 that are entirely testable from this reference alone. Write them first, and
