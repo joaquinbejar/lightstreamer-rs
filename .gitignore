@@ -13,4 +13,7 @@ tarpaulin-report.html
 rules/
 CLAUDE.md
 AGENTS.md
-docs/
+
+# NOTE: docs/ is deliberately NOT ignored. docs/SPEC.md and docs/spec/* are the
+# citation trail that backs the clean-room rewrite and the MIT relicensing —
+# they are published repo content.
