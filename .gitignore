@@ -9,6 +9,7 @@ cobertura.xml
 tarpaulin-report.html
 
 # Local agent working assets (not published repo content)
+.agents/
 .claude/
 rules/
 CLAUDE.md
