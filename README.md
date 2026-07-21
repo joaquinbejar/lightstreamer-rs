@@ -48,8 +48,17 @@ async fn main() -> lightstreamer_rs::Result<()> {
 }
 ```
 
-Run it with `cargo run --example demo_quotes` — it connects to the public demo
-server the specification's own transcripts use.
+## Examples
+
+All four run against `push.lightstreamer.com`, the public demo server the
+specification's own transcripts use. No credentials, no setup.
+
+| | |
+|---|---|
+| `cargo run --example demo_quotes` | MERGE-mode stock quotes: snapshot, then live updates, printing which fields actually changed |
+| `cargo run --example demo_portfolio` | COMMAND mode: maintains a table of rows from `ADD`/`UPDATE`/`DELETE` |
+| `cargo run --example demo_chat` | Sending messages upstream and correlating each outcome to the message that caused it |
+| `cargo run --example demo_resilience` | What a reconnection *meant* — break your network while it runs and watch it say so |
 
 ## What this crate gives you
 

@@ -31,6 +31,9 @@ const DEMO_SERVER: &str = "https://push.lightstreamer.com";
 /// The Adapter Set that serves the simulated stock feed.
 const DEMO_ADAPTER_SET: &str = "DEMO";
 
+/// The Data Adapter inside `DEMO` that publishes the simulated stock feed.
+const QUOTE_ADAPTER: &str = "QUOTE_ADAPTER";
+
 /// The stocks to watch. The demo adapter publishes `item1` … `item30`.
 const ITEMS: [&str; 5] = ["item1", "item2", "item3", "item4", "item5"];
 
@@ -73,6 +76,10 @@ async fn run() -> lightstreamer_rs::Result<()> {
         ItemGroup::from_items(ITEMS)?,
         FieldSchema::from_fields(FIELDS)?,
     )
+    // The `DEMO` Adapter Set contains more than one Data Adapter, so the
+    // stock feed has to be named: omitting it is answered with control error
+    // 17, "Data Adapter not found" [`docs/spec/05-error-codes.md` §3].
+    .with_data_adapter(QUOTE_ADAPTER)
     // Start from a complete picture instead of waiting for every field to
     // tick. In MERGE mode the snapshot is the current value of every field.
     .with_snapshot(Snapshot::On);
