@@ -1,0 +1,94 @@
+# cargo-deny policy for lightstreamer-rs.
+#
+# This crate is a clean-room rewrite relicensed from GPL-3.0-only to MIT
+# (see docs/adr/0001-mit-relicensing-clean-room.md). A copyleft dependency
+# would relicense the crate by linkage and defeat the entire point of the
+# rewrite, so the license check below is deny-by-default: only the licenses
+# listed in `licenses.allow` are accepted, everything else -- including
+# GPL/AGPL/LGPL and any license cargo-deny cannot identify -- is rejected.
+#
+# Run locally with `make license-check` (`cargo deny check licenses
+# advisories`), or the full `cargo deny check` for bans/sources too.
+# Regenerate this file's structure (not its policy) with `cargo deny init`
+# if a future cargo-deny release changes the schema.
+
+[graph]
+# Check the dependency graph as CI builds it, including every optional
+# feature (`json-patch`, `test-util`) and dev-dependency (the IG example's
+# `reqwest`/`serde`), so a copyleft dependency can't hide behind a feature
+# flag or a dev-only edge.
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# No ignored advisories. A new RUSTSEC entry must be triaged, not silenced
+# here -- see RELEASING.md if one appears before a release.
+ignore = []
+
+[licenses]
+# MIT-compatible licenses observed in the resolved dependency tree (see the
+# `cargo metadata` audit run when this policy was written) plus the common
+# permissive licenses a future dependency is likely to carry. Anything not
+# listed here -- copyleft (GPL/AGPL/LGPL) or unrecognized -- is denied.
+#
+# A dependency that offers a copyleft license only as one option of an SPDX
+# `OR` expression (e.g. `MIT OR Apache-2.0 OR LGPL-2.1-or-later`) still
+# passes: cargo-deny accepts an `OR` expression if any one branch is on this
+# list, which is exactly the dual-license case this policy exists to permit.
+# A copyleft license joined with `AND` (no permissive alternative) is denied
+# because it is not covered by this list.
+#
+# `cargo deny check licenses` only checks normal/build dependencies, not
+# dev-dependencies (e.g. the `reqwest`/`serde` used solely to build the IG
+# example): those never link into a downstream consumer's binary, so they
+# are outside what this policy exists to protect. Several entries below
+# (BSD-2-Clause, BSD-3-Clause, ISC, CC0-1.0, MIT-0) are not required by any
+# currently-resolved crate; they are kept as pre-approved headroom for the
+# common permissive licenses a routine dependency bump is likely to add, so
+# `license-not-encountered` warnings for them are expected and harmless. A
+# genuinely new license -- one not already on this list -- still fails the
+# check and needs an explicit policy decision, which is the point.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

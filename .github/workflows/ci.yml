@@ -1,0 +1,126 @@
+name: CI
+
+# Every job here is also a Makefile target (`make <job's run line>`), so
+# `make pre-push` runs exactly what this workflow runs -- see Makefile.
+#
+# `tokio-tungstenite`'s `native-tls` feature pulls in `openssl-sys` on Linux,
+# so every job that compiles the crate (everything except `fmt`, `deny`, and
+# `package-check`, which only parse source/metadata) installs `pkg-config`
+# and `libssl-dev` first. Verified against a plain `ubuntu-22.04` container;
+# omitting either package fails the `openssl-sys` build script.
+
+on:
+  push:
+    branches: [main, v1]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: make fmt-check
+
+  check-spanish:
+    name: check-spanish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - run: make check-spanish
+
+  lint:
+    name: lint (clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native TLS build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: make lint
+
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The feature matrix matters here: `json-patch` and `test-util` change
+      # the compiled surface (see Cargo.toml `[features]`).
+      matrix:
+        target: [test-default, test-all-features, test-no-default-features]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native TLS build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: make ${{ matrix.target }}
+
+  release:
+    name: release build (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native TLS build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make release
+
+  doc:
+    name: doc (rustdoc + doctests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native TLS build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make doc
+
+  deny:
+    name: cargo-deny (licenses, advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native TLS build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: make msrv
+
+  package-check:
+    name: package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make package-check
