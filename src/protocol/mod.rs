@@ -10,11 +10,6 @@
 //! normative parsing algorithm), `docs/spec/03-requests.md` (request
 //! encoding), `docs/spec/04-notifications.md` (notification parsing).
 
-// The session layer that consumes this module has not been written yet
-// (see `docs/SPEC.md`, implementation order steps 3-5). Until it exists,
-// these items have no in-crate caller.
-#![allow(dead_code)]
-
 pub(crate) mod escaping;
 pub(crate) mod request;
 pub(crate) mod response;

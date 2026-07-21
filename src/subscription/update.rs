@@ -44,6 +44,34 @@ fn field_value_error(reason: impl Into<String>) -> ProtocolError {
 // Field state
 // ---------------------------------------------------------------------------
 
+/// Whether the client's copy of a field value is the exact character sequence
+/// the server sent, or one the client produced itself.
+///
+/// The distinction only matters as the **base of a later character diff**. A
+/// `^T` diff is defined by character positions into the previous value
+/// [Appendix D, pp.98-99], so it can only be applied to a value that is
+/// character-for-character the one the server diffed against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalForm {
+    /// The value is exactly the character sequence that arrived on the wire —
+    /// actual content, the empty string set by `$`, or the result of a diff
+    /// whose base was itself exact and whose output is defined character by
+    /// character.
+    AsSent,
+    /// The value was reconstructed by the client and its spelling is not
+    /// guaranteed to match the server's.
+    ///
+    /// Produced only by `^P`: applying an RFC 6902 patch requires parsing the
+    /// JSON document and serialising it again, which does not preserve
+    /// insignificant whitespace, member order or number spelling. See
+    /// SPEC-AMBIGUITY (json-patch-reserialisation) on `apply_json_patch`.
+    // The `^P` decoder is the only producer, so without that feature the
+    // variant is unreachable by construction — which is the point: the guard
+    // it feeds still compiles and still reads the same in both builds.
+    #[cfg_attr(not(feature = "json-patch"), allow(dead_code))]
+    ClientDerived,
+}
+
 /// The value of one field of one item.
 ///
 /// TLCP distinguishes three states that must not be collapsed: a field that has
@@ -57,14 +85,31 @@ enum FieldSlot {
     /// Not reachable after the first update of a subscription: the empty token
     /// and every `^` token "never happens on the first update"
     /// [`docs/spec/04-notifications.md` §2.3], so the first update necessarily
-    /// carries content, `#` or `$` for every field of the schema.
+    /// carries content, `#` or `$` for every field of the schema — and
+    /// [`ItemState::apply`] rejects any update that says otherwise.
     Unset,
     /// The field is null — the `#` marker
     /// [`docs/spec/04-notifications.md` §2.2].
     Null,
     /// The field holds a string, possibly empty — the `$` marker sets it to the
     /// empty string [`docs/spec/04-notifications.md` §2.2].
-    Value(String),
+    Value {
+        /// The characters of the value.
+        text: String,
+        /// Whether `text` may serve as the base of a `^T` character diff.
+        form: LexicalForm,
+    },
+}
+
+impl FieldSlot {
+    /// A value that is exactly what the server sent.
+    #[must_use]
+    fn as_sent(text: impl Into<String>) -> Self {
+        Self::Value {
+            text: text.into(),
+            form: LexicalForm::AsSent,
+        }
+    }
 }
 
 /// The client-side state of one subscribed item: the current value of every
@@ -114,8 +159,33 @@ impl ItemState {
     pub(crate) fn field(&self, index: usize) -> Option<Option<&str>> {
         match self.fields.get(index)? {
             FieldSlot::Unset | FieldSlot::Null => Some(None),
-            FieldSlot::Value(value) => Some(Some(value.as_str())),
+            FieldSlot::Value { text, .. } => Some(Some(text.as_str())),
         }
+    }
+
+    /// Whether field `index` has a value an unchanged token could preserve.
+    ///
+    /// §2.3 attaches the same note to the empty token and to every `^`
+    /// directive: "this case never happens on the first update of a
+    /// subscription". A field that no update has set therefore cannot be the
+    /// target of one, and accepting it would publish a field that reads as null
+    /// while no server value was ever behind it.
+    #[must_use]
+    fn has_baseline(&self, index: usize) -> bool {
+        matches!(
+            self.fields.get(index),
+            Some(FieldSlot::Null | FieldSlot::Value { .. })
+        )
+    }
+
+    /// The error an unchanged token that touches a never-set field reports.
+    #[cold]
+    #[inline(never)]
+    fn no_baseline_error(token: &str, index: usize) -> ProtocolError {
+        field_value_error(format!(
+            "{token} leaves field {index} unchanged, but no update has ever set it; §2.3 states \
+             this never happens on the first update of a subscription"
+        ))
     }
 
     /// Applies the raw, still-undecoded third argument of a `U` notification.
@@ -153,8 +223,14 @@ impl ItemState {
             }
 
             // §2.3: "If its value is empty, the pointed field should be left
-            // unchanged and the pointer moved to the next field."
+            // unchanged and the pointer moved to the next field." The same
+            // clause carries the note "this case never happens on the first
+            // update of a subscription", so there must be something to leave
+            // unchanged.
             if token.is_empty() {
+                if !self.has_baseline(pointer) {
+                    return Err(Self::no_baseline_error("an empty token", pointer));
+                }
                 // Cannot overflow: `pointer < field_count <= usize::MAX`.
                 pointer += 1;
                 continue;
@@ -170,7 +246,7 @@ impl ItemState {
                 continue;
             }
             if token == "$" {
-                staged.push((pointer, FieldSlot::Value(String::new())));
+                staged.push((pointer, FieldSlot::as_sent(String::new())));
                 changed.push(pointer);
                 pointer += 1;
                 continue;
@@ -216,6 +292,15 @@ impl ItemState {
                              {field_count}-field schema"
                         )));
                     }
+                    // §2.3 attaches "this case never happens on the first
+                    // update of a subscription" to the whole `^` case, so every
+                    // field the run covers must already have a value.
+                    if let Some(index) = (pointer..end).find(|index| !self.has_baseline(*index)) {
+                        return Err(Self::no_baseline_error(
+                            &format!("the run `^{rest}`"),
+                            index,
+                        ));
+                    }
                     pointer = end;
                     continue;
                 }
@@ -225,31 +310,6 @@ impl ItemState {
                     // letter and decode any percent-encoding", then apply it as
                     // a difference in the format named by the letter [§2.2].
                     let payload = percent_decode(rest_chars.as_str())?;
-
-                    // §2.3: "this case never happens if the value of the
-                    // pointed field is currently null".
-                    // SPEC-AMBIGUITY (diff-onto-non-value): the spec rules out
-                    // a diff onto a *null* field but says nothing about a field
-                    // that has never been set, nor about one currently holding
-                    // the empty string. Choice: never-set is rejected together
-                    // with null — neither has a base character sequence to diff
-                    // against — while the empty string is accepted as a base of
-                    // zero characters, which is a perfectly well-defined input
-                    // to both diff formats.
-                    let base = match self.fields.get(pointer) {
-                        Some(FieldSlot::Value(value)) => value.as_str(),
-                        Some(FieldSlot::Null) => {
-                            return Err(field_value_error(format!(
-                                "`^{marker}` diff applies to field {pointer}, which is null"
-                            )));
-                        }
-                        Some(FieldSlot::Unset) | None => {
-                            return Err(field_value_error(format!(
-                                "`^{marker}` diff applies to field {pointer}, which has never \
-                                 been set"
-                            )));
-                        }
-                    };
 
                     // ADR-0004: dispatch through the same registry the
                     // `LS_supported_diffs` advertisement is derived from, so a
@@ -265,8 +325,41 @@ impl ItemState {
                             ))
                         })?;
 
-                    let value = (decoder.apply)(base, payload.as_ref())?;
-                    staged.push((pointer, FieldSlot::Value(value)));
+                    // §2.3: "this case never happens if the value of the
+                    // pointed field is currently null".
+                    // SPEC-AMBIGUITY (diff-onto-non-value): the spec rules out
+                    // a diff onto a *null* field but says nothing about a field
+                    // that has never been set, nor about one currently holding
+                    // the empty string. Choice: never-set is rejected together
+                    // with null — neither has a base character sequence to diff
+                    // against — while the empty string is accepted as a base of
+                    // zero characters, which is a perfectly well-defined input
+                    // to both diff formats.
+                    let base = match self.fields.get(pointer) {
+                        Some(FieldSlot::Value { text, form }) => {
+                            Self::diffable_base(decoder, marker, pointer, text, *form)?
+                        }
+                        Some(FieldSlot::Null) => {
+                            return Err(field_value_error(format!(
+                                "`^{marker}` diff applies to field {pointer}, which is null"
+                            )));
+                        }
+                        Some(FieldSlot::Unset) | None => {
+                            return Err(field_value_error(format!(
+                                "`^{marker}` diff applies to field {pointer}, which has never \
+                                 been set"
+                            )));
+                        }
+                    };
+
+                    let text = (decoder.apply)(base, payload.as_ref())?;
+                    staged.push((
+                        pointer,
+                        FieldSlot::Value {
+                            text,
+                            form: decoder.result_form,
+                        },
+                    ));
                     changed.push(pointer);
                     pointer += 1;
                     continue;
@@ -291,7 +384,7 @@ impl ItemState {
             // which is why the `#`/`$`/`^` tests above ran against the raw
             // token and cannot be fooled by a `%23` that decodes to `#`.
             let decoded = percent_decode(token)?;
-            staged.push((pointer, FieldSlot::Value(decoded.into_owned())));
+            staged.push((pointer, FieldSlot::as_sent(decoded.into_owned())));
             changed.push(pointer);
             pointer += 1;
         }
@@ -318,6 +411,48 @@ impl ItemState {
         }
 
         Ok(UpdateOutcome { changed })
+    }
+
+    /// Checks that the current value of a field may serve as the base of the
+    /// diff `decoder` is about to apply.
+    ///
+    /// SPEC-AMBIGUITY (mixed-diff-baseline): the spec allows a client to
+    /// advertise several formats in `LS_supported_diffs`
+    /// [`docs/spec/03-requests.md` §2.1] and lets the server pick a different
+    /// one per update [`docs/spec/04-notifications.md` §2.2], but never says
+    /// which representation of the previous value the next diff is computed
+    /// against. For `^P` that does not matter — RFC 6902 addresses a *parsed*
+    /// document, so a re-serialised base is equivalent — but a `^T` is defined
+    /// over character positions [Appendix D, pp.98-99] and can only be applied
+    /// to the exact characters the server diffed against. After a `^P` this
+    /// client holds a re-serialisation of its own (see
+    /// SPEC-AMBIGUITY (json-patch-reserialisation)), which may differ from the
+    /// server's text in whitespace, member order or number spelling. Choice:
+    /// reject the `^T`. Applying it would either fail on a copy overrun or,
+    /// worse, succeed and hand the caller silently corrupted JSON.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::FieldValue`] when the diff needs the server's own
+    /// characters and this client no longer has them.
+    fn diffable_base<'slot>(
+        decoder: &DiffDecoder,
+        marker: char,
+        index: usize,
+        text: &'slot str,
+        form: LexicalForm,
+    ) -> Result<&'slot str, ProtocolError> {
+        match form {
+            LexicalForm::AsSent => Ok(text),
+            LexicalForm::ClientDerived if decoder.needs_base_as_sent => {
+                Err(field_value_error(format!(
+                    "`^{marker}` diff applies to field {index}, whose current value was rebuilt \
+                     by this client from a `^P` patch; a character diff cannot be applied to a \
+                     value whose spelling is not the server's"
+                )))
+            }
+            LexicalForm::ClientDerived => Ok(text),
+        }
     }
 }
 
@@ -377,6 +512,10 @@ impl UpdateOutcome {
     }
 
     /// Whether this update carried a value for field `index` (0-based).
+    // This and the two below have no non-test caller: the manager forwards
+    // `changed_fields` into an `ItemUpdate`, which exposes the same three
+    // questions publicly. They are what this module's tests assert against.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) fn is_field_changed(&self, index: usize) -> bool {
@@ -384,6 +523,7 @@ impl UpdateOutcome {
     }
 
     /// How many fields this update changed.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) fn changed_count(&self) -> usize {
@@ -391,6 +531,7 @@ impl UpdateOutcome {
     }
 
     /// Whether this update changed nothing at all.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -402,27 +543,46 @@ impl UpdateOutcome {
 // Diff decoder registry (ADR-0004)
 // ---------------------------------------------------------------------------
 
-/// One compiled-in diff format: its wire tag and the function that applies it.
+/// One compiled-in diff format: its wire tag, the function that applies it, and
+/// how it relates to the exactness of the value it reads and writes.
 struct DiffDecoder {
     /// The letter that follows the caret on the wire
     /// [`docs/spec/04-notifications.md` §2.2].
     tag: char,
     /// Applies a percent-decoded diff payload to the field's previous value.
     apply: fn(base: &str, payload: &str) -> Result<String, ProtocolError>,
+    /// Whether the format addresses the base by character position, and
+    /// therefore needs the server's own characters — see
+    /// [`ItemState::diffable_base`].
+    needs_base_as_sent: bool,
+    /// What the exactness of the produced value is.
+    result_form: LexicalForm,
 }
 
 /// TLCP-diff, the custom format of Appendix D
 /// [`docs/spec/04-notifications.md` §2.7, spec pp.98-99].
+///
+/// Every instruction is a character count into the base [p.98], so the base
+/// must be exact; the result is then assembled character by character out of an
+/// exact base and the payload's own literals, and is exact in turn.
 const TLCP_DIFF_DECODER: DiffDecoder = DiffDecoder {
     tag: 'T',
     apply: apply_tlcp_diff,
+    needs_base_as_sent: true,
+    result_form: LexicalForm::AsSent,
 };
 
 /// JSON Patch, RFC 6902 [`docs/spec/04-notifications.md` §2.2].
+///
+/// RFC 6902 addresses a parsed document rather than a character sequence, so
+/// any equivalent spelling of the base will do; the value it produces is this
+/// client's own serialisation and is therefore not exact.
 #[cfg(feature = "json-patch")]
 const JSON_PATCH_DECODER: DiffDecoder = DiffDecoder {
     tag: 'P',
     apply: apply_json_patch,
+    needs_base_as_sent: false,
+    result_form: LexicalForm::ClientDerived,
 };
 
 /// The decoders compiled into this build — the single source of truth ADR-0004
@@ -494,22 +654,54 @@ enum DiffInstruction {
 /// Returns [`ProtocolError::FieldValue`] if the payload is not a well-formed
 /// TLCP-diff or if its instructions do not fit the base value.
 fn apply_tlcp_diff(base: &str, payload: &str) -> Result<String, ProtocolError> {
-    // Appendix D, p.98: a TLCP-diff and the base it applies to are guaranteed
-    // to contain no character whose UTF-16 representation needs a surrogate
-    // pair. Under that guarantee one Unicode scalar value is one UTF-16 code
-    // unit, so the appendix's "characters" — which are UTF-16 code units,
-    // the format being defined for a Java implementation — coincide exactly
-    // with Rust `char`s. Byte offsets do *not* coincide: a two-byte UTF-8
-    // character would make every count wrong. Both the base and the payload are
-    // therefore materialised as `Vec<char>` and every position and count in
-    // this function is a `char` index. Should a server violate the guarantee
-    // and send an astral character, this decoder counts it as one unit where a
-    // UTF-16 implementation counts two; that is a server-side protocol
-    // violation, and counting scalar values is the only self-consistent reading
-    // available to a UTF-8 language.
+    // §2.2 states the precondition of the `T` format verbatim: it "can be
+    // applied to all strings, only provided that their encoding in UTF-16 (the
+    // format used internally in Java) doesn't contain surrogate pairs.
+    // Obviously, if a TLCP-diff is received, this guarantees that both the
+    // previous and new value are compliant."
+    //
+    // Under that guarantee one Unicode scalar value is one UTF-16 code unit, so
+    // the appendix's "characters" — UTF-16 code units, the format being defined
+    // for a Java implementation — coincide exactly with Rust `char`s. Byte
+    // offsets do *not* coincide: a two-byte UTF-8 character would make every
+    // count wrong. Both the base and the payload are therefore materialised as
+    // `Vec<char>` and every position and count in this function is a `char`
+    // index.
+    //
+    // A character outside the BMP breaks that coincidence: the server counts it
+    // as two units and this decoder would count it as one, so every position
+    // after it refers to a different place in the two implementations. The
+    // guarantee is the server's to keep, so its violation is checked and
+    // reported rather than absorbed — silently decoding under a broken
+    // precondition produces a plausible value that is wrong where the caller
+    // cannot see it.
+    reject_astral(base, "the base value")?;
+    reject_astral(payload, "the diff payload")?;
+
     let base_chars: Vec<char> = base.chars().collect();
     let instructions = parse_tlcp_diff(payload)?;
     apply_tlcp_instructions(&base_chars, &instructions)
+}
+
+/// Rejects text the `T` precondition of
+/// [`docs/spec/04-notifications.md` §2.2] forbids.
+///
+/// A `char` whose UTF-16 encoding takes two code units is exactly a character
+/// "whose encoding in UTF-16 contains a surrogate pair".
+///
+/// # Errors
+///
+/// [`ProtocolError::FieldValue`] if `text` contains such a character.
+fn reject_astral(text: &str, role: &str) -> Result<(), ProtocolError> {
+    match text.chars().find(|character| character.len_utf16() == 2) {
+        None => Ok(()),
+        Some(character) => Err(field_value_error(format!(
+            "`^T` diff violates its own precondition: {role} contains `{character}` \
+             (U+{:04X}), whose UTF-16 encoding is a surrogate pair, so character positions \
+             cannot be counted the same way on both sides",
+            u32::from(character)
+        ))),
+    }
 }
 
 /// Parses a TLCP-diff payload into its instruction list [Appendix D, p.98].
@@ -770,8 +962,6 @@ fn apply_json_patch(base: &str, payload: &str) -> Result<String, ProtocolError> 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     /// The §2.5 schema: `timestamp`, `price`, `change`, `minimum`, `maximum`,
@@ -797,6 +987,16 @@ mod tests {
         state
     }
 
+    /// The text of field `index`, failing the test if there is no such field or
+    /// if it is null.
+    #[cfg(feature = "json-patch")]
+    fn text_of(state: &ItemState, index: usize) -> String {
+        match state.field(index) {
+            Some(Some(text)) => text.to_owned(),
+            other => panic!("field {index} should hold text, found {other:?}"),
+        }
+    }
+
     /// Asserts the whole schema at once. `None` means null.
     fn assert_quote(state: &ItemState, expected: [Option<&str>; QUOTE_FIELDS]) {
         for (index, want) in expected.iter().enumerate() {
@@ -808,9 +1008,9 @@ mod tests {
     // -- §2.5 worked examples ------------------------------------------------
 
     #[test]
-    fn test_apply_example_1_snapshot_sets_every_field_p51() {
+    fn test_apply_example_1_snapshot_sets_every_field_p51() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(QUOTE_FIELDS);
-        let outcome = state.apply(EX1).unwrap();
+        let outcome = state.apply(EX1)?;
 
         assert_quote(
             &state,
@@ -830,12 +1030,14 @@ mod tests {
         // "The initial update (the snapshot) carries information for all the
         // fields" [p.51]: every field is marked Changed in the spec's table.
         assert_eq!(outcome.changed_fields(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_example_2_four_unchanged_fields_p51() {
+    fn test_apply_example_2_four_unchanged_fields_p51() -> Result<(), ProtocolError> {
         let mut state = quote_state_after(&[EX1]);
-        let outcome = state.apply(EX2).unwrap();
+        let outcome = state.apply(EX2)?;
 
         assert_quote(
             &state,
@@ -855,12 +1057,14 @@ mod tests {
         // "This update contains 4 unchanged fields: minimum, maximum, open and
         // close" [p.52] — indices 3, 4, 7 and 8.
         assert_eq!(outcome.changed_fields(), &[0, 1, 2, 5, 6, 9]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_example_3_dollar_resets_status_to_empty_p52() {
+    fn test_apply_example_3_dollar_resets_status_to_empty_p52() -> Result<(), ProtocolError> {
         let mut state = quote_state_after(&[EX1, EX2]);
-        let outcome = state.apply(EX3).unwrap();
+        let outcome = state.apply(EX3)?;
 
         assert_quote(
             &state,
@@ -883,12 +1087,14 @@ mod tests {
         // "value differs".
         assert_eq!(outcome.changed_fields(), &[0, 1, 2, 5, 6, 9]);
         assert!(outcome.is_field_changed(9));
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_example_4_caret_run_of_four_p52() {
+    fn test_apply_example_4_caret_run_of_four_p52() -> Result<(), ProtocolError> {
         let mut state = quote_state_after(&[EX1, EX2, EX3]);
-        let outcome = state.apply(EX4).unwrap();
+        let outcome = state.apply(EX4)?;
 
         assert_quote(
             &state,
@@ -909,12 +1115,14 @@ mod tests {
         // change, minimum and maximum" [p.52] — `^4` covers indices 1..=4,
         // inclusive of the pointed field, and `bid`/`ask` follow it.
         assert_eq!(outcome.changed_fields(), &[0, 5, 6]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_example_5_caret_run_reaching_end_of_schema_p52() {
+    fn test_apply_example_5_caret_run_reaching_end_of_schema_p52() -> Result<(), ProtocolError> {
         let mut state = quote_state_after(&[EX1, EX2, EX3, EX4]);
-        let outcome = state.apply(EX5).unwrap();
+        let outcome = state.apply(EX5)?;
 
         // The structural claim of the example is that `^7` covers the last
         // seven fields [p.52].
@@ -940,12 +1148,14 @@ mod tests {
             ],
         );
         assert_eq!(outcome.changed_fields(), &[0, 1, 2]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_example_6_final_update_p52() {
+    fn test_apply_example_6_final_update_p52() -> Result<(), ProtocolError> {
         let mut state = quote_state_after(&[EX1, EX2, EX3, EX4, EX5]);
-        let outcome = state.apply(EX6).unwrap();
+        let outcome = state.apply(EX6)?;
 
         assert_quote(
             &state,
@@ -966,6 +1176,8 @@ mod tests {
         // [p.52]; `status` is unchanged too, carried by the trailing empty
         // token.
         assert_eq!(outcome.changed_fields(), &[0, 1, 2, 5, 6]);
+
+        Ok(())
     }
 
     // -- §2.6 worked examples (diffs) ---------------------------------------
@@ -978,41 +1190,46 @@ mod tests {
         r#"{ "text": "aa|bb", "attributes": [ { "font": "courier" }, "..." ] }"#;
 
     #[test]
-    fn test_apply_diff_example_1_snapshot_percent_decodes_pipe_p52() {
+    fn test_apply_diff_example_1_snapshot_percent_decodes_pipe_p52() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(2);
-        let outcome = state.apply(DIFF_SNAPSHOT).unwrap();
+        let outcome = state.apply(DIFF_SNAPSHOT)?;
 
         assert_eq!(state.field(0), Some(Some("20:00:33")));
         // `%7C` inside a value decodes to `|` and does not split the list
         // [`docs/spec/04-notifications.md` §2.2, §2.3 invariant 1, p.52].
         assert_eq!(state.field(1), Some(Some(DIFF_SNAPSHOT_TEXT)));
         assert_eq!(outcome.changed_fields(), &[0, 1]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_diff_example_3_empty_token_leaves_text_unchanged_p53() {
+    fn test_apply_diff_example_3_empty_token_leaves_text_unchanged_p53() -> Result<(), ProtocolError>
+    {
         let mut state = ItemState::new(2);
-        state.apply(DIFF_SNAPSHOT).unwrap();
+        state.apply(DIFF_SNAPSHOT)?;
 
         // "In the final update, the text field is unchanged; this is carried,
         // as usual, by an empty field" [p.53].
-        let outcome = state.apply("20:04:16|").unwrap();
+        let outcome = state.apply("20:04:16|")?;
         assert_eq!(state.field(0), Some(Some("20:04:16")));
         assert_eq!(state.field(1), Some(Some(DIFF_SNAPSHOT_TEXT)));
         assert_eq!(outcome.changed_fields(), &[0]);
+
+        Ok(())
     }
 
     #[cfg(feature = "json-patch")]
     #[test]
-    fn test_apply_diff_example_2_json_patch_p53() {
+    fn test_apply_diff_example_2_json_patch_p53() -> Result<(), Box<dyn std::error::Error>> {
         let mut state = ItemState::new(2);
-        state.apply(DIFF_SNAPSHOT).unwrap();
+        state.apply(DIFF_SNAPSHOT)?;
 
         let line = concat!(
             r#"20:00:54|^P[{"op":"replace","path":"/text","value":"aa%7Cbb%7Ccc"},"#,
             r#"{"op":"add","path":"/attributes/1","value":"bold"}]"#
         );
-        let outcome = state.apply(line).unwrap();
+        let outcome = state.apply(line)?;
 
         assert_eq!(state.field(0), Some(Some("20:00:54")));
         assert_eq!(outcome.changed_fields(), &[0, 1]);
@@ -1022,53 +1239,138 @@ mod tests {
         // [p.53]. See SPEC-AMBIGUITY (json-patch-reserialisation): the byte
         // form after re-serialisation is not defined by the spec, so the
         // assertion is on the JSON document, not on its spelling.
-        let got: serde_json::Value =
-            serde_json::from_str(state.field(1).unwrap().unwrap()).unwrap();
+        let got: serde_json::Value = serde_json::from_str(&text_of(&state, 1))?;
         let want: serde_json::Value = serde_json::from_str(
             r#"{"text":"aa|bb|cc","attributes":[{"font":"courier"},"bold","..."]}"#,
-        )
-        .unwrap();
+        )?;
         assert_eq!(got, want);
+
+        Ok(())
     }
 
     #[cfg(feature = "json-patch")]
     #[test]
-    fn test_apply_json_patch_that_does_not_apply_is_an_error() {
+    fn test_apply_json_patch_that_does_not_apply_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply(r#"{"a":1}"#).unwrap();
+        state.apply(r#"{"a":1}"#)?;
         // `remove` of a path that is not there cannot be applied.
         let result = state.apply(r#"^P[{"op":"remove","path":"/nope"}]"#);
         assert!(matches!(result, Err(ProtocolError::FieldValue { .. })));
         // The rejected update left the field alone.
         assert_eq!(state.field(0), Some(Some(r#"{"a":1}"#)));
+
+        Ok(())
+    }
+
+    // -- Mixing `^P` and `^T` on the same field ------------------------------
+
+    /// A JSON document whose spelling this client cannot reproduce: padded
+    /// whitespace, a member order `serde_json` does not keep by default, an
+    /// escaped character with a shorter equivalent, and a number spelling that
+    /// does not survive a parse.
+    #[cfg(feature = "json-patch")]
+    const LEXICALLY_AWKWARD_JSON: &str = r#"{ "z" : 1.50 ,  "a" : "A" , "n" : [ 1, 2 ] }"#;
+
+    #[cfg(feature = "json-patch")]
+    #[test]
+    fn test_a_tlcp_diff_after_a_json_patch_is_rejected() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(1);
+        state.apply(LEXICALLY_AWKWARD_JSON)?;
+
+        // The `^P` succeeds, but what this client now holds is its own
+        // serialisation, not the server's characters.
+        state.apply(r#"^P[{"op":"replace","path":"/z","value":2}]"#)?;
+        let after_patch = text_of(&state, 0);
+        assert_ne!(
+            after_patch, LEXICALLY_AWKWARD_JSON,
+            "the reserialisation is what makes this case dangerous"
+        );
+
+        // SPEC-AMBIGUITY (mixed-diff-baseline): a `^T` is defined over
+        // character positions [Appendix D, pp.98-99] and the server computed it
+        // against its own text. Applying it here would corrupt the value
+        // silently, so it is refused.
+        assert_field_value_error(state.apply("^Tbdzap"));
+        assert_eq!(state.field(0), Some(Some(after_patch.as_str())));
+
+        Ok(())
     }
 
     #[cfg(feature = "json-patch")]
     #[test]
-    fn test_apply_json_patch_onto_non_json_base_is_an_error() {
+    fn test_a_json_patch_after_a_json_patch_is_accepted() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut state = ItemState::new(1);
-        state.apply("not json").unwrap();
+        state.apply(LEXICALLY_AWKWARD_JSON)?;
+        state.apply(r#"^P[{"op":"replace","path":"/z","value":2}]"#)?;
+        // RFC 6902 addresses the parsed document, so an equivalent spelling of
+        // the base is as good as the server's [§2.2].
+        state.apply(r#"^P[{"op":"replace","path":"/a","value":"B"}]"#)?;
+
+        let got: serde_json::Value = serde_json::from_str(&text_of(&state, 0))?;
+        let want: serde_json::Value = serde_json::from_str(r#"{"z":2,"a":"B","n":[1,2]}"#)?;
+        assert_eq!(got, want);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "json-patch")]
+    #[test]
+    fn test_a_full_value_restores_the_baseline_a_tlcp_diff_needs() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(1);
+        state.apply(LEXICALLY_AWKWARD_JSON)?;
+        state.apply(r#"^P[{"op":"replace","path":"/z","value":2}]"#)?;
+        // Actual content is the server's own characters again, so the field is
+        // once more a legal base for a character diff.
+        state.apply("foobar")?;
+        state.apply("^Tbdzapcd")?;
+        assert_eq!(state.field(0), Some(Some("fzapbar")));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "json-patch")]
+    #[test]
+    fn test_a_tlcp_diff_chain_stays_a_legal_baseline() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(1);
+        state.apply("foobar")?;
+        // A `^T` result is assembled from the server's own characters, so it is
+        // exact and a further `^T` applies to it.
+        state.apply("^Tbdzapcd")?;
+        state.apply("^Tdczz")?;
+        assert_eq!(state.field(0), Some(Some("fzazz")));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "json-patch")]
+    #[test]
+    fn test_apply_json_patch_onto_non_json_base_is_an_error() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(1);
+        state.apply("not json")?;
         let result = state.apply(r#"^P[{"op":"replace","path":"/a","value":1}]"#);
         assert!(matches!(result, Err(ProtocolError::FieldValue { .. })));
+
+        Ok(())
     }
 
     // -- Appendix D: value -> instruction list [p.98] ------------------------
 
     #[test]
-    fn test_parse_tlcp_diff_appendix_d_section_table_p98() {
+    fn test_parse_tlcp_diff_appendix_d_section_table_p98() -> Result<(), ProtocolError> {
         use DiffInstruction::{Add, Copy, Del};
 
-        assert_eq!(parse_tlcp_diff("d").unwrap(), vec![Copy(3)]);
+        assert_eq!(parse_tlcp_diff("d")?, vec![Copy(3)]);
         assert_eq!(
-            parse_tlcp_diff("bdzap").unwrap(),
+            parse_tlcp_diff("bdzap")?,
             vec![Copy(1), Add("zap".to_owned())]
         );
         assert_eq!(
-            parse_tlcp_diff("bdzapcd").unwrap(),
+            parse_tlcp_diff("bdzapcd")?,
             vec![Copy(1), Add("zap".to_owned()), Del(2), Copy(3)]
         );
         assert_eq!(
-            parse_tlcp_diff("adzapad").unwrap(),
+            parse_tlcp_diff("adzapad")?,
             vec![Copy(0), Add("zap".to_owned()), Del(0), Copy(3)]
         );
         // The multi-letter row. See SPEC-AMBIGUITY
@@ -1076,90 +1378,102 @@ mod tests {
         // COPY(26) per the table, which the prose's own weighting rule cannot
         // produce.
         assert_eq!(
-            parse_tlcp_diff("AdacAa").unwrap(),
+            parse_tlcp_diff("AdacAa")?,
             vec![Copy(29), Add(String::new()), Del(2), Copy(26)]
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_decode_encoded_integer_matches_appendix_d_examples_p98() {
-        fn decode(text: &str) -> usize {
+    fn test_decode_encoded_integer_matches_appendix_d_examples_p98() -> Result<(), ProtocolError> {
+        fn decode(text: &str) -> Result<usize, ProtocolError> {
             let chars: Vec<char> = text.chars().collect();
             let mut position = 0;
-            let value = decode_encoded_integer(&chars, &mut position).unwrap();
+            let value = decode_encoded_integer(&chars, &mut position)?;
             assert_eq!(position, chars.len(), "consumed the whole integer");
-            value
+            Ok(value)
         }
 
-        assert_eq!(decode("a"), 0);
-        assert_eq!(decode("b"), 1);
-        assert_eq!(decode("c"), 2);
-        assert_eq!(decode("d"), 3);
-        assert_eq!(decode("z"), 25);
-        assert_eq!(decode("Aa"), 26);
-        assert_eq!(decode("Ad"), 29);
+        assert_eq!(decode("a")?, 0);
+        assert_eq!(decode("b")?, 1);
+        assert_eq!(decode("c")?, 2);
+        assert_eq!(decode("d")?, 3);
+        assert_eq!(decode("z")?, 25);
+        assert_eq!(decode("Aa")?, 26);
+        assert_eq!(decode("Ad")?, 29);
         // Extrapolated from the same rule: (0+1)·26² + (0+1)·26 + 0.
-        assert_eq!(decode("AAa"), 702);
+        assert_eq!(decode("AAa")?, 702);
+
+        Ok(())
     }
 
     // -- Appendix D: base + instructions -> result [p.99] --------------------
 
     #[test]
-    fn test_apply_tlcp_instructions_appendix_d_application_table_p99() {
+    fn test_apply_tlcp_instructions_appendix_d_application_table_p99() -> Result<(), ProtocolError>
+    {
         use DiffInstruction::{Add, Copy, Del};
 
-        fn run(base: &str, instructions: &[DiffInstruction]) -> String {
+        fn run(base: &str, instructions: &[DiffInstruction]) -> Result<String, ProtocolError> {
             let chars: Vec<char> = base.chars().collect();
-            apply_tlcp_instructions(&chars, instructions).unwrap()
+            apply_tlcp_instructions(&chars, instructions)
         }
 
-        assert_eq!(run("foo", &[Copy(3)]), "foo");
+        assert_eq!(run("foo", &[Copy(3)])?, "foo");
         // A diff that stops early truncates the base: no implicit trailing
         // copy [p.99].
-        assert_eq!(run("foobar", &[Copy(3)]), "foo");
-        assert_eq!(run("foobar", &[Copy(1), Add("zap".to_owned())]), "fzap");
+        assert_eq!(run("foobar", &[Copy(3)])?, "foo");
+        assert_eq!(run("foobar", &[Copy(1), Add("zap".to_owned())])?, "fzap");
         assert_eq!(
-            run("foobar", &[Copy(1), Add("zap".to_owned()), Del(2), Copy(3)]),
+            run("foobar", &[Copy(1), Add("zap".to_owned()), Del(2), Copy(3)])?,
             "fzapbar"
         );
         assert_eq!(
-            run("foobar", &[Copy(0), Add("zap".to_owned()), Del(0), Copy(3)]),
+            run("foobar", &[Copy(0), Add("zap".to_owned()), Del(0), Copy(3)])?,
             "zapfoo"
         );
         assert_eq!(
-            run("foobar", &[Copy(2), Add(String::new()), Del(2), Copy(2)]),
+            run("foobar", &[Copy(2), Add(String::new()), Del(2), Copy(2)])?,
             "foar"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_tlcp_diff_end_to_end_over_both_appendix_d_tables_p98_p99() {
+    fn test_apply_tlcp_diff_end_to_end_over_both_appendix_d_tables_p98_p99()
+    -> Result<(), ProtocolError> {
         // Every value from the section table [p.98] run against the base of the
         // application table [p.99]; the two tables share the same instruction
         // lists, so the pairings are exactly the spec's own.
-        assert_eq!(apply_tlcp_diff("foo", "d").unwrap(), "foo");
-        assert_eq!(apply_tlcp_diff("foobar", "d").unwrap(), "foo");
-        assert_eq!(apply_tlcp_diff("foobar", "bdzap").unwrap(), "fzap");
-        assert_eq!(apply_tlcp_diff("foobar", "bdzapcd").unwrap(), "fzapbar");
-        assert_eq!(apply_tlcp_diff("foobar", "adzapad").unwrap(), "zapfoo");
+        assert_eq!(apply_tlcp_diff("foo", "d")?, "foo");
+        assert_eq!(apply_tlcp_diff("foobar", "d")?, "foo");
+        assert_eq!(apply_tlcp_diff("foobar", "bdzap")?, "fzap");
+        assert_eq!(apply_tlcp_diff("foobar", "bdzapcd")?, "fzapbar");
+        assert_eq!(apply_tlcp_diff("foobar", "adzapad")?, "zapfoo");
         // The last application row, `COPY(2) ADD(0,) DEL(2) COPY(2)`, encodes
         // as `cacc` — the spec gives the instruction list but not the value
         // [p.99].
-        assert_eq!(apply_tlcp_diff("foobar", "cacc").unwrap(), "foar");
+        assert_eq!(apply_tlcp_diff("foobar", "cacc")?, "foar");
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_tlcp_diff_through_item_state() {
+    fn test_apply_tlcp_diff_through_item_state() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(2);
-        state.apply("t0|foobar").unwrap();
+        state.apply("t0|foobar")?;
 
-        let outcome = state.apply("t1|^Tbdzapcd").unwrap();
+        let outcome = state.apply("t1|^Tbdzapcd")?;
         assert_eq!(state.field(1), Some(Some("fzapbar")));
         assert_eq!(outcome.changed_fields(), &[0, 1]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_tlcp_diff_counts_characters_not_bytes() {
+    fn test_apply_tlcp_diff_counts_characters_not_bytes() -> Result<(), ProtocolError> {
         // Base of five characters, ten UTF-8 bytes. The diff is
         // COPY(2) ADD(1,"ñ") DEL(1) COPY(2) = `c` `b`+`ñ` `b` `c`.
         // Appendix D counts characters [p.98]; a byte-indexed decoder would cut
@@ -1167,31 +1481,38 @@ mod tests {
         let base = "áéíóú";
         assert_eq!(base.len(), 10);
         assert_eq!(base.chars().count(), 5);
-        assert_eq!(apply_tlcp_diff(base, "cbñbc").unwrap(), "áéñóú");
+        assert_eq!(apply_tlcp_diff(base, "cbñbc")?, "áéñóú");
+
+        Ok(())
     }
 
     #[test]
-    fn test_apply_tlcp_diff_onto_multi_byte_value_through_item_state() {
+    fn test_apply_tlcp_diff_onto_multi_byte_value_through_item_state() -> Result<(), ProtocolError>
+    {
         let mut state = ItemState::new(1);
-        state.apply("日本語テキスト").unwrap();
+        state.apply("日本語テキスト")?;
         // COPY(3) ADD(2,"です") = `d` + `c` + `です`; keeps the first three
         // characters of a seven-character, twenty-one-byte base.
-        let outcome = state.apply("^Tdcです").unwrap();
+        let outcome = state.apply("^Tdcです")?;
         assert_eq!(state.field(0), Some(Some("日本語です")));
         assert_eq!(outcome.changed_fields(), &[0]);
+
+        Ok(())
     }
 
     // -- Null vs empty, and the markers as content ---------------------------
 
     #[test]
-    fn test_null_and_empty_are_distinct() {
+    fn test_null_and_empty_are_distinct() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(2);
-        state.apply("#|$").unwrap();
+        state.apply("#|$")?;
         // `#` is null [§2.2]; `$` is the empty string [§2.2]. Collapsing them
         // would lose information the protocol carries deliberately.
         assert_eq!(state.field(0), Some(None));
         assert_eq!(state.field(1), Some(Some("")));
         assert_ne!(state.field(0), state.field(1));
+
+        Ok(())
     }
 
     #[test]
@@ -1204,100 +1525,168 @@ mod tests {
     }
 
     #[test]
-    fn test_null_can_be_replaced_by_a_value_and_back() {
+    fn test_null_can_be_replaced_by_a_value_and_back() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("#").unwrap();
+        state.apply("#")?;
         assert_eq!(state.field(0), Some(None));
-        state.apply("v").unwrap();
+        state.apply("v")?;
         assert_eq!(state.field(0), Some(Some("v")));
-        state.apply("#").unwrap();
+        state.apply("#")?;
         assert_eq!(state.field(0), Some(None));
+
+        Ok(())
     }
 
     #[test]
-    fn test_escaped_markers_are_content_not_markers() {
+    fn test_escaped_markers_are_content_not_markers() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
         // "#, $ and ^ characters are percent-encoded if occurring at the
         // beginning of an actual content (and only in this case)" [§2.2, p.51].
-        state.apply("%23|%24|%5E").unwrap();
+        state.apply("%23|%24|%5E")?;
         assert_eq!(state.field(0), Some(Some("#")));
         assert_eq!(state.field(1), Some(Some("$")));
         assert_eq!(state.field(2), Some(Some("^")));
+
+        Ok(())
     }
 
     #[test]
-    fn test_hash_and_dollar_match_only_as_a_whole_token() {
+    fn test_hash_and_dollar_match_only_as_a_whole_token() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(2);
         // §2.3 invariant 2: the marker test is for a token that *is* a single
         // hash / dollar sign, so a longer token is content.
-        state.apply("%23abc|%24x").unwrap();
+        state.apply("%23abc|%24x")?;
         assert_eq!(state.field(0), Some(Some("#abc")));
         assert_eq!(state.field(1), Some(Some("$x")));
+
+        Ok(())
     }
 
     #[test]
-    fn test_pipe_inside_a_value_is_percent_encoded() {
+    fn test_pipe_inside_a_value_is_percent_encoded() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(2);
         // §2.3 invariant 1: splitting comes first, and `%7C` is not a
         // separator [p.52].
-        let outcome = state.apply("aa%7Cbb|cc").unwrap();
+        let outcome = state.apply("aa%7Cbb|cc")?;
         assert_eq!(state.field(0), Some(Some("aa|bb")));
         assert_eq!(state.field(1), Some(Some("cc")));
         assert_eq!(outcome.changed_count(), 2);
+
+        Ok(())
     }
 
     // -- `^N` runs -----------------------------------------------------------
 
     #[test]
-    fn test_caret_run_is_inclusive_of_the_pointed_field() {
+    fn test_caret_run_is_inclusive_of_the_pointed_field() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(4);
-        state.apply("a|b|c|d").unwrap();
+        state.apply("a|b|c|d")?;
         // §2.3 invariant 6: `^3` covers the pointed field and the following
         // two, so only the fourth field is left for the next token.
-        let outcome = state.apply("^3|z").unwrap();
+        let outcome = state.apply("^3|z")?;
         assert_eq!(state.field(0), Some(Some("a")));
         assert_eq!(state.field(1), Some(Some("b")));
         assert_eq!(state.field(2), Some(Some("c")));
         assert_eq!(state.field(3), Some(Some("z")));
         assert_eq!(outcome.changed_fields(), &[3]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_run_at_the_end_of_the_schema() {
+    fn test_caret_run_at_the_end_of_the_schema() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(4);
-        state.apply("a|b|c|d").unwrap();
-        let outcome = state.apply("z|^3").unwrap();
+        state.apply("a|b|c|d")?;
+        let outcome = state.apply("z|^3")?;
         assert_eq!(state.field(0), Some(Some("z")));
         assert_eq!(state.field(3), Some(Some("d")));
         assert_eq!(outcome.changed_fields(), &[0]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_run_covering_the_whole_schema_changes_nothing() {
+    fn test_caret_run_covering_the_whole_schema_changes_nothing() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
-        let outcome = state.apply("^3").unwrap();
+        state.apply("a|b|c")?;
+        let outcome = state.apply("^3")?;
         assert!(outcome.is_empty());
         assert_eq!(outcome.changed_fields(), &[] as &[usize]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_run_of_zero_advances_nothing() {
+    fn test_caret_run_of_zero_advances_nothing() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("a").unwrap();
+        state.apply("a")?;
         // SPEC-AMBIGUITY (unchanged-run-number-format): the spec allows a count
         // of 0 without saying so explicitly; it is accepted as the no-op it
         // literally describes.
-        let outcome = state.apply("^0|b").unwrap();
+        let outcome = state.apply("^0|b")?;
         assert_eq!(state.field(0), Some(Some("b")));
         assert_eq!(outcome.changed_fields(), &[0]);
+
+        Ok(())
+    }
+
+    // -- Unchanged tokens need a baseline (§2.3 "never on the first update") --
+
+    #[test]
+    fn test_empty_token_on_the_first_update_is_rejected() {
+        let mut state = ItemState::new(2);
+        // §2.3, empty-token case: "Note: this case never happens on the first
+        // update of a subscription." Accepting it would publish field 0 as null
+        // although no server value was ever behind it.
+        assert_field_value_error(state.apply("|a"));
+        assert_eq!(state.field(0), Some(None));
+        assert_eq!(state.field(1), Some(None));
     }
 
     #[test]
-    fn test_caret_run_with_leading_zeros_is_accepted() {
+    fn test_caret_run_on_the_first_update_is_rejected() {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
+        // §2.3 attaches the same note to the whole `^` case, so a run cannot
+        // skip fields that have never been set either.
+        assert_field_value_error(state.apply("^2|c"));
+        // Not even when the run is what completes the line.
+        assert_field_value_error(state.apply("a|^2"));
+    }
+
+    #[test]
+    fn test_unchanged_tokens_are_accepted_over_every_kind_of_baseline() -> Result<(), ProtocolError>
+    {
+        let mut state = ItemState::new(3);
+        // A first update carries a token for every field: content, `#` and `$`
+        // are all baselines [§2.3].
+        state.apply("a|#|$")?;
+
+        let outcome = state.apply("|^2")?;
+        assert!(outcome.is_empty());
+        assert_eq!(state.field(0), Some(Some("a")));
+        assert_eq!(state.field(1), Some(None));
+        assert_eq!(state.field(2), Some(Some("")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_run_of_zero_needs_no_baseline() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(1);
+        // `^0` covers no field, so there is nothing to have a baseline for.
+        state.apply("^0|a")?;
+        assert_eq!(state.field(0), Some(Some("a")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_caret_run_with_leading_zeros_is_accepted() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(3);
+        state.apply("a|b|c")?;
         assert!(state.apply("^003").is_ok());
+
+        Ok(())
     }
 
     // -- Malformed input -----------------------------------------------------
@@ -1310,74 +1699,90 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_diff_tag_is_an_error() {
+    fn test_unknown_diff_tag_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("base").unwrap();
+        state.apply("base")?;
         // ADR-0004: an algorithm the client did not advertise is a typed error,
         // never a silent passthrough.
         assert_field_value_error(state.apply("^Zwhatever"));
         assert_eq!(state.field(0), Some(Some("base")));
+
+        Ok(())
     }
 
     #[cfg(not(feature = "json-patch"))]
     #[test]
-    fn test_json_patch_tag_is_unknown_when_the_feature_is_off() {
+    fn test_json_patch_tag_is_unknown_when_the_feature_is_off() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply(r#"{"a":1}"#).unwrap();
+        state.apply(r#"{"a":1}"#)?;
         // The decoder is not compiled in, so `P` is not advertised and must not
         // be accepted (ADR-0004).
         assert_field_value_error(state.apply(r#"^P[{"op":"remove","path":"/a"}]"#));
+
+        Ok(())
     }
 
     #[test]
-    fn test_bare_caret_is_an_error() {
+    fn test_bare_caret_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("a").unwrap();
+        state.apply("a")?;
         // SPEC-AMBIGUITY (caret-without-marker).
         assert_field_value_error(state.apply("^"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_followed_by_neither_letter_nor_digit_is_an_error() {
+    fn test_caret_followed_by_neither_letter_nor_digit_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("a").unwrap();
+        state.apply("a")?;
         // SPEC-AMBIGUITY (caret-marker-not-letter-or-digit).
         assert_field_value_error(state.apply("^!x"));
         assert_field_value_error(state.apply("^-1"));
         assert_field_value_error(state.apply("^^"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_run_with_trailing_garbage_is_an_error() {
+    fn test_caret_run_with_trailing_garbage_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
+        state.apply("a|b|c")?;
         // SPEC-AMBIGUITY (unchanged-run-number-format): `^2x` is not read as 2.
         assert_field_value_error(state.apply("^2x|z"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_run_out_of_range_is_an_error() {
+    fn test_caret_run_out_of_range_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
+        state.apply("a|b|c")?;
         assert_field_value_error(state.apply("^99999999999999999999999999"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_caret_run_overrunning_the_schema_is_an_error() {
+    fn test_caret_run_overrunning_the_schema_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
+        state.apply("a|b|c")?;
         // SPEC-AMBIGUITY (run-overruns-schema).
         assert_field_value_error(state.apply("z|^5"));
         assert_eq!(state.field(0), Some(Some("a")));
+
+        Ok(())
     }
 
     #[test]
-    fn test_line_shorter_than_the_schema_is_an_error() {
+    fn test_line_shorter_than_the_schema_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
+        state.apply("a|b|c")?;
         // SPEC-AMBIGUITY (line-shorter-than-schema).
         assert_field_value_error(state.apply("z|y"));
         assert_eq!(state.field(0), Some(Some("a")));
+
+        Ok(())
     }
 
     #[test]
@@ -1387,13 +1792,15 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_onto_a_null_field_is_an_error() {
+    fn test_diff_onto_a_null_field_is_an_error() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("#").unwrap();
+        state.apply("#")?;
         // §2.3: "this case never happens if the value of the pointed field is
         // currently null". SPEC-AMBIGUITY (diff-onto-non-value).
         assert_field_value_error(state.apply("^Td"));
         assert_eq!(state.field(0), Some(None));
+
+        Ok(())
     }
 
     #[test]
@@ -1404,20 +1811,22 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_onto_an_empty_field_is_accepted() {
+    fn test_diff_onto_an_empty_field_is_accepted() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("$").unwrap();
+        state.apply("$")?;
         // SPEC-AMBIGUITY (diff-onto-non-value): the empty string is a base of
         // zero characters, so COPY(0) ADD(3,"new") applies cleanly.
-        let outcome = state.apply("^Tadnew").unwrap();
+        let outcome = state.apply("^Tadnew")?;
         assert_eq!(state.field(0), Some(Some("new")));
         assert_eq!(outcome.changed_fields(), &[0]);
+
+        Ok(())
     }
 
     #[test]
-    fn test_malformed_tlcp_diff_payloads_are_errors() {
+    fn test_malformed_tlcp_diff_payloads_are_errors() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(1);
-        state.apply("foobar").unwrap();
+        state.apply("foobar")?;
 
         // Empty payload: Appendix D requires "one or more sections" [p.98].
         assert_field_value_error(state.apply("^T"));
@@ -1431,25 +1840,86 @@ mod tests {
         assert_field_value_error(state.apply("^TAdacAa"));
 
         assert_eq!(state.field(0), Some(Some("foobar")));
+
+        Ok(())
     }
 
     #[test]
-    fn test_del_past_the_end_of_the_base_is_tolerated() {
+    fn test_del_past_the_end_of_the_base_is_tolerated() -> Result<(), ProtocolError> {
         // SPEC-AMBIGUITY (del-past-base): COPY(3) ADD(0,) DEL(9) = `d` `a` `j`.
         // The sequence ends after the DEL, so the overshoot never matters.
-        assert_eq!(apply_tlcp_diff("foo", "daj").unwrap(), "foo");
+        assert_eq!(apply_tlcp_diff("foo", "daj")?, "foo");
+
+        Ok(())
     }
 
     #[test]
-    fn test_a_rejected_update_leaves_every_field_untouched() {
+    fn test_a_copy_after_an_overshooting_del_is_rejected() {
+        // The tolerance above is bounded: `daja` is
+        // COPY(3) ADD(0,) DEL(9) COPY(0), and even a zero-length copy from a
+        // cursor past the end of the base is refused, so a DEL overshoot that
+        // could affect the result never escapes.
+        assert!(apply_tlcp_diff("foo", "daja").is_err());
+        // One character further out is refused for the same reason.
+        assert!(apply_tlcp_diff("foo", "dajb").is_err());
+    }
+
+    #[test]
+    fn test_copy_boundaries_against_the_base() -> Result<(), ProtocolError> {
+        // Exactly to the end is the appendix's own first example [p.99].
+        assert_eq!(apply_tlcp_diff("foo", "d")?, "foo");
+        // One past the end is not: COPY(4) over a three-character base.
+        assert!(apply_tlcp_diff("foo", "e").is_err());
+        // An empty base is a base of zero characters: COPY(0) applies, COPY(1)
+        // does not.
+        assert_eq!(apply_tlcp_diff("", "a")?, "");
+        assert!(apply_tlcp_diff("", "b").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tlcp_diff_rejects_a_base_outside_the_bmp() {
+        // §2.2: the `T` format "can be applied to all strings, only provided
+        // that their encoding in UTF-16 ... doesn't contain surrogate pairs",
+        // and receiving one "guarantees that both the previous and new value
+        // are compliant". `😀` is U+1F600, a surrogate pair in UTF-16, so the
+        // server counts it as two units and this decoder would count one.
+        assert!(apply_tlcp_diff("😀bc", "d").is_err());
+        assert!(apply_tlcp_diff("ab😀", "b").is_err());
+        assert!(apply_tlcp_diff("a😀c", "bbz").is_err());
+    }
+
+    #[test]
+    fn test_tlcp_diff_rejects_a_payload_outside_the_bmp() {
+        // The same guarantee covers the new value, so an ADD cannot introduce
+        // one either [§2.2].
+        assert!(apply_tlcp_diff("foo", "db😀").is_err());
+    }
+
+    #[test]
+    fn test_tlcp_diff_rejects_an_astral_base_through_item_state() -> Result<(), ProtocolError> {
+        let mut state = ItemState::new(1);
+        state.apply("a😀c")?;
+        assert_field_value_error(state.apply("^Tbbz"));
+        // The rejected update left the value alone.
+        assert_eq!(state.field(0), Some(Some("a😀c")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_rejected_update_leaves_every_field_untouched() -> Result<(), ProtocolError> {
         let mut state = ItemState::new(3);
-        state.apply("a|b|c").unwrap();
+        state.apply("a|b|c")?;
         // The first two tokens are well formed; the third is not. Nothing is
         // committed.
         assert_field_value_error(state.apply("x|y|^"));
         assert_eq!(state.field(0), Some(Some("a")));
         assert_eq!(state.field(1), Some(Some("b")));
         assert_eq!(state.field(2), Some(Some("c")));
+
+        Ok(())
     }
 
     // -- `LS_supported_diffs` (ADR-0004) -------------------------------------

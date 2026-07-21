@@ -390,6 +390,10 @@ impl SubscriptionManager {
     }
 
     /// The subscription's mode.
+    // This and the three accessors below have no non-test caller: the session
+    // layer drives a manager through `handle` and reads the events it returns.
+    // They are the inspection surface this module's tests assert against.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) const fn mode(&self) -> SubscriptionMode {
@@ -398,6 +402,7 @@ impl SubscriptionManager {
 
     /// Whether `SUBOK`/`SUBCMD` has arrived, i.e. whether the subscription's
     /// shape is known [`docs/spec/04-notifications.md` §3.1, §3.2].
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) const fn is_active(&self) -> bool {
@@ -412,6 +417,7 @@ impl SubscriptionManager {
     }
 
     /// How many items the subscription resolved to, once it is active.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) fn item_count(&self) -> Option<usize> {
@@ -422,6 +428,7 @@ impl SubscriptionManager {
     }
 
     /// How many fields the schema resolved to, once the subscription is active.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) fn field_count(&self) -> Option<usize> {
@@ -771,8 +778,6 @@ const fn to_one_based(index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
     use crate::subscription::item_update::{FieldValue, ItemCommand};
 

@@ -70,13 +70,21 @@ use crate::protocol::escaping::encode_form_value;
 /// The protocol version this crate speaks, as it appears in the required
 /// `LS_protocol` query-string parameter and in the WebSocket subprotocol
 /// header [`docs/spec/01-foundations.md` §6.1.1, §6.2.1].
+// No non-test caller: `LS_protocol` belongs to the HTTP request target, and
+// only the WebSocket transport is implemented (`src/transport/ws.rs`).
+#[allow(dead_code)]
 pub(crate) const PROTOCOL_VERSION: &str = "TLCP-2.5.0";
 
 /// The `Sec-WebSocket-Protocol` value a TLCP WebSocket must be opened with
 /// [`docs/spec/01-foundations.md` §6.2.1].
+// No in-crate caller: `src/transport/ws.rs` carries its own copy of the
+// subprotocol string and the endpoint path.
+#[allow(dead_code)]
 pub(crate) const WS_SUBPROTOCOL: &str = "TLCP-2.5.0.lightstreamer.com";
 
 /// The WebSocket endpoint path [`docs/spec/01-foundations.md` §6.2.1].
+// No in-crate caller: see `WS_SUBPROTOCOL`.
+#[allow(dead_code)]
 pub(crate) const WS_PATH: &str = "/lightstreamer";
 
 /// The line separator, for both the HTTP body and the WS message
@@ -132,6 +140,9 @@ pub(crate) enum TransportKind {
     /// One line of an HTTP control batch whose `LS_session` is supplied on the
     /// query string as the default for every line
     /// [`docs/spec/03-requests.md` §1.1].
+    // Never constructed: control batching is an HTTP-only shape and only the
+    // WebSocket transport is implemented (`src/transport/ws.rs`).
+    #[allow(dead_code)]
     HttpBatched,
     /// A WebSocket text message [`docs/spec/01-foundations.md` §6.2.2].
     WebSocket,
@@ -260,6 +271,10 @@ pub(crate) trait TlcpRequest {
 
     /// The full HTTP request target, carrying the required `LS_protocol`
     /// query-string parameter [`docs/spec/01-foundations.md` §6.1.1].
+    // This and the two helpers below have no in-crate caller: only the
+    // WebSocket transport is implemented (`src/transport/ws.rs`), and it uses
+    // `ws_message`.
+    #[allow(dead_code)]
     #[must_use]
     fn http_target() -> String
     where
@@ -271,6 +286,7 @@ pub(crate) trait TlcpRequest {
     /// The HTTP request target with `LS_session` added to the query string,
     /// where it acts as the default session for every line of a control batch
     /// [`docs/spec/03-requests.md` §1.1].
+    #[allow(dead_code)]
     #[must_use]
     fn http_target_with_session(session: &str) -> String
     where
@@ -288,6 +304,7 @@ pub(crate) trait TlcpRequest {
     /// # Errors
     ///
     /// As [`TlcpRequest::encode_parameters`].
+    #[allow(dead_code)]
     fn http_body(&self) -> Result<String, ProtocolError> {
         self.encode_parameters(TransportKind::Http)
     }
@@ -565,6 +582,9 @@ impl CauseCode {
     ///
     /// [`ProtocolError::Request`] if the code is positive
     /// [`docs/spec/03-requests.md` §11.1].
+    // No in-crate caller: `destroy` is sent without a cause by the session
+    // layer, so nothing constructs a `CauseCode` outside the tests.
+    #[allow(dead_code)]
     #[must_use = "builders do nothing unless the result is used"]
     pub(crate) fn try_new(code: i32) -> Result<Self, ProtocolError> {
         if code > 0 {
@@ -596,6 +616,8 @@ impl CauseMessage {
     /// The length past which the server may replace the message with
     /// `[Custom message skipped]`, if a content-length limit is in force
     /// [`docs/spec/03-requests.md` §11.1].
+    // No in-crate caller, for the same reason as `CauseCode::try_new`.
+    #[allow(dead_code)]
     pub(crate) const RECOMMENDED_MAX_LEN: usize = 35;
 
     /// Validates a cause message.
@@ -611,6 +633,9 @@ impl CauseMessage {
     // ("should", with a stated server-side fallback), so they are documented
     // on `RECOMMENDED_MAX_LEN` rather than enforced. Only the flat
     // prohibition on multiline text is a hard rejection.
+    //
+    // No in-crate caller, for the same reason as `CauseCode::try_new`.
+    #[allow(dead_code)]
     #[must_use = "builders do nothing unless the result is used"]
     pub(crate) fn try_new(message: impl Into<String>) -> Result<Self, ProtocolError> {
         let message = message.into();
@@ -703,6 +728,9 @@ pub(crate) enum ControlOperation {
     /// Reconfigure an existing subscription.
     Reconf,
     /// Change the constraints of an existing session.
+    // Never constructed: the client surface does not expose a runtime
+    // bandwidth change, so nothing builds a `ConstrainSession`.
+    #[allow(dead_code)]
     Constrain,
     /// Force an existing session to rebind.
     ForceRebind,
@@ -762,6 +790,10 @@ impl RequestedMaxFrequency {
 /// and the request is in any case "admitted only if the subscription is not
 /// subscribed to with `unfiltered` max frequency". Making `unfiltered`
 /// unrepresentable here removes the possibility of asking for it.
+// Never constructed outside the tests: the client surface reconfigures a
+// subscription's frequency through `RequestedMaxFrequency`, and this narrower
+// type exists so that `reconf` cannot be asked for `unfiltered`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum MaxFrequencyLimit {
     /// `unlimited` — relieve any existing frequency limit.
@@ -783,6 +815,9 @@ impl MaxFrequencyLimit {
 
 /// The value of `LS_requested_max_bandwidth` on a session constrain request,
 /// expressed in kbps [`docs/spec/03-requests.md` §9.1].
+// No in-crate caller: the client surface does not expose a runtime bandwidth
+// change, so nothing builds a `ConstrainSession` to carry this.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum MaxBandwidth {
     /// `unlimited` — relieve any existing bandwidth limit.
@@ -793,6 +828,7 @@ pub(crate) enum MaxBandwidth {
 
 impl MaxBandwidth {
     /// The value as it goes on the wire.
+    #[allow(dead_code)]
     #[must_use]
     fn as_str(&self) -> &str {
         match self {
@@ -835,6 +871,9 @@ pub(crate) enum Snapshot {
 
 /// The value of `LS_ttl_millis` on a session creation request
 /// [`docs/spec/03-requests.md` §2.1].
+// Never constructed outside the tests: `LS_ttl_millis` is not among the
+// connection options the client surface exposes.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TimeToLive {
     /// `unknown` — the request is kept until completion. This is also the
@@ -897,6 +936,9 @@ pub(crate) enum ConnectionMode {
     /// A polling connection: the server sends only the notifications ready at
     /// connection time and exits immediately, keeping the session active for
     /// subsequent rebinds. Encoded as `LS_polling=true`.
+    // Never constructed: polling is an HTTP shape and only the WebSocket
+    // streaming transport is implemented (`src/transport/ws.rs`).
+    #[allow(dead_code)]
     Polling {
         /// `LS_polling_millis`: the expected time between the closing of this
         /// connection and the next polling connection. Required by the server
@@ -1558,6 +1600,10 @@ impl TlcpRequest for ReconfigureSubscription {
 ///
 /// As of TLCP-2.5.0 the maximum bandwidth is the only changeable constraint
 /// (§9.1), which is why this struct has exactly one payload field.
+// No in-crate caller: the client surface does not expose a runtime bandwidth
+// change. The encoder is kept because `control` with `LS_op=constrain` is part
+// of the protocol this module models [`docs/spec/03-requests.md` §9].
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConstrainSession {
     /// `LS_session`: see the control-request common parameters.
@@ -1572,6 +1618,7 @@ pub(crate) struct ConstrainSession {
 
 impl ConstrainSession {
     /// The `LS_op` this request carries [`docs/spec/03-requests.md` §9.1].
+    #[allow(dead_code)]
     pub(crate) const OPERATION: ControlOperation = ControlOperation::Constrain;
 }
 
@@ -1960,8 +2007,6 @@ impl WsOk {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     /// The session ID the spec's control examples use [p.31 onward].
@@ -1970,7 +2015,10 @@ mod tests {
     const BIND_SESSION: &str = "S73d162c183916f0dT2729905";
 
     fn sub_id(n: u32) -> NonZeroU32 {
-        NonZeroU32::new(n).unwrap()
+        match NonZeroU32::new(n) {
+            Some(id) => id,
+            None => panic!("a subscription ID is 1-based and never zero"),
+        }
     }
 
     fn req_id(n: u64) -> RequestId {
@@ -1987,6 +2035,14 @@ mod tests {
     fn param<'a>(line: &'a str, name: &str) -> Option<&'a str> {
         line.split('&')
             .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    }
+
+    /// As [`param`], for a parameter the test asserts must be present.
+    fn required_param<'a>(line: &'a str, name: &str) -> &'a str {
+        match param(line, name) {
+            Some(value) => value,
+            None => panic!("`{name}` is missing from {line:?}"),
+        }
     }
 
     /// Whether a wire value carries the given percent-escape, ignoring the
@@ -2031,21 +2087,25 @@ mod tests {
     }
 
     #[test]
-    fn test_create_session_http_body_matches_spec_example_p24() {
-        let body = spec_create_session().http_body().unwrap();
+    fn test_create_session_http_body_matches_spec_example_p24() -> Result<(), ProtocolError> {
+        let body = spec_create_session().http_body()?;
         let expected = format!("{CREATE_SESSION_EXAMPLE}{}", supported_diffs_tail());
         assert_eq!(body, expected);
         assert!(body.starts_with(CREATE_SESSION_EXAMPLE));
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_ws_message_matches_spec_example_p24() {
-        let message = spec_create_session().ws_message().unwrap();
+    fn test_create_session_ws_message_matches_spec_example_p24() -> Result<(), ProtocolError> {
+        let message = spec_create_session().ws_message()?;
         let expected = format!(
             "create_session\r\n{CREATE_SESSION_EXAMPLE}{}",
             supported_diffs_tail()
         );
         assert_eq!(message, expected);
+
+        Ok(())
     }
 
     #[test]
@@ -2058,22 +2118,24 @@ mod tests {
     }
 
     #[test]
-    fn test_create_session_omits_every_optional_parameter_when_none() {
+    fn test_create_session_omits_every_optional_parameter_when_none() -> Result<(), ProtocolError> {
         // Only `LS_cid` is required, plus the derived `LS_supported_diffs`.
-        let body = CreateSession::default().http_body().unwrap();
+        let body = CreateSession::default().http_body()?;
         let expected = format!("LS_cid={CLIENT_IDENTIFIER}{}", supported_diffs_tail());
         assert_eq!(body, expected);
         assert!(!body.contains("LS_user"));
         assert!(!body.contains("LS_polling"));
         assert!(!body.contains("LS_ttl_millis"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_supported_diffs_is_derived_not_literal() {
+    fn test_create_session_supported_diffs_is_derived_not_literal() -> Result<(), ProtocolError> {
         // ADR-0004: the advertised set is computed from the decoder registry.
         // When the registry is empty the parameter is omitted, never sent
         // empty.
-        let body = CreateSession::default().http_body().unwrap();
+        let body = CreateSession::default().http_body()?;
         let diffs = crate::subscription::update::supported_diffs();
         if diffs.is_empty() {
             assert!(!body.contains("LS_supported_diffs"));
@@ -2086,10 +2148,12 @@ mod tests {
             assert!(diffs.split(',').all(|tag| !tag.is_empty()));
             assert!(!diffs.contains(' '));
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_streaming_group_encoded() {
+    fn test_create_session_streaming_group_encoded() -> Result<(), ProtocolError> {
         let request = CreateSession {
             connection: ConnectionMode::Streaming {
                 inactivity_millis: Some(5000),
@@ -2098,16 +2162,19 @@ mod tests {
             },
             ..CreateSession::default()
         };
-        let body = request.http_body().unwrap();
+        let body = request.http_body()?;
         assert!(body.contains("LS_inactivity_millis=5000"));
         assert!(body.contains("LS_keepalive_millis=3000"));
         assert!(body.contains("LS_send_sync=false"));
         // Absence of `LS_polling` *is* the streaming request [§2.1].
         assert!(!body.contains("LS_polling"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_polling_group_encoded_and_excludes_streaming_group() {
+    fn test_create_session_polling_group_encoded_and_excludes_streaming_group()
+    -> Result<(), ProtocolError> {
         let request = CreateSession {
             connection: ConnectionMode::Polling {
                 polling_millis: 2000,
@@ -2115,7 +2182,7 @@ mod tests {
             },
             ..CreateSession::default()
         };
-        let body = request.http_body().unwrap();
+        let body = request.http_body()?;
         assert!(body.contains("LS_polling=true"));
         assert!(body.contains("LS_polling_millis=2000"));
         assert!(body.contains("LS_idle_millis=15000"));
@@ -2123,10 +2190,12 @@ mod tests {
         assert!(!body.contains("LS_inactivity_millis"));
         assert!(!body.contains("LS_keepalive_millis"));
         assert!(!body.contains("LS_send_sync"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_polling_millis_is_not_optional() {
+    fn test_create_session_polling_millis_is_not_optional() -> Result<(), ProtocolError> {
         // `LS_polling_millis` is "required by the Server in the polling case"
         // [§2.2], so the type has no way to omit it.
         let request = CreateSession {
@@ -2136,11 +2205,13 @@ mod tests {
             },
             ..CreateSession::default()
         };
-        assert!(request.http_body().unwrap().contains("LS_polling_millis=0"));
+        assert!(request.http_body()?.contains("LS_polling_millis=0"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_ttl_millis_special_values() {
+    fn test_create_session_ttl_millis_special_values() -> Result<(), ProtocolError> {
         for (ttl, expected) in [
             (TimeToLive::Unknown, "LS_ttl_millis=unknown"),
             (TimeToLive::Unlimited, "LS_ttl_millis=unlimited"),
@@ -2150,26 +2221,31 @@ mod tests {
                 ttl: Some(ttl),
                 ..CreateSession::default()
             };
-            assert!(request.http_body().unwrap().contains(expected));
+            assert!(request.http_body()?.contains(expected));
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_bandwidth_content_length_and_reduce_head() {
+    fn test_create_session_bandwidth_content_length_and_reduce_head() -> Result<(), ProtocolError> {
         let request = CreateSession {
-            requested_max_bandwidth: Some(DecimalNumber::try_new("50.0").unwrap()),
+            requested_max_bandwidth: Some(DecimalNumber::try_new("50.0")?),
             content_length: Some(4000),
             reduce_head: Some(true),
             ..CreateSession::default()
         };
-        let body = request.http_body().unwrap();
+        let body = request.http_body()?;
         assert!(body.contains("LS_requested_max_bandwidth=50.0"));
         assert!(body.contains("LS_content_length=4000"));
         assert!(body.contains("LS_reduce_head=true"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_create_session_escapes_reserved_characters_in_credentials() {
+    fn test_create_session_escapes_reserved_characters_in_credentials() -> Result<(), ProtocolError>
+    {
         // The reserved set is CR, LF, `&`, `=`, `%`, `+`
         // [`docs/spec/01-foundations.md` §6.1.3]. Escaping is delegated to
         // `encode_form_value`; this asserts the raw value never reaches the
@@ -2179,69 +2255,73 @@ mod tests {
             password: Some("p+w%d".to_owned()),
             ..CreateSession::default()
         };
-        let body = request.http_body().unwrap();
+        let body = request.http_body()?;
 
-        let user = param(&body, "LS_user").unwrap();
+        let user = required_param(&body, "LS_user");
         assert_ne!(user, "a&b=c");
         assert!(!user.contains(RESERVED));
         assert!(has_escape(user, "%26"));
         assert!(has_escape(user, "%3D"));
 
-        let password = param(&body, "LS_password").unwrap();
+        let password = required_param(&body, "LS_password");
         assert!(!password.contains(RESERVED));
         assert!(has_escape(password, "%2B"));
         assert!(has_escape(password, "%25"));
+
+        Ok(())
     }
 
     // -- bind_session -------------------------------------------------------
 
     #[test]
-    fn test_bind_session_http_body_matches_spec_example_p26() {
+    fn test_bind_session_http_body_matches_spec_example_p26() -> Result<(), ProtocolError> {
         let request = BindSession {
             session: Some(BIND_SESSION.to_owned()),
             ..BindSession::default()
         };
-        assert_eq!(
-            request.http_body().unwrap(),
-            "LS_session=S73d162c183916f0dT2729905"
-        );
+        assert_eq!(request.http_body()?, "LS_session=S73d162c183916f0dT2729905");
+
+        Ok(())
     }
 
     #[test]
-    fn test_bind_session_ws_message_matches_spec_example_p26() {
+    fn test_bind_session_ws_message_matches_spec_example_p26() -> Result<(), ProtocolError> {
         let request = BindSession {
             session: Some(BIND_SESSION.to_owned()),
             ..BindSession::default()
         };
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "bind_session\r\nLS_session=S73d162c183916f0dT2729905"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_bind_session_ws_may_omit_session() {
+    fn test_bind_session_ws_may_omit_session() -> Result<(), ProtocolError> {
         // With WS the rebind applies to the last session bound to that
         // connection [§3.1].
-        let message = BindSession::default().ws_message().unwrap();
+        let message = BindSession::default().ws_message()?;
         assert_eq!(message, "bind_session\r\n");
+
+        Ok(())
     }
 
     #[test]
     fn test_bind_session_http_without_session_is_error() {
         // "It is always required with HTTP transport" [§3.1].
-        let error = BindSession::default().http_body().unwrap_err();
         assert!(matches!(
-            error,
-            ProtocolError::Request {
+            BindSession::default().http_body(),
+            Err(ProtocolError::Request {
                 request: "bind_session",
                 ..
-            }
+            })
         ));
     }
 
     #[test]
-    fn test_bind_session_recovery_and_content_length() {
+    fn test_bind_session_recovery_and_content_length() -> Result<(), ProtocolError> {
         let request = BindSession {
             session: Some(BIND_SESSION.to_owned()),
             recovery_from: Some(1234),
@@ -2250,14 +2330,16 @@ mod tests {
             ..BindSession::default()
         };
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=S73d162c183916f0dT2729905&LS_recovery_from=1234\
              &LS_content_length=50000&LS_reduce_head=true"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_bind_session_polling_group() {
+    fn test_bind_session_polling_group() -> Result<(), ProtocolError> {
         let request = BindSession {
             session: Some(BIND_SESSION.to_owned()),
             connection: ConnectionMode::Polling {
@@ -2266,9 +2348,11 @@ mod tests {
             },
             ..BindSession::default()
         };
-        let body = request.http_body().unwrap();
+        let body = request.http_body()?;
         assert!(body.contains("LS_polling=true&LS_polling_millis=5000"));
         assert!(!body.contains("LS_idle_millis"));
+
+        Ok(())
     }
 
     // -- control: add -------------------------------------------------------
@@ -2291,27 +2375,31 @@ mod tests {
     }
 
     #[test]
-    fn test_subscribe_http_body_matches_spec_example_p31() {
+    fn test_subscribe_http_body_matches_spec_example_p31() -> Result<(), ProtocolError> {
         let request = spec_subscribe(Some(CONTROL_SESSION));
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=1&LS_op=add&LS_subId=1\
              &LS_group=item1&LS_schema=last_price&LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_ws_message_matches_spec_example_p31() {
+    fn test_subscribe_ws_message_matches_spec_example_p31() -> Result<(), ProtocolError> {
         let request = spec_subscribe(None);
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "control\r\nLS_reqId=1&LS_op=add&LS_subId=1&LS_group=item1\
              &LS_schema=last_price&LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_ws_batch_matches_spec_example_p31() {
+    fn test_subscribe_ws_batch_matches_spec_example_p31() -> Result<(), ProtocolError> {
         // Multiple request example with WS transport [§6.4, pp.31-32].
         let first = spec_subscribe(None);
         let second = Subscribe {
@@ -2321,21 +2409,23 @@ mod tests {
             ..spec_subscribe(None)
         };
         let lines = vec![
-            first.encode_parameters(TransportKind::WebSocket).unwrap(),
-            second.encode_parameters(TransportKind::WebSocket).unwrap(),
+            first.encode_parameters(TransportKind::WebSocket)?,
+            second.encode_parameters(TransportKind::WebSocket)?,
         ];
         assert_eq!(
-            encode_ws_batch(Subscribe::NAME, &lines).unwrap(),
+            encode_ws_batch(Subscribe::NAME, &lines)?,
             "control\r\n\
              LS_reqId=1&LS_op=add&LS_subId=1&LS_group=item1&LS_schema=last_price\
              &LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE\r\n\
              LS_reqId=2&LS_op=add&LS_subId=2&LS_group=item2&LS_schema=last_price\
              &LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_http_batch_uses_query_string_session() {
+    fn test_subscribe_http_batch_uses_query_string_session() -> Result<(), ProtocolError> {
         // Multiple request example with HTTP transport [§6.4, p.31]. The
         // printed body of that example omits the `&` between `LS_reqId` and
         // `LS_op` on both lines, which §6.4 flags as a typographical error
@@ -2351,10 +2441,8 @@ mod tests {
             ..spec_subscribe(None)
         };
         let lines = vec![
-            first.encode_parameters(TransportKind::HttpBatched).unwrap(),
-            second
-                .encode_parameters(TransportKind::HttpBatched)
-                .unwrap(),
+            first.encode_parameters(TransportKind::HttpBatched)?,
+            second.encode_parameters(TransportKind::HttpBatched)?,
         ];
         assert_eq!(
             Subscribe::http_target_with_session(CONTROL_SESSION),
@@ -2362,12 +2450,14 @@ mod tests {
              &LS_session=Sd9fce58fb5dbbebfT2255126"
         );
         assert_eq!(
-            encode_http_batch(Subscribe::NAME, &lines).unwrap(),
+            encode_http_batch(Subscribe::NAME, &lines)?,
             "LS_reqId=1&LS_op=add&LS_subId=1&LS_group=item1&LS_schema=last_price\
              &LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE\r\n\
              LS_reqId=2&LS_op=add&LS_subId=2&LS_group=item2&LS_schema=last_price\
              &LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE"
         );
+
+        Ok(())
     }
 
     #[test]
@@ -2380,45 +2470,47 @@ mod tests {
     fn test_subscribe_http_without_session_is_error() {
         let request = spec_subscribe(None);
         assert!(matches!(
-            request.http_body().unwrap_err(),
-            ProtocolError::Request {
+            request.http_body(),
+            Err(ProtocolError::Request {
                 request: "control",
                 ..
-            }
+            })
         ));
     }
 
     #[test]
-    fn test_subscribe_all_optional_parameters_encoded() {
+    fn test_subscribe_all_optional_parameters_encoded() -> Result<(), ProtocolError> {
         let request = Subscribe {
             selector: Some("sel1".to_owned()),
             requested_buffer_size: Some(RequestedBufferSize::Events(sub_id(30))),
-            requested_max_frequency: Some(RequestedMaxFrequency::Limited(
-                DecimalNumber::try_new("2.5").unwrap(),
-            )),
+            requested_max_frequency: Some(RequestedMaxFrequency::Limited(DecimalNumber::try_new(
+                "2.5",
+            )?)),
             snapshot: Some(Snapshot::On),
             ack: Some(false),
             ..spec_subscribe(None)
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=1&LS_op=add&LS_subId=1&LS_group=item1&LS_schema=last_price\
              &LS_data_adapter=QUOTE_ADAPTER&LS_mode=MERGE&LS_selector=sel1\
              &LS_requested_buffer_size=30&LS_requested_max_frequency=2.5\
              &LS_snapshot=true&LS_ack=false"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_unlimited_buffer_size_and_unfiltered_frequency() {
+    fn test_subscribe_unlimited_buffer_size_and_unfiltered_frequency() -> Result<(), ProtocolError>
+    {
         let request = Subscribe {
             requested_buffer_size: Some(RequestedBufferSize::Unlimited),
             ..spec_subscribe(None)
         };
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .contains("LS_requested_buffer_size=unlimited")
         );
 
@@ -2428,30 +2520,32 @@ mod tests {
         };
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .contains("LS_requested_max_frequency=unfiltered")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_ack_is_omitted_on_http_and_emitted_on_ws() {
+    fn test_subscribe_ack_is_omitted_on_http_and_emitted_on_ws() -> Result<(), ProtocolError> {
         // "Ignored if used with HTTP transport" [§6.1].
         let request = Subscribe {
             ack: Some(false),
             ..spec_subscribe(Some(CONTROL_SESSION))
         };
-        assert!(!request.http_body().unwrap().contains("LS_ack"));
+        assert!(!request.http_body()?.contains("LS_ack"));
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .contains("LS_ack=false")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_snapshot_length_requires_distinct_mode() {
+    fn test_subscribe_snapshot_length_requires_distinct_mode() -> Result<(), ProtocolError> {
         // "Admitted only if LS_mode is DISTINCT" [§6.1].
         let request = Subscribe {
             mode: SubscriptionMode::Merge,
@@ -2467,14 +2561,15 @@ mod tests {
         };
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .contains("LS_snapshot=10")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_subscribe_snapshot_off_is_encoded_explicitly() {
+    fn test_subscribe_snapshot_off_is_encoded_explicitly() -> Result<(), ProtocolError> {
         // `false` is the default, but an explicit `Snapshot::Off` is a
         // deliberate statement and is emitted rather than dropped [§6.1].
         let request = Subscribe {
@@ -2483,10 +2578,11 @@ mod tests {
         };
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .contains("LS_snapshot=false")
         );
+
+        Ok(())
     }
 
     #[test]
@@ -2532,21 +2628,23 @@ mod tests {
     }
 
     #[test]
-    fn test_subscribe_escapes_group_and_schema() {
+    fn test_subscribe_escapes_group_and_schema() -> Result<(), ProtocolError> {
         let request = Subscribe {
             group: "item1&item2".to_owned(),
             schema: "f1=f2".to_owned(),
             ..spec_subscribe(None)
         };
-        let line = request.encode_parameters(TransportKind::WebSocket).unwrap();
+        let line = request.encode_parameters(TransportKind::WebSocket)?;
 
-        let group = param(&line, "LS_group").unwrap();
+        let group = required_param(&line, "LS_group");
         assert!(!group.contains(RESERVED));
         assert!(has_escape(group, "%26"));
 
-        let schema = param(&line, "LS_schema").unwrap();
+        let schema = required_param(&line, "LS_schema");
         assert!(!schema.contains(RESERVED));
         assert!(has_escape(schema, "%3D"));
+
+        Ok(())
     }
 
     #[test]
@@ -2571,7 +2669,7 @@ mod tests {
     // -- control: delete ----------------------------------------------------
 
     #[test]
-    fn test_unsubscribe_http_body_matches_spec_example_p32() {
+    fn test_unsubscribe_http_body_matches_spec_example_p32() -> Result<(), ProtocolError> {
         let request = Unsubscribe {
             session: Some(CONTROL_SESSION.to_owned()),
             request_id: req_id(2),
@@ -2579,13 +2677,15 @@ mod tests {
             ack: None,
         };
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=2&LS_op=delete&LS_subId=1"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_unsubscribe_ws_message_matches_spec_example_p32() {
+    fn test_unsubscribe_ws_message_matches_spec_example_p32() -> Result<(), ProtocolError> {
         let request = Unsubscribe {
             session: None,
             request_id: req_id(2),
@@ -2593,65 +2693,72 @@ mod tests {
             ack: None,
         };
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "control\r\nLS_reqId=2&LS_op=delete&LS_subId=1"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_unsubscribe_ack_only_on_ws() {
+    fn test_unsubscribe_ack_only_on_ws() -> Result<(), ProtocolError> {
         let request = Unsubscribe {
             session: Some(CONTROL_SESSION.to_owned()),
             request_id: req_id(2),
             subscription_id: sub_id(1),
             ack: Some(false),
         };
-        assert!(!request.http_body().unwrap().contains("LS_ack"));
+        assert!(!request.http_body()?.contains("LS_ack"));
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .ends_with("&LS_ack=false")
         );
+
+        Ok(())
     }
 
     // -- control: reconf ----------------------------------------------------
 
     #[test]
-    fn test_reconf_http_body_matches_spec_example_p33() {
+    fn test_reconf_http_body_matches_spec_example_p33() -> Result<(), ProtocolError> {
         let request = ReconfigureSubscription {
             session: Some(CONTROL_SESSION.to_owned()),
             request_id: req_id(3),
             subscription_id: sub_id(1),
-            requested_max_frequency: Some(MaxFrequencyLimit::Limited(
-                DecimalNumber::try_new("2.0").unwrap(),
-            )),
+            requested_max_frequency: Some(MaxFrequencyLimit::Limited(DecimalNumber::try_new(
+                "2.0",
+            )?)),
         };
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=3&LS_op=reconf&LS_subId=1\
              &LS_requested_max_frequency=2.0"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_reconf_ws_message_matches_spec_example_p33() {
+    fn test_reconf_ws_message_matches_spec_example_p33() -> Result<(), ProtocolError> {
         let request = ReconfigureSubscription {
             session: None,
             request_id: req_id(3),
             subscription_id: sub_id(1),
-            requested_max_frequency: Some(MaxFrequencyLimit::Limited(
-                DecimalNumber::try_new("2.0").unwrap(),
-            )),
+            requested_max_frequency: Some(MaxFrequencyLimit::Limited(DecimalNumber::try_new(
+                "2.0",
+            )?)),
         };
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "control\r\nLS_reqId=3&LS_op=reconf&LS_subId=1&LS_requested_max_frequency=2.0"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_reconf_unlimited_relieves_the_limit_and_none_omits_it() {
+    fn test_reconf_unlimited_relieves_the_limit_and_none_omits_it() -> Result<(), ProtocolError> {
         let request = ReconfigureSubscription {
             session: None,
             request_id: req_id(3),
@@ -2660,8 +2767,7 @@ mod tests {
         };
         assert!(
             request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap()
+                .encode_parameters(TransportKind::WebSocket)?
                 .ends_with("&LS_requested_max_frequency=unlimited")
         );
 
@@ -2670,53 +2776,55 @@ mod tests {
             ..request
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=3&LS_op=reconf&LS_subId=1"
         );
+
+        Ok(())
     }
 
     // -- control: constrain -------------------------------------------------
 
     #[test]
-    fn test_constrain_http_body_matches_spec_example_p34() {
+    fn test_constrain_http_body_matches_spec_example_p34() -> Result<(), ProtocolError> {
         let request = ConstrainSession {
             session: Some(CONTROL_SESSION.to_owned()),
             request_id: req_id(4),
-            requested_max_bandwidth: Some(MaxBandwidth::Limited(
-                DecimalNumber::try_new("50.0").unwrap(),
-            )),
+            requested_max_bandwidth: Some(MaxBandwidth::Limited(DecimalNumber::try_new("50.0")?)),
         };
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=4&LS_op=constrain\
              &LS_requested_max_bandwidth=50.0"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_constrain_ws_message_matches_spec_example_p34() {
+    fn test_constrain_ws_message_matches_spec_example_p34() -> Result<(), ProtocolError> {
         let request = ConstrainSession {
             session: None,
             request_id: req_id(4),
-            requested_max_bandwidth: Some(MaxBandwidth::Limited(
-                DecimalNumber::try_new("50.0").unwrap(),
-            )),
+            requested_max_bandwidth: Some(MaxBandwidth::Limited(DecimalNumber::try_new("50.0")?)),
         };
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "control\r\nLS_reqId=4&LS_op=constrain&LS_requested_max_bandwidth=50.0"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_constrain_unlimited_and_omitted_bandwidth() {
+    fn test_constrain_unlimited_and_omitted_bandwidth() -> Result<(), ProtocolError> {
         let request = ConstrainSession {
             session: None,
             request_id: req_id(4),
             requested_max_bandwidth: Some(MaxBandwidth::Unlimited),
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=4&LS_op=constrain&LS_requested_max_bandwidth=unlimited"
         );
 
@@ -2725,15 +2833,17 @@ mod tests {
             ..request
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=4&LS_op=constrain"
         );
+
+        Ok(())
     }
 
     // -- control: force_rebind ----------------------------------------------
 
     #[test]
-    fn test_force_rebind_http_body_matches_spec_example_p35() {
+    fn test_force_rebind_http_body_matches_spec_example_p35() -> Result<(), ProtocolError> {
         let request = ForceRebind {
             session: Some(CONTROL_SESSION.to_owned()),
             request_id: req_id(5),
@@ -2741,13 +2851,15 @@ mod tests {
             close_socket: None,
         };
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=5&LS_op=force_rebind"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_force_rebind_ws_message_matches_spec_example_p35() {
+    fn test_force_rebind_ws_message_matches_spec_example_p35() -> Result<(), ProtocolError> {
         let request = ForceRebind {
             session: None,
             request_id: req_id(5),
@@ -2755,13 +2867,15 @@ mod tests {
             close_socket: None,
         };
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "control\r\nLS_reqId=5&LS_op=force_rebind"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_force_rebind_optional_parameters() {
+    fn test_force_rebind_optional_parameters() -> Result<(), ProtocolError> {
         let request = ForceRebind {
             session: None,
             request_id: req_id(5),
@@ -2769,15 +2883,17 @@ mod tests {
             close_socket: Some(true),
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=5&LS_op=force_rebind&LS_polling_millis=2000&LS_close_socket=true"
         );
+
+        Ok(())
     }
 
     // -- control: destroy ---------------------------------------------------
 
     #[test]
-    fn test_destroy_http_body_matches_spec_example_p36() {
+    fn test_destroy_http_body_matches_spec_example_p36() -> Result<(), ProtocolError> {
         let request = DestroySession {
             session: Some(CONTROL_SESSION.to_owned()),
             request_id: req_id(6),
@@ -2785,60 +2901,65 @@ mod tests {
             close_socket: None,
         };
         assert_eq!(
-            request.http_body().unwrap(),
+            request.http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=6&LS_op=destroy"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_destroy_ws_message_matches_spec_example_p36() {
+    fn test_destroy_ws_message_matches_spec_example_p36() -> Result<(), ProtocolError> {
         let request = DestroySession {
             session: None,
             request_id: req_id(6),
             cause: None,
             close_socket: None,
         };
-        assert_eq!(
-            request.ws_message().unwrap(),
-            "control\r\nLS_reqId=6&LS_op=destroy"
-        );
+        assert_eq!(request.ws_message()?, "control\r\nLS_reqId=6&LS_op=destroy");
+
+        Ok(())
     }
 
     #[test]
-    fn test_destroy_cause_code_and_message() {
+    fn test_destroy_cause_code_and_message() -> Result<(), ProtocolError> {
         let request = DestroySession {
             session: None,
             request_id: req_id(6),
             cause: Some(DestroyCause {
-                code: CauseCode::try_new(-7).unwrap(),
-                message: Some(CauseMessage::try_new("bye").unwrap()),
+                code: CauseCode::try_new(-7)?,
+                message: Some(CauseMessage::try_new("bye")?),
             }),
             close_socket: Some(true),
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=6&LS_op=destroy&LS_cause_code=-7&LS_cause_message=bye\
              &LS_close_socket=true"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_destroy_cause_code_without_message_is_legal() {
+    fn test_destroy_cause_code_without_message_is_legal() -> Result<(), ProtocolError> {
         // "If LS_cause_code is present and LS_cause_message is not specified,
         // then the reported message will be null" [§11.1].
         let request = DestroySession {
             session: None,
             request_id: req_id(6),
             cause: Some(DestroyCause {
-                code: CauseCode::try_new(0).unwrap(),
+                code: CauseCode::try_new(0)?,
                 message: None,
             }),
             close_socket: None,
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=6&LS_op=destroy&LS_cause_code=0"
         );
+
+        Ok(())
     }
 
     #[test]
@@ -2859,21 +2980,23 @@ mod tests {
     }
 
     #[test]
-    fn test_destroy_escapes_the_cause_message() {
+    fn test_destroy_escapes_the_cause_message() -> Result<(), ProtocolError> {
         let request = DestroySession {
             session: None,
             request_id: req_id(6),
             cause: Some(DestroyCause {
-                code: CauseCode::try_new(0).unwrap(),
-                message: Some(CauseMessage::try_new("a=b&c").unwrap()),
+                code: CauseCode::try_new(0)?,
+                message: Some(CauseMessage::try_new("a=b&c")?),
             }),
             close_socket: None,
         };
-        let line = request.encode_parameters(TransportKind::WebSocket).unwrap();
-        let message = param(&line, "LS_cause_message").unwrap();
+        let line = request.encode_parameters(TransportKind::WebSocket)?;
+        let message = required_param(&line, "LS_cause_message");
         assert!(!message.contains(RESERVED));
         assert!(has_escape(message, "%3D"));
         assert!(has_escape(message, "%26"));
+
+        Ok(())
     }
 
     // -- msg ----------------------------------------------------------------
@@ -2883,7 +3006,10 @@ mod tests {
             session: session.map(str::to_owned),
             request_id: req_id(11),
             message: "Hello".to_owned(),
-            sequence: Some(SequenceName::try_new("CHAT").unwrap()),
+            sequence: Some(match SequenceName::try_new("CHAT") {
+                Ok(name) => name,
+                Err(error) => panic!("`CHAT` is a valid sequence name: {error}"),
+            }),
             msg_prog: NonZeroU32::new(1),
             max_wait_millis: None,
             ack: None,
@@ -2892,28 +3018,34 @@ mod tests {
     }
 
     #[test]
-    fn test_message_send_http_body_matches_spec_example_p43() {
+    fn test_message_send_http_body_matches_spec_example_p43() -> Result<(), ProtocolError> {
         assert_eq!(
-            spec_message(Some(CONTROL_SESSION)).http_body().unwrap(),
+            spec_message(Some(CONTROL_SESSION)).http_body()?,
             "LS_session=Sd9fce58fb5dbbebfT2255126&LS_reqId=11&LS_sequence=CHAT\
              &LS_msg_prog=1&LS_message=Hello"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_message_send_ws_message_matches_spec_example_p43() {
+    fn test_message_send_ws_message_matches_spec_example_p43() -> Result<(), ProtocolError> {
         assert_eq!(
-            spec_message(None).ws_message().unwrap(),
+            spec_message(None).ws_message()?,
             "msg\r\nLS_reqId=11&LS_sequence=CHAT&LS_msg_prog=1&LS_message=Hello"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_message_send_carries_no_op_parameter() {
+    fn test_message_send_carries_no_op_parameter() -> Result<(), ProtocolError> {
         // "Makes use of a different request name and hence does not require
         // the LS_op parameter" [§12].
-        assert!(!spec_message(None).ws_message().unwrap().contains("LS_op="));
+        assert!(!spec_message(None).ws_message()?.contains("LS_op="));
         assert_eq!(MessageSend::PATH, "/lightstreamer/msg.txt");
+
+        Ok(())
     }
 
     #[test]
@@ -2924,10 +3056,8 @@ mod tests {
             ..spec_message(None)
         };
         assert!(matches!(
-            request
-                .encode_parameters(TransportKind::WebSocket)
-                .unwrap_err(),
-            ProtocolError::Request { request: "msg", .. }
+            request.encode_parameters(TransportKind::WebSocket),
+            Err(ProtocolError::Request { request: "msg", .. })
         ));
     }
 
@@ -2950,7 +3080,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_send_fire_and_forget_needs_no_msg_prog() {
+    fn test_message_send_fire_and_forget_needs_no_msg_prog() -> Result<(), ProtocolError> {
         // With both LS_ack and LS_outcome false there is no notification at
         // all, and LS_msg_prog is then genuinely optional [§12.1, §12.2].
         let request = MessageSend {
@@ -2961,13 +3091,15 @@ mod tests {
             ..spec_message(None)
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=11&LS_ack=false&LS_outcome=false&LS_message=Hello"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_message_send_max_wait_and_ack_and_outcome() {
+    fn test_message_send_max_wait_and_ack_and_outcome() -> Result<(), ProtocolError> {
         let request = MessageSend {
             max_wait_millis: Some(1500),
             ack: Some(true),
@@ -2975,10 +3107,12 @@ mod tests {
             ..spec_message(None)
         };
         assert_eq!(
-            request.encode_parameters(TransportKind::WebSocket).unwrap(),
+            request.encode_parameters(TransportKind::WebSocket)?,
             "LS_reqId=11&LS_sequence=CHAT&LS_msg_prog=1&LS_max_wait=1500\
              &LS_ack=true&LS_outcome=true&LS_message=Hello"
         );
+
+        Ok(())
     }
 
     #[test]
@@ -2996,15 +3130,15 @@ mod tests {
     }
 
     #[test]
-    fn test_message_send_escapes_the_payload() {
+    fn test_message_send_escapes_the_payload() -> Result<(), ProtocolError> {
         // "Any text string" [§12.1] — so the payload is the value most likely
         // to carry a reserved character.
         let request = MessageSend {
             message: "a=1&b=2\r\n100%".to_owned(),
             ..spec_message(None)
         };
-        let line = request.encode_parameters(TransportKind::WebSocket).unwrap();
-        let message = param(&line, "LS_message").unwrap();
+        let line = request.encode_parameters(TransportKind::WebSocket)?;
+        let message = required_param(&line, "LS_message");
         assert!(!message.contains(RESERVED));
         for escape in ["%3D", "%26", "%0D", "%0A", "%25"] {
             assert!(has_escape(message, escape), "missing {escape}");
@@ -3014,6 +3148,8 @@ mod tests {
         // §6.2.2].
         assert!(!line.contains('\r'));
         assert!(!line.contains('\n'));
+
+        Ok(())
     }
 
     #[test]
@@ -3039,48 +3175,53 @@ mod tests {
     // -- heartbeat ----------------------------------------------------------
 
     #[test]
-    fn test_heartbeat_http_body_matches_spec_example_p46() {
+    fn test_heartbeat_http_body_matches_spec_example_p46() -> Result<(), ProtocolError> {
         let request = Heartbeat {
             session: Some(CONTROL_SESSION.to_owned()),
         };
-        assert_eq!(
-            request.http_body().unwrap(),
-            "LS_session=Sd9fce58fb5dbbebfT2255126"
-        );
+        assert_eq!(request.http_body()?, "LS_session=Sd9fce58fb5dbbebfT2255126");
         assert_eq!(
             Heartbeat::http_target(),
             "/lightstreamer/heartbeat.txt?LS_protocol=TLCP-2.5.0"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_heartbeat_ws_message_matches_spec_example_p46() {
+    fn test_heartbeat_ws_message_matches_spec_example_p46() -> Result<(), ProtocolError> {
         let request = Heartbeat {
             session: Some(CONTROL_SESSION.to_owned()),
         };
         assert_eq!(
-            request.ws_message().unwrap(),
+            request.ws_message()?,
             "heartbeat\r\nLS_session=Sd9fce58fb5dbbebfT2255126"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_heartbeat_ws_without_parameters_keeps_the_empty_parameter_line() {
+    fn test_heartbeat_ws_without_parameters_keeps_the_empty_parameter_line()
+    -> Result<(), ProtocolError> {
         // "Since the request here has no parameters, the final line
         // terminator must be included" [§14.2].
-        assert_eq!(Heartbeat::default().ws_message().unwrap(), "heartbeat\r\n");
+        assert_eq!(Heartbeat::default().ws_message()?, "heartbeat\r\n");
+
+        Ok(())
     }
 
     #[test]
-    fn test_heartbeat_carries_no_req_id_and_no_op() {
+    fn test_heartbeat_carries_no_req_id_and_no_op() -> Result<(), ProtocolError> {
         // "heartbeat takes no LS_reqId and no LS_op" [§14.1].
         let message = Heartbeat {
             session: Some(CONTROL_SESSION.to_owned()),
         }
-        .ws_message()
-        .unwrap();
+        .ws_message()?;
         assert!(!message.contains("LS_reqId"));
         assert!(!message.contains("LS_op"));
+
+        Ok(())
     }
 
     #[test]
@@ -3101,21 +3242,25 @@ mod tests {
     // -- shared value types -------------------------------------------------
 
     #[test]
-    fn test_request_id_rejects_empty_and_non_alphanumeric() {
+    fn test_request_id_rejects_empty_and_non_alphanumeric() -> Result<(), ProtocolError> {
         // "Any combination of letters and numbers" [§5.1].
         assert!(RequestId::try_new("").is_err());
         assert!(RequestId::try_new("1-2").is_err());
         assert!(RequestId::try_new("req 1").is_err());
-        assert_eq!(RequestId::try_new("abc123").unwrap().as_str(), "abc123");
+        assert_eq!(RequestId::try_new("abc123")?.as_str(), "abc123");
         assert_eq!(RequestId::from_progressive(42).as_str(), "42");
+
+        Ok(())
     }
 
     #[test]
-    fn test_decimal_number_accepts_the_spec_example_forms() {
+    fn test_decimal_number_accepts_the_spec_example_forms() -> Result<(), ProtocolError> {
         // The spec writes `2.0` [§8.3] and `50.0` [§9.3].
-        assert_eq!(DecimalNumber::try_new("2.0").unwrap().as_str(), "2.0");
-        assert_eq!(DecimalNumber::try_new("50.0").unwrap().as_str(), "50.0");
+        assert_eq!(DecimalNumber::try_new("2.0")?.as_str(), "2.0");
+        assert_eq!(DecimalNumber::try_new("50.0")?.as_str(), "50.0");
         assert!(DecimalNumber::try_new("50").is_ok());
+
+        Ok(())
     }
 
     #[test]

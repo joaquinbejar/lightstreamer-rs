@@ -119,24 +119,18 @@ impl<'a> FieldValue<'a> {
     }
 
     /// The text, substituting `default` if the field is null.
+    ///
+    /// This is how a field value is rendered for a human: `Display` is
+    /// deliberately **not** implemented, because every rendering of a null has
+    /// to choose a spelling and no choice is safe to make on the caller's
+    /// behalf — the empty string collapses null into `$`, and any placeholder
+    /// is a string a field could legitimately hold. Naming the substitute at
+    /// the call site is a one-word cost and it keeps
+    /// `println!("{}", value.text_or("(null)"))` honest.
     #[must_use]
     #[inline]
     pub fn text_or(self, default: &'a str) -> &'a str {
         self.text().unwrap_or(default)
-    }
-}
-
-impl fmt::Display for FieldValue<'_> {
-    /// Renders null as an empty string.
-    ///
-    /// This is a display convenience and is intentionally lossy — it is the one
-    /// place the null/empty distinction is collapsed, because a terminal has no
-    /// way to show it. Match on the variant when the difference matters.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Null => Ok(()),
-            Self::Text(text) => f.write_str(text),
-        }
     }
 }
 
@@ -412,6 +406,10 @@ impl SubscriptionSchema {
     }
 
     /// How many items the subscription resolved to.
+    // No non-test caller: the item count reaches the caller through
+    // `SubscriptionEvent::Activated`, and this is the inspection surface the
+    // tests assert against.
+    #[allow(dead_code)]
     #[must_use]
     #[inline]
     pub(crate) fn item_count(&self) -> usize {
@@ -735,11 +733,57 @@ impl ItemUpdate {
     /// [`None`] if the subscription is not in `COMMAND` mode, or if the command
     /// field is null — a null command names no operation, so this crate reports
     /// its absence rather than guessing one.
+    ///
+    /// # Check [`is_command_changed`](Self::is_command_changed) before acting
+    ///
+    /// The command is an ordinary field, and an ordinary field that this update
+    /// did not carry keeps the value the previous update gave it
+    /// [`docs/spec/04-notifications.md` §2.2]. So a `U` that leaves the command
+    /// field unchanged makes this method return the **previous** update's
+    /// command, and a caller that deletes a row whenever it sees
+    /// [`ItemCommand::Delete`] would delete on the strength of an operation
+    /// that already happened.
+    ///
+    /// SPEC-AMBIGUITY (command-delta-baseline): the specification does not
+    /// state the client-side `COMMAND` state machine, nor "whether
+    /// unchanged-field markers in a `U` are resolved against the previous
+    /// update **of the same key** or of the same item"
+    /// [`docs/spec/04-notifications.md` §3.3]. This crate does not invent one:
+    /// it reports the field value the decoding algorithm produces, and reports
+    /// separately whether *this* update carried it, so the caller can require
+    /// the stronger evidence before doing something destructive.
     #[must_use]
     pub fn command(&self) -> Option<ItemCommand> {
         let index = self.schema.command_field?;
         let value = self.field(index.checked_add(1)?)?;
         value.text().map(ItemCommand::from_wire)
+    }
+
+    /// Whether **this** update carried a token for the command field, as
+    /// opposed to inheriting its value from an earlier update of the same item
+    /// [`docs/spec/04-notifications.md` §2.2, §2.5].
+    ///
+    /// `false` when the subscription is not in `COMMAND` mode.
+    #[must_use]
+    pub fn is_command_changed(&self) -> bool {
+        self.schema
+            .command_field
+            .and_then(|index| index.checked_add(1))
+            .is_some_and(|position| self.is_field_changed(position))
+    }
+
+    /// Whether **this** update carried a token for the key field.
+    ///
+    /// `false` when the subscription is not in `COMMAND` mode. A `false` here
+    /// does not mean the row is unknown: under the per-item baseline this crate
+    /// keeps (see [`key`](Self::key)) it means the key is the one the previous
+    /// update named.
+    #[must_use]
+    pub fn is_key_changed(&self) -> bool {
+        self.schema
+            .key_field
+            .and_then(|index| index.checked_add(1))
+            .is_some_and(|position| self.is_field_changed(position))
     }
 }
 
@@ -898,8 +942,6 @@ impl fmt::Debug for ChangedFields<'_> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     fn names(values: &[&str]) -> Vec<String> {
@@ -955,10 +997,15 @@ mod tests {
     }
 
     #[test]
-    fn test_field_display_collapses_null_to_empty_deliberately() {
-        assert_eq!(FieldValue::Null.to_string(), "");
-        assert_eq!(FieldValue::Text("").to_string(), "");
-        assert_eq!(FieldValue::Text("x").to_string(), "x");
+    fn test_every_rendering_of_a_field_value_keeps_null_distinguishable() {
+        // There is no `Display`: rendering goes through `text_or`, which makes
+        // the substitute for a null explicit and therefore visible in a log.
+        assert_eq!(FieldValue::Null.text_or("(null)"), "(null)");
+        assert_eq!(FieldValue::Text("").text_or("(null)"), "");
+        assert_eq!(FieldValue::Text("x").text_or("(null)"), "x");
+        // `Debug` — what the iterators print — never collapses them either.
+        assert_eq!(format!("{:?}", FieldValue::Null), "Null");
+        assert_eq!(format!("{:?}", FieldValue::Text("")), r#"Text("")"#);
     }
 
     // -- Positions and names -------------------------------------------------
@@ -1163,7 +1210,10 @@ mod tests {
             update.command(),
             Some(ItemCommand::Unrecognized("MERGE_ROW".to_owned()))
         );
-        assert_eq!(update.command().unwrap().as_str(), "MERGE_ROW");
+        assert_eq!(
+            update.command().as_ref().map(ItemCommand::as_str),
+            Some("MERGE_ROW")
+        );
     }
 
     #[test]
@@ -1179,6 +1229,49 @@ mod tests {
         assert!(!update.is_command_mode());
         assert_eq!(update.key(), None);
         assert_eq!(update.command(), None);
+        assert!(!update.is_key_changed());
+        assert!(!update.is_command_changed());
+    }
+
+    #[test]
+    fn test_a_retained_command_is_reported_as_not_changed() {
+        // `SUBCMD,3,1,3,1,2`: key first, command second
+        // [`docs/spec/04-notifications.md` §3.2]. This update carried only the
+        // third field, so the key and command values it exposes are the ones an
+        // earlier update left behind [§2.2].
+        let schema = Arc::new(SubscriptionSchema::new(
+            1,
+            3,
+            &names(&["portfolio"]),
+            &names(&["key", "command", "qty"]),
+            Some((0, 1)),
+        ));
+        let update = ItemUpdate::new(
+            schema,
+            0,
+            UpdateKind::RealTime,
+            vec![
+                Some("AAPL".to_owned()),
+                Some("DELETE".to_owned()),
+                Some("10".to_owned()),
+            ],
+            vec![2],
+        );
+
+        // The field values are what the decoding algorithm produced...
+        assert_eq!(update.key(), Some(FieldValue::Text("AAPL")));
+        assert_eq!(update.command(), Some(ItemCommand::Delete));
+        // ...and this is the evidence that says they are not this update's
+        // doing, which is what a caller must check before deleting a row.
+        assert!(!update.is_key_changed());
+        assert!(!update.is_command_changed());
+    }
+
+    #[test]
+    fn test_a_carried_command_is_reported_as_changed() {
+        let update = command_update("AAPL", "DELETE");
+        assert!(update.is_key_changed());
+        assert!(update.is_command_changed());
     }
 
     #[test]

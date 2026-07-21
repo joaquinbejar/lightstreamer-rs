@@ -440,6 +440,16 @@ pub(crate) enum MaxFrequency {
     },
     /// The literal `unlimited`: no frequency limit is applied.
     Unlimited,
+    /// Neither a decimal number nor a literal this version knows.
+    ///
+    /// Kept apart from [`MaxFrequency::Limited`] so that a value which is not a
+    /// number cannot be handed to a caller as though it were one; the literal
+    /// is preserved so a future alternative is still visible
+    /// [`docs/spec/04-notifications.md` §3.8].
+    Unrecognized {
+        /// The argument as it arrived, after percent-decoding.
+        literal: String,
+    },
 }
 
 /// Whether a subscription's updates may be filtered
@@ -475,6 +485,13 @@ pub(crate) enum Bandwidth {
     /// additionally the client is **not allowed** to limit the bandwidth of
     /// this session.
     Unmanaged,
+    /// Neither a decimal number nor a literal this version knows — see
+    /// [`MaxFrequency::Unrecognized`]
+    /// [`docs/spec/04-notifications.md` §5.1].
+    Unrecognized {
+        /// The argument as it arrived, after percent-decoding.
+        literal: String,
+    },
 }
 
 /// The sequence a message was sent in, as echoed by `MSGDONE` / `MSGFAIL`
@@ -891,14 +908,13 @@ fn split_fixed<'a, const N: usize>(
 
     let mut arguments = [""; N];
     let mut parts = rest.splitn(N, ',');
-    let mut found = 0usize;
-    for slot in &mut arguments {
+    // `index` is how many arguments were filled before this one, which is
+    // exactly what the error has to report — counted by the iterator rather
+    // than by an addition of our own, so there is no arithmetic to overflow.
+    for (index, slot) in arguments.iter_mut().enumerate() {
         match parts.next() {
-            Some(part) => {
-                *slot = part;
-                found = found.saturating_add(1);
-            }
-            None => return Err(argument_count(tag, N, found)),
+            Some(part) => *slot = part,
+            None => return Err(argument_count(tag, N, index)),
         }
     }
     Ok(arguments)
@@ -942,15 +958,57 @@ fn number<T: FromStr>(tag: &str, argument: &'static str, value: &str) -> Result<
 fn parse_max_frequency(argument: &str) -> MaxFrequency {
     if argument == "unlimited" {
         MaxFrequency::Unlimited
-    } else {
-        // Anything else is the decimal form. It is kept verbatim: the spec
-        // never fixes its lexical form (flagged as ambiguity 16 in
-        // [`docs/spec/04-notifications.md` §7]), and this crate does not
-        // convert server-supplied numbers on the caller's behalf.
+    } else if is_decimal_number(argument) {
+        // The value is kept verbatim: this crate does not convert
+        // server-supplied numbers on the caller's behalf.
         MaxFrequency::Limited {
             updates_per_second: argument.to_owned(),
         }
+    } else {
+        MaxFrequency::Unrecognized {
+            literal: argument.to_owned(),
+        }
     }
+}
+
+/// Classify a `CONS` `<bandwidth>` argument
+/// [`docs/spec/04-notifications.md` §5.1].
+///
+/// The two literals are matched exactly, as in [`parse_max_frequency`].
+#[must_use]
+fn parse_bandwidth(argument: &str) -> Bandwidth {
+    match argument {
+        "unlimited" => Bandwidth::Unlimited,
+        "unmanaged" => Bandwidth::Unmanaged,
+        _ if is_decimal_number(argument) => Bandwidth::Limited {
+            kbps: argument.to_owned(),
+        },
+        _ => Bandwidth::Unrecognized {
+            literal: argument.to_owned(),
+        },
+    }
+}
+
+/// Whether a `CONF` or `CONS` argument is the decimal alternative.
+///
+/// SPEC-AMBIGUITY: the two notification sections type these arguments as "a
+/// decimal number" and give no grammar — flagged as ambiguity 16 in
+/// [`docs/spec/04-notifications.md` §7] for `CONF`, and §5.1 says no more for
+/// `CONS`. The grammar checked here is the one the specification *does* fix,
+/// for the request parameters that carry the same two quantities in the other
+/// direction: "a decimal number, with a **dot** as decimal separator"
+/// [`docs/spec/03-requests.md` §8.1, §9.1]. It is deliberately the very same
+/// predicate the encoder enforces on what this client sends, so the client
+/// cannot demand of the server a spelling it would not produce itself.
+///
+/// The strictness is therefore a **choice**, not a quotation: a server that
+/// wrote `+3`, `3.`, `3e2` or `3,0` would be reported as
+/// [`MaxFrequency::Unrecognized`] rather than as a limit. That is the point —
+/// a caller told "this is 3 updates/sec" when the server said something else
+/// acts on a number nobody sent.
+#[must_use]
+fn is_decimal_number(argument: &str) -> bool {
+    crate::protocol::request::DecimalNumber::try_new(argument).is_ok()
 }
 
 /// Classify a `CONF` `<filtered|unfiltered>` argument
@@ -967,22 +1025,6 @@ fn parse_filtering(argument: String) -> FilteringMode {
         // notification is well-formed and useful, and "unknown is not fatal"
         // is this crate's standing rule for forward compatibility.
         _ => FilteringMode::Unrecognized { literal: argument },
-    }
-}
-
-/// Classify a `CONS` `<bandwidth>` argument
-/// [`docs/spec/04-notifications.md` §5.1].
-///
-/// The two literals are matched exactly; everything else is the decimal form,
-/// which makes this total by construction.
-#[must_use]
-fn parse_bandwidth(argument: &str) -> Bandwidth {
-    match argument {
-        "unlimited" => Bandwidth::Unlimited,
-        "unmanaged" => Bandwidth::Unmanaged,
-        _ => Bandwidth::Limited {
-            kbps: argument.to_owned(),
-        },
     }
 }
 
@@ -1028,8 +1070,6 @@ fn not_numeric(tag: &str, argument: &'static str, value: &str) -> ProtocolError 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     // ---------------------------------------------------------------------
@@ -1256,6 +1296,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_max_frequency_accepts_only_the_two_specified_alternatives() {
+        // The decimal alternative, in the shapes the grammar allows
+        // [`docs/spec/03-requests.md` §8.1].
+        for text in ["3.0", "3", "0", "0.5", "12345.678", "007"] {
+            assert_eq!(
+                parse_max_frequency(text),
+                MaxFrequency::Limited {
+                    updates_per_second: text.to_owned(),
+                },
+                "{text:?} is a decimal number"
+            );
+        }
+        // The literal alternative, matched exactly [§3.8].
+        assert_eq!(parse_max_frequency("unlimited"), MaxFrequency::Unlimited);
+    }
+
+    #[test]
+    fn test_parse_max_frequency_does_not_pass_off_garbage_as_a_limit() {
+        // Empty, sign-only, whitespace, an exponent, a comma separator, a
+        // dangling dot, trailing garbage, a casing the spec does not give, and
+        // a hypothetical future literal. None of these is a number, and the
+        // caller must be able to tell that from the value alone.
+        for text in [
+            "",
+            "+",
+            "-3",
+            "+3.0",
+            " 3.0",
+            "3.0 ",
+            "3e2",
+            "3,0",
+            "3.",
+            ".5",
+            "3.0x",
+            "UNLIMITED",
+            "unfiltered",
+            "adaptive",
+        ] {
+            assert_eq!(
+                parse_max_frequency(text),
+                MaxFrequency::Unrecognized {
+                    literal: text.to_owned(),
+                },
+                "{text:?} must not be reported as a frequency limit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_max_frequency_keeps_an_overlong_number_verbatim() {
+        // A number far past any integer type is still a decimal number, and
+        // this crate never converts one: it is reported as the server wrote it
+        // rather than saturated or rejected.
+        let long = "1".repeat(200);
+        assert_eq!(
+            parse_max_frequency(&long),
+            MaxFrequency::Limited {
+                updates_per_second: long.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_line_conf_with_an_unreadable_frequency() {
+        assert_eq!(
+            parse_line("CONF,7,banana,filtered"),
+            Ok(Notification::SubscriptionReconfigured {
+                subscription_id: 7,
+                max_frequency: MaxFrequency::Unrecognized {
+                    literal: "banana".to_owned(),
+                },
+                // The rest of the line is well formed and still useful.
+                filtering: FilteringMode::Filtered,
+            })
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Message notifications
     // ---------------------------------------------------------------------
@@ -1364,6 +1482,42 @@ mod tests {
             parse_line("CONS,unmanaged"),
             Ok(Notification::ConstraintsChanged {
                 bandwidth: Bandwidth::Unmanaged
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_line_cons_with_an_unreadable_bandwidth() {
+        // An empty argument is the sharp case: `CONS,` used to become a
+        // bandwidth limit of `""`, which a caller cannot tell from a real
+        // constraint [`docs/spec/04-notifications.md` §5.1].
+        assert_eq!(
+            parse_line("CONS,"),
+            Ok(Notification::ConstraintsChanged {
+                bandwidth: Bandwidth::Unrecognized {
+                    literal: String::new(),
+                },
+            })
+        );
+        for text in ["-50", "50kbps", "5e3", "50,0", "UNMANAGED", "throttled"] {
+            assert_eq!(
+                parse_line(&format!("CONS,{text}")),
+                Ok(Notification::ConstraintsChanged {
+                    bandwidth: Bandwidth::Unrecognized {
+                        literal: text.to_owned(),
+                    },
+                }),
+                "{text:?} must not be reported as a bandwidth limit"
+            );
+        }
+        // The decimal alternative still parses, in both spellings the spec
+        // shows for these quantities [§5.1, p.61; §3.8, p.57].
+        assert_eq!(
+            parse_line("CONS,50.5"),
+            Ok(Notification::ConstraintsChanged {
+                bandwidth: Bandwidth::Limited {
+                    kbps: "50.5".to_owned(),
+                },
             })
         );
     }
@@ -1721,6 +1875,43 @@ mod tests {
             Err(ProtocolError::UnknownTag {
                 tag: String::new(),
                 line: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_line_unknown_tag_preserves_the_whole_line() {
+        // An unknown tag is reported with the line intact, whatever it carries:
+        // the arguments are not counted, not split and not decoded, because the
+        // argument count of a tag this client does not know is not knowable
+        // [`docs/spec/01-foundations.md` §7.1]. That is what lets a caller log
+        // or forward the original bytes.
+        let line = "FUTURE,1,two,three,with,commas,and%20an%20escape";
+        assert_eq!(
+            parse_line(line),
+            Err(ProtocolError::UnknownTag {
+                tag: "FUTURE".to_owned(),
+                line: line.to_owned(),
+            })
+        );
+
+        // The reported line is the one the parser worked on: the terminator the
+        // transport left behind is stripped, and nothing else is.
+        assert_eq!(
+            parse_line("FUTURE,a,b\r\n"),
+            Err(ProtocolError::UnknownTag {
+                tag: "FUTURE".to_owned(),
+                line: "FUTURE,a,b".to_owned(),
+            })
+        );
+
+        // A tag with a trailing comma and no argument at all still reports the
+        // line verbatim rather than an argument-count error.
+        assert_eq!(
+            parse_line("FUTURE,"),
+            Err(ProtocolError::UnknownTag {
+                tag: "FUTURE".to_owned(),
+                line: "FUTURE,".to_owned(),
             })
         );
     }

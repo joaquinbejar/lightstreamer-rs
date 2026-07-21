@@ -264,164 +264,204 @@ fn input_offset_of_decoded_byte(input: &str, decoded_offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     // ---- percent_decode: the borrow path -----------------------------------
 
     #[test]
-    fn test_percent_decode_no_escape_borrows() {
+    fn test_percent_decode_no_escape_borrows() -> Result<(), ProtocolError> {
         // A value with no `%` must not allocate.
-        let decoded = percent_decode("20:00:33").unwrap();
+        let decoded = percent_decode("20:00:33")?;
         assert!(matches!(decoded, Cow::Borrowed(_)));
         assert_eq!(decoded, "20:00:33");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_empty_input_borrows() {
+    fn test_percent_decode_empty_input_borrows() -> Result<(), ProtocolError> {
         // "An argument may be empty" [docs/spec/01-foundations.md §7.1].
-        let decoded = percent_decode("").unwrap();
+        let decoded = percent_decode("")?;
         assert!(matches!(decoded, Cow::Borrowed(_)));
         assert_eq!(decoded, "");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_non_ascii_without_escape_borrows() {
+    fn test_percent_decode_non_ascii_without_escape_borrows() -> Result<(), ProtocolError> {
         // Unencoded content is UTF-8 too [docs/spec/01-foundations.md §7.1],
         // so raw multi-byte characters pass through untouched.
-        let decoded = percent_decode("Suspended — é€🚀").unwrap();
+        let decoded = percent_decode("Suspended — é€🚀")?;
         assert!(matches!(decoded, Cow::Borrowed(_)));
         assert_eq!(decoded, "Suspended — é€🚀");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_with_escape_allocates() {
-        let decoded = percent_decode("aa%7Cbb").unwrap();
+    fn test_percent_decode_with_escape_allocates() -> Result<(), ProtocolError> {
+        let decoded = percent_decode("aa%7Cbb")?;
         assert!(matches!(decoded, Cow::Owned(_)));
+
+        Ok(())
     }
 
     // ---- percent_decode: the spec's own examples ---------------------------
 
     #[test]
-    fn test_percent_decode_spec_pipe_example_decodes_separator() {
+    fn test_percent_decode_spec_pipe_example_decodes_separator() -> Result<(), ProtocolError> {
         // `docs/spec/04-notifications.md` §2.6, diff example 1 [p.52]:
         // the field value `aa%7Cbb` decodes to `aa|bb`.
-        assert_eq!(percent_decode("aa%7Cbb").unwrap(), "aa|bb");
+        assert_eq!(percent_decode("aa%7Cbb")?, "aa|bb");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_spec_snapshot_json_example_decodes_separator() {
+    fn test_percent_decode_spec_snapshot_json_example_decodes_separator()
+    -> Result<(), ProtocolError> {
         // `docs/spec/04-notifications.md` §2.6, diff example 1 [p.52]: the
         // whole `text` field of the snapshot, verbatim from the printed page.
         let wire = r#"{ "text": "aa%7Cbb", "attributes": [ { "font": "courier" }, "..." ] }"#;
         let expected = r#"{ "text": "aa|bb", "attributes": [ { "font": "courier" }, "..." ] }"#;
-        assert_eq!(percent_decode(wire).unwrap(), expected);
+        assert_eq!(percent_decode(wire)?, expected);
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_spec_json_patch_payload_decodes_separators() {
+    fn test_percent_decode_spec_json_patch_payload_decodes_separators() -> Result<(), ProtocolError>
+    {
         // `docs/spec/04-notifications.md` §2.6, diff example 2 [p.53]: the
         // payload following `^P`, which §2.3 says to percent-decode.
         let wire = r#"[{"op":"replace","path":"/text","value":"aa%7Cbb%7Ccc"},{"op":"add","path":"/attributes/1","value":"bold"}]"#;
         let expected = r#"[{"op":"replace","path":"/text","value":"aa|bb|cc"},{"op":"add","path":"/attributes/1","value":"bold"}]"#;
-        assert_eq!(percent_decode(wire).unwrap(), expected);
+        assert_eq!(percent_decode(wire)?, expected);
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_marker_characters_decode_to_themselves() {
+    fn test_percent_decode_marker_characters_decode_to_themselves() -> Result<(), ProtocolError> {
         // `#` (0x23), `$` (0x24) and `^` (0x5E) are percent-encoded when they
         // start actual content [docs/spec/04-notifications.md §2.2, p.51].
-        assert_eq!(percent_decode("%23").unwrap(), "#");
-        assert_eq!(percent_decode("%24").unwrap(), "$");
-        assert_eq!(percent_decode("%5E").unwrap(), "^");
+        assert_eq!(percent_decode("%23")?, "#");
+        assert_eq!(percent_decode("%24")?, "$");
+        assert_eq!(percent_decode("%5E")?, "^");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_line_terminator_decodes() {
+    fn test_percent_decode_line_terminator_decodes() -> Result<(), ProtocolError> {
         // CR-LF is a meta character inside the value list
         // [docs/spec/04-notifications.md §2.2].
-        assert_eq!(percent_decode("a%0D%0Ab").unwrap(), "a\r\nb");
+        assert_eq!(percent_decode("a%0D%0Ab")?, "a\r\nb");
+
+        Ok(())
     }
 
     // ---- percent_decode: hex digit handling --------------------------------
 
     #[test]
-    fn test_percent_decode_lowercase_hex_decodes() {
-        assert_eq!(percent_decode("aa%7cbb").unwrap(), "aa|bb");
+    fn test_percent_decode_lowercase_hex_decodes() -> Result<(), ProtocolError> {
+        assert_eq!(percent_decode("aa%7cbb")?, "aa|bb");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_uppercase_hex_decodes() {
-        assert_eq!(percent_decode("aa%7Cbb").unwrap(), "aa|bb");
+    fn test_percent_decode_uppercase_hex_decodes() -> Result<(), ProtocolError> {
+        assert_eq!(percent_decode("aa%7Cbb")?, "aa|bb");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_mixed_case_hex_decodes() {
+    fn test_percent_decode_mixed_case_hex_decodes() -> Result<(), ProtocolError> {
         // Case may differ between the two digits of one escape, and between
         // the escapes of one multi-byte character.
-        assert_eq!(percent_decode("%2c%2C").unwrap(), ",,");
-        assert_eq!(percent_decode("%c3%A9").unwrap(), "é");
-        assert_eq!(percent_decode("%eF%bF%bD").unwrap(), "\u{FFFD}");
+        assert_eq!(percent_decode("%2c%2C")?, ",,");
+        assert_eq!(percent_decode("%c3%A9")?, "é");
+        assert_eq!(percent_decode("%eF%bF%bD")?, "\u{FFFD}");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_escaped_percent_is_not_decoded_twice() {
+    fn test_percent_decode_escaped_percent_is_not_decoded_twice() -> Result<(), ProtocolError> {
         // `%25` is a percent sign; the result must not be re-scanned.
-        assert_eq!(percent_decode("%25").unwrap(), "%");
-        assert_eq!(percent_decode("%2525").unwrap(), "%25");
-        assert_eq!(percent_decode("100%25").unwrap(), "100%");
+        assert_eq!(percent_decode("%25")?, "%");
+        assert_eq!(percent_decode("%2525")?, "%25");
+        assert_eq!(percent_decode("100%25")?, "100%");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_nul_byte_decodes() {
+    fn test_percent_decode_nul_byte_decodes() -> Result<(), ProtocolError> {
         // 0x00 is valid UTF-8 and carries no protocol meaning.
-        assert_eq!(percent_decode("a%00b").unwrap(), "a\0b");
+        assert_eq!(percent_decode("a%00b")?, "a\0b");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_plus_is_left_literal() {
+    fn test_percent_decode_plus_is_left_literal() -> Result<(), ProtocolError> {
         // SPEC-AMBIGUITY (see the `+` note above): percent-encoding is the
         // only escaping mechanism in the downstream direction
         // [docs/spec/01-foundations.md §7.2], so `+` is a plus sign, never a
         // space.
-        let decoded = percent_decode("a+b").unwrap();
+        let decoded = percent_decode("a+b")?;
         assert!(matches!(decoded, Cow::Borrowed(_)));
         assert_eq!(decoded, "a+b");
-        assert_eq!(percent_decode("a%2Bb").unwrap(), "a+b");
+        assert_eq!(percent_decode("a%2Bb")?, "a+b");
+
+        Ok(())
     }
 
     // ---- percent_decode: multi-byte UTF-8 assembly -------------------------
 
     #[test]
-    fn test_percent_decode_two_byte_sequence_assembles() {
-        assert_eq!(percent_decode("%C3%A9").unwrap(), "é");
+    fn test_percent_decode_two_byte_sequence_assembles() -> Result<(), ProtocolError> {
+        assert_eq!(percent_decode("%C3%A9")?, "é");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_three_byte_sequence_assembles() {
-        assert_eq!(percent_decode("%E2%82%AC").unwrap(), "€");
+    fn test_percent_decode_three_byte_sequence_assembles() -> Result<(), ProtocolError> {
+        assert_eq!(percent_decode("%E2%82%AC")?, "€");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_four_byte_sequence_assembles() {
-        assert_eq!(percent_decode("%F0%9F%9A%80").unwrap(), "🚀");
+    fn test_percent_decode_four_byte_sequence_assembles() -> Result<(), ProtocolError> {
+        assert_eq!(percent_decode("%F0%9F%9A%80")?, "🚀");
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_multibyte_between_literals_assembles() {
+    fn test_percent_decode_multibyte_between_literals_assembles() -> Result<(), ProtocolError> {
         // The bytes of one character arrive as consecutive escapes and must be
         // assembled before the UTF-8 check
         // [docs/spec/01-foundations.md §7.1: UTF-8 for encoded content too].
         assert_eq!(
-            percent_decode("caf%C3%A9 %E2%82%AC5 %F0%9F%9A%80!").unwrap(),
+            percent_decode("caf%C3%A9 %E2%82%AC5 %F0%9F%9A%80!")?,
             "café €5 🚀!"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_percent_decode_escaped_and_raw_multibyte_mix_assembles() {
-        assert_eq!(percent_decode("é%C3%A9é").unwrap(), "ééé");
+    fn test_percent_decode_escaped_and_raw_multibyte_mix_assembles() -> Result<(), ProtocolError> {
+        assert_eq!(percent_decode("é%C3%A9é")?, "ééé");
+
+        Ok(())
     }
 
     // ---- percent_decode: malformed escapes ---------------------------------
@@ -514,15 +554,12 @@ mod tests {
     #[test]
     fn test_percent_decode_truncated_utf8_sequence_errors() {
         // 0xC3 starts a two-byte sequence; 0x28 (`(`) is not a continuation.
-        assert_eq!(
-            percent_decode("%C3%28").unwrap_err(),
-            unsupported_utf8_err(0)
-        );
+        assert_eq!(percent_decode("%C3%28"), Err(unsupported_utf8_err(0)));
     }
 
     #[test]
     fn test_percent_decode_lone_continuation_byte_errors() {
-        assert_eq!(percent_decode("%80").unwrap_err(), unsupported_utf8_err(0));
+        assert_eq!(percent_decode("%80"), Err(unsupported_utf8_err(0)));
     }
 
     #[test]
@@ -531,29 +568,20 @@ mod tests {
         // decoded buffer — but byte 2 of the *input* is inside the first
         // escape. The reported position must be 6, where the bad sequence
         // actually starts on the wire.
-        assert_eq!(
-            percent_decode("%C3%A9%C3%28").unwrap_err(),
-            unsupported_utf8_err(6)
-        );
+        assert_eq!(percent_decode("%C3%A9%C3%28"), Err(unsupported_utf8_err(6)));
     }
 
     #[test]
     fn test_percent_decode_invalid_utf8_after_literals_position_is_an_input_offset() {
         // Two literal bytes, then a lone 0xFF.
-        assert_eq!(
-            percent_decode("ab%FF").unwrap_err(),
-            unsupported_utf8_err(2)
-        );
+        assert_eq!(percent_decode("ab%FF"), Err(unsupported_utf8_err(2)));
     }
 
     #[test]
     fn test_percent_decode_surrogate_encoding_errors() {
         // 0xED 0xA0 0x80 is the CESU-8 encoding of a UTF-16 surrogate; it is
         // not valid UTF-8, and §7.1 mandates UTF-8.
-        assert_eq!(
-            percent_decode("%ED%A0%80").unwrap_err(),
-            unsupported_utf8_err(0)
-        );
+        assert_eq!(percent_decode("%ED%A0%80"), Err(unsupported_utf8_err(0)));
     }
 
     // ---- encode_form_value: the borrow path --------------------------------
@@ -652,7 +680,7 @@ mod tests {
     // ---- round trips -------------------------------------------------------
 
     #[test]
-    fn test_encode_then_decode_round_trips() {
+    fn test_encode_then_decode_round_trips() -> Result<(), ProtocolError> {
         let cases = [
             "",
             "plain",
@@ -667,9 +695,11 @@ mod tests {
         ];
         for case in cases {
             let encoded = encode_form_value(case);
-            let decoded = percent_decode(&encoded).unwrap();
+            let decoded = percent_decode(&encoded)?;
             assert_eq!(decoded, case, "round trip failed for {case:?}");
         }
+
+        Ok(())
     }
 
     // ---- helper units ------------------------------------------------------

@@ -16,10 +16,6 @@
 //!
 //! Source: `docs/spec/04-notifications.md` §2, §3.
 
-// Consumed by the session layer and the client façade, which do not consume it
-// yet (see `docs/SPEC.md`, implementation order steps 4-5).
-#![allow(dead_code)]
-
 pub(crate) mod item_update;
 pub(crate) mod manager;
 pub(crate) mod update;
