@@ -61,7 +61,13 @@ async fn run() -> lightstreamer_rs::Result<()> {
         .build()?;
 
     println!("connecting to {DEMO_SERVER} …");
-    let (client, _session_events) = Client::connect(config).await?;
+    // This example is about COMMAND mode, not about reconnection, so it opts
+    // out of the session events — with a `drop`, not an underscore. Naming the
+    // receiver `_session_events` would keep it alive and unread, and an unread
+    // stream stalls the client once it fills. `demo_quotes` shows the other
+    // half: consuming them on a task of their own.
+    let (client, session_events) = Client::connect(config).await?;
+    drop(session_events);
 
     let subscription = Subscription::new(
         SubscriptionMode::Command,

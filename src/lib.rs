@@ -25,7 +25,12 @@
 //!         .with_adapter_set(AdapterSet::try_new("DEMO")?)
 //!         .build()?;
 //!
-//!     let (client, _session_events) = Client::connect(config).await?;
+//!     // This example is only interested in the data. Opting out of the
+//!     // session events is a `drop`, not an underscore: naming a receiver
+//!     // `_session_events` would *keep* it, and a stream that is held but
+//!     // never read stalls the client once it fills. See `SessionEvents`.
+//!     let (client, session_events) = Client::connect(config).await?;
+//!     drop(session_events);
 //!
 //!     let mut updates = client
 //!         .subscribe(
@@ -162,13 +167,22 @@ mod session;
 mod subscription;
 mod transport;
 
+/// What every redacting [`Debug`] renders in place of the value it is hiding.
+///
+/// One spelling, in one place, so that a test can look for it and so that no
+/// type invents its own. The policy it stands for is narrow and absolute:
+/// a value that authenticates or identifies — a password, a user name, a
+/// session identifier — crosses this crate's **API** boundary, where the
+/// caller asked for it, and never its **logging** boundary, where nobody did.
+pub(crate) const REDACTED: &str = "<redacted>";
+
 // --- The client -------------------------------------------------------------
 pub use client::Client;
 
 // --- Configuration ----------------------------------------------------------
 pub use config::{
     AdapterSet, ClientConfig, ClientConfigBuilder, ConfigError, ConnectionOptions, Credentials,
-    RetryPolicy, ServerAddress, Transport,
+    MAX_TIMING, RetryPolicy, ServerAddress, Transport,
 };
 
 // --- Describing a subscription ----------------------------------------------
@@ -191,7 +205,7 @@ pub use client::{Message, MessageOutcome, MessageResult, SequenceName};
 // --- Consuming the session --------------------------------------------------
 pub use client::{
     ClosedReason, Connected, Continuity, DisconnectReason, Recovery, RecoveryOutcome, Resubscribed,
-    ServerInfo, SessionEvent, SessionEvents,
+    ServerInfo, SessionEvent, SessionEvents, StateValidity,
 };
 
 // --- Errors -----------------------------------------------------------------

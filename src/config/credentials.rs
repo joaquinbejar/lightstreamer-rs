@@ -10,6 +10,7 @@
 
 use std::fmt;
 
+use crate::REDACTED;
 use crate::config::ConfigError;
 
 /// The name of the Adapter Set that will serve a session.
@@ -85,16 +86,24 @@ impl fmt::Display for AdapterSet {
 /// # Secrecy
 ///
 /// This crate never reads credentials from the environment, from a file, or
-/// from anywhere else: you supply them. The password is never logged and never
+/// from anywhere else: you supply them. Neither half is ever logged, neither
 /// appears in any [`Error`](crate::Error) this crate produces, and the
-/// hand-written [`Debug`] implementation redacts it, so a `{:?}` of a config
-/// struct that happens to contain one is safe.
+/// hand-written [`Debug`] implementation redacts **both**, so a `{:?}` of a
+/// config struct that happens to contain one is safe.
+///
+/// The user name is redacted as well as the password because it is not always
+/// the innocuous half: adapters routinely authenticate with an account
+/// identifier or an API key as the user name, and a `Debug` that printed it
+/// would put that in a log by accident. When you want it, ask for it —
+/// [`Credentials::user`] returns it and says so at the call site.
 ///
 /// ```
 /// use lightstreamer_rs::Credentials;
 ///
 /// let credentials = Credentials::new("alice", "hunter2");
-/// assert!(!format!("{credentials:?}").contains("hunter2"));
+/// let rendered = format!("{credentials:?}");
+/// assert!(!rendered.contains("hunter2"));
+/// assert!(!rendered.contains("alice"));
 /// ```
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Credentials {
@@ -163,10 +172,14 @@ impl Credentials {
 }
 
 impl fmt::Debug for Credentials {
+    /// Reports which halves are set and neither of their values.
+    ///
+    /// Written by hand rather than derived so that no `{:?}` anywhere — this
+    /// crate's, the caller's, or a panic message's — can print a credential.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credentials")
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("user", &self.user.as_ref().map(|_| REDACTED))
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
             .finish()
     }
 }
@@ -208,12 +221,46 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_debug_redacts_the_password() {
+    fn test_credentials_debug_redacts_both_halves() {
+        // A-01: neither half may reach a `{:?}`. The user name is not the
+        // innocuous one — with many adapters it *is* the account identifier.
         let credentials = Credentials::new("alice", "hunter2");
         let rendered = format!("{credentials:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
-        assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(rendered.contains("alice"), "{rendered}");
+        assert!(!rendered.contains("alice"), "{rendered}");
+        assert!(rendered.contains(REDACTED), "{rendered}");
+    }
+
+    #[test]
+    fn test_credentials_debug_still_says_which_halves_are_set() {
+        // Redaction must not cost the diagnostic value: "is a password set at
+        // all" is the question a caller debugging an authentication failure
+        // actually asks.
+        let anonymous = format!("{:?}", Credentials::anonymous());
+        assert!(anonymous.contains("None"), "{anonymous}");
+        let user_only = format!("{:?}", Credentials::user_only("alice"));
+        assert!(user_only.contains(REDACTED), "{user_only}");
+        assert!(user_only.contains("None"), "{user_only}");
+    }
+
+    #[test]
+    fn test_a_config_holding_credentials_leaks_nothing_through_debug() {
+        // The realistic path: nobody formats `Credentials`, they format the
+        // whole configuration.
+        let Ok(address) = crate::ServerAddress::try_new("wss://push.example.com") else {
+            unreachable!("the fixture address is valid");
+        };
+        let built = crate::ClientConfig::builder(address)
+            .with_credentials(Credentials::new("alice", "hunter2"))
+            .build();
+        match built {
+            Ok(config) => {
+                let rendered = format!("{config:?}");
+                assert!(!rendered.contains("hunter2"), "{rendered}");
+                assert!(!rendered.contains("alice"), "{rendered}");
+            }
+            Err(error) => panic!("the fixture configuration is valid: {error}"),
+        }
     }
 
     #[test]

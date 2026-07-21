@@ -468,6 +468,18 @@ impl BufferSize {
 /// [`Subscription::new`]; everything else is optional and defaults to letting
 /// the server decide.
 ///
+/// # Not every combination is a subscription
+///
+/// The optional parameters are not independent of the mode: a snapshot length
+/// is admitted only in [`SubscriptionMode::Distinct`], and a snapshot, a
+/// frequency cap and a buffer size are each meaningless in
+/// [`SubscriptionMode::Raw`] [`docs/spec/03-requests.md` §6.1]. The setters
+/// stay infallible so that they chain, and the whole combination is checked at
+/// once by [`Subscription::validate`] — which
+/// [`Client::subscribe`](crate::Client::subscribe) calls before anything is
+/// sent, so an impossible subscription is a typed error at the call rather
+/// than a stream that never activates.
+///
 /// # Examples
 ///
 /// ```
@@ -580,6 +592,85 @@ impl Subscription {
     #[inline]
     pub const fn snapshot(&self) -> Snapshot {
         self.snapshot
+    }
+
+    /// Checks that the mode admits every option this subscription carries.
+    ///
+    /// [`Client::subscribe`](crate::Client::subscribe) calls this first, so a
+    /// caller never has to; it is public because checking a configuration
+    /// before a client exists is sometimes what you want, and because the
+    /// error is more useful at the line that built the subscription than at
+    /// the line that sent it.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::SnapshotLengthNeedsDistinct`] — a
+    ///   [`Snapshot::Length`] outside [`SubscriptionMode::Distinct`]. This one
+    ///   is the specification's own rule: a length is "admitted only if
+    ///   `LS_mode` is `DISTINCT`" [`docs/spec/03-requests.md` §6.1].
+    /// - [`ConfigError::SnapshotNeedsAStatefulMode`] — a snapshot in
+    ///   [`SubscriptionMode::Raw`], which keeps no state to snapshot.
+    /// - [`ConfigError::FrequencyNeedsAFilteredMode`] — a frequency cap in
+    ///   [`SubscriptionMode::Raw`], which the server does not filter.
+    /// - [`ConfigError::BufferSizeNeedsMergeOrDistinct`] — a buffer size
+    ///   outside [`SubscriptionMode::Merge`] and [`SubscriptionMode::Distinct`].
+    /// - [`ConfigError::BufferSizeWithUnfilteredFrequency`] — a buffer size
+    ///   alongside [`MaxFrequency::Unfiltered`], which the server ignores.
+    ///
+    /// The last four are refused rather than dropped. The server would accept
+    /// the request and ignore the parameter [`docs/spec/03-requests.md` §6.1],
+    /// which means a caller who asked for a cap would run without one and
+    /// never be told — a silent difference between what was written and what
+    /// is happening.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lightstreamer_rs::{
+    ///     ConfigError, FieldSchema, ItemGroup, Snapshot, Subscription, SubscriptionMode,
+    /// };
+    ///
+    /// let raw = Subscription::new(
+    ///     SubscriptionMode::Raw,
+    ///     ItemGroup::from_items(["item1"])?,
+    ///     FieldSchema::from_fields(["last_price"])?,
+    /// )
+    /// .with_snapshot(Snapshot::On);
+    ///
+    /// assert!(matches!(
+    ///     raw.validate(),
+    ///     Err(ConfigError::SnapshotNeedsAStatefulMode)
+    /// ));
+    /// # Ok::<(), ConfigError>(())
+    /// ```
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let filtered = !matches!(self.mode, SubscriptionMode::Raw);
+
+        if matches!(self.snapshot, Snapshot::Length(_)) && self.mode != SubscriptionMode::Distinct {
+            return Err(ConfigError::SnapshotLengthNeedsDistinct {
+                mode: self.mode.as_str(),
+            });
+        }
+        if self.snapshot.is_requested() && !filtered {
+            return Err(ConfigError::SnapshotNeedsAStatefulMode);
+        }
+        if !matches!(self.max_frequency, MaxFrequency::Unlimited) && !filtered {
+            return Err(ConfigError::FrequencyNeedsAFilteredMode);
+        }
+        if !matches!(self.buffer_size, BufferSize::ServerDecides) {
+            if !matches!(
+                self.mode,
+                SubscriptionMode::Merge | SubscriptionMode::Distinct
+            ) {
+                return Err(ConfigError::BufferSizeNeedsMergeOrDistinct {
+                    mode: self.mode.as_str(),
+                });
+            }
+            if matches!(self.max_frequency, MaxFrequency::Unfiltered) {
+                return Err(ConfigError::BufferSizeWithUnfilteredFrequency);
+            }
+        }
+        Ok(())
     }
 
     /// The item names the caller declared, or an empty vector for a
@@ -777,6 +868,141 @@ mod tests {
             spec.requested_max_frequency,
             Some(RequestedMaxFrequency::Limited(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // A-02: every mode-specific constraint fails at the public boundary
+    // -----------------------------------------------------------------------
+
+    fn subscription(mode: SubscriptionMode) -> Subscription {
+        Subscription::new(mode, group(), schema())
+    }
+
+    #[test]
+    fn test_a_plain_subscription_validates_in_every_mode() {
+        for mode in [
+            SubscriptionMode::Raw,
+            SubscriptionMode::Merge,
+            SubscriptionMode::Distinct,
+            SubscriptionMode::Command,
+        ] {
+            assert!(
+                subscription(mode).validate().is_ok(),
+                "{} was rejected",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_snapshot_length_is_refused_outside_distinct_mode() {
+        // The spec's own admissibility rule [`docs/spec/03-requests.md` §6.1].
+        for mode in [
+            SubscriptionMode::Raw,
+            SubscriptionMode::Merge,
+            SubscriptionMode::Command,
+        ] {
+            let built = subscription(mode).with_snapshot(Snapshot::Length(NonZeroU32::MIN));
+            assert!(
+                matches!(
+                    built.validate(),
+                    Err(ConfigError::SnapshotLengthNeedsDistinct { mode: named }) if named == mode.as_str()
+                ),
+                "{} accepted a snapshot length",
+                mode.as_str()
+            );
+        }
+        assert!(
+            subscription(SubscriptionMode::Distinct)
+                .with_snapshot(Snapshot::Length(NonZeroU32::MIN))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_a_snapshot_is_refused_in_raw_mode() {
+        assert!(matches!(
+            subscription(SubscriptionMode::Raw)
+                .with_snapshot(Snapshot::On)
+                .validate(),
+            Err(ConfigError::SnapshotNeedsAStatefulMode)
+        ));
+        // `Snapshot::Off` is the default and asks for nothing, so it stays legal.
+        assert!(
+            subscription(SubscriptionMode::Raw)
+                .with_snapshot(Snapshot::Off)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_a_frequency_is_refused_in_raw_mode() {
+        let Ok(limited) = MaxFrequency::limited("2.0") else {
+            unreachable!("the fixture frequency is valid");
+        };
+        for frequency in [MaxFrequency::Unfiltered, limited] {
+            assert!(
+                matches!(
+                    subscription(SubscriptionMode::Raw)
+                        .with_max_frequency(frequency.clone())
+                        .validate(),
+                    Err(ConfigError::FrequencyNeedsAFilteredMode)
+                ),
+                "{frequency:?} was accepted with RAW"
+            );
+        }
+        assert!(
+            subscription(SubscriptionMode::Raw)
+                .with_max_frequency(MaxFrequency::Unlimited)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_a_buffer_size_is_refused_outside_merge_and_distinct() {
+        for mode in [SubscriptionMode::Raw, SubscriptionMode::Command] {
+            assert!(
+                matches!(
+                    subscription(mode)
+                        .with_buffer_size(BufferSize::Unlimited)
+                        .validate(),
+                    Err(ConfigError::BufferSizeNeedsMergeOrDistinct { mode: named }) if named == mode.as_str()
+                ),
+                "{} accepted a buffer size",
+                mode.as_str()
+            );
+        }
+        for mode in [SubscriptionMode::Merge, SubscriptionMode::Distinct] {
+            assert!(
+                subscription(mode)
+                    .with_buffer_size(BufferSize::Events(NonZeroU32::MIN))
+                    .validate()
+                    .is_ok(),
+                "{} rejected a buffer size",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_buffer_size_is_refused_alongside_an_unfiltered_frequency() {
+        assert!(matches!(
+            subscription(SubscriptionMode::Merge)
+                .with_max_frequency(MaxFrequency::Unfiltered)
+                .with_buffer_size(BufferSize::Unlimited)
+                .validate(),
+            Err(ConfigError::BufferSizeWithUnfilteredFrequency)
+        ));
+        // Either alone is fine; it is the pair the server ignores.
+        assert!(
+            subscription(SubscriptionMode::Merge)
+                .with_max_frequency(MaxFrequency::Unfiltered)
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

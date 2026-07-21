@@ -169,6 +169,53 @@ impl Message {
         &self.inner.message
     }
 
+    /// Checks that the parts of this message can be sent together.
+    ///
+    /// [`Client::send_message`](crate::Client::send_message) calls this first,
+    /// so a caller never has to; it is public for the same reason
+    /// [`Subscription::validate`](crate::Subscription::validate) is.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::SequencedMessageNeedsAProgressive`] if a
+    ///   [`Message::fire_and_forget`] message was placed in a sequence. A
+    ///   sequence orders messages *by their progressive*, and a
+    ///   fire-and-forget message has none: `LS_msg_prog` is "mandatory
+    ///   whenever `LS_sequence` is specified"
+    ///   [`docs/spec/03-requests.md` §12.1]. The two are not a combination the
+    ///   protocol leaves open.
+    /// - [`ConfigError::MaxWaitNeedsASequence`] if
+    ///   [`Message::with_max_wait`] was used on a message in no sequence,
+    ///   where it names how long to wait for messages that do not exist. The
+    ///   server ignores it there [`docs/spec/03-requests.md` §12.1]; this
+    ///   crate refuses it, so that a caller who set a bound is never silently
+    ///   running without one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lightstreamer_rs::{ConfigError, Message, SequenceName};
+    ///
+    /// let impossible = Message::fire_and_forget("BUY 100")
+    ///     .in_sequence(SequenceName::try_new("ORDERS")?);
+    ///
+    /// assert!(matches!(
+    ///     impossible.validate(),
+    ///     Err(ConfigError::SequencedMessageNeedsAProgressive)
+    /// ));
+    /// # Ok::<(), ConfigError>(())
+    /// ```
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let sequenced = self.inner.sequence.is_some();
+        if sequenced && self.inner.msg_prog.is_none() {
+            return Err(ConfigError::SequencedMessageNeedsAProgressive);
+        }
+        if self.inner.max_wait_millis.is_some() && !sequenced {
+            return Err(ConfigError::MaxWaitNeedsASequence);
+        }
+        Ok(())
+    }
+
     /// Hands the payload to the session layer.
     pub(crate) fn into_outgoing(self) -> OutgoingMessage {
         self.inner
@@ -345,6 +392,80 @@ mod tests {
             Message::fire_and_forget("x").with_max_wait(Duration::MAX),
             Err(ConfigError::DurationTooLarge { field: "max_wait" })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // A-03: an impossible message is refused before it is sent
+    // -----------------------------------------------------------------------
+
+    fn sequence() -> SequenceName {
+        match SequenceName::try_new("ORDERS") {
+            Ok(name) => name,
+            Err(error) => unreachable!("the fixture sequence name is valid: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_a_fire_and_forget_message_cannot_be_sequenced() {
+        // A sequence orders messages by a progressive this one does not have
+        // [`docs/spec/03-requests.md` §12.1].
+        assert!(matches!(
+            Message::fire_and_forget("BUY 100")
+                .in_sequence(sequence())
+                .validate(),
+            Err(ConfigError::SequencedMessageNeedsAProgressive)
+        ));
+    }
+
+    #[test]
+    fn test_a_max_wait_needs_a_sequence() {
+        let built = Message::new("BUY 100", NonZeroU32::MIN).with_max_wait(Duration::from_secs(1));
+        match built {
+            Ok(message) => assert!(matches!(
+                message.validate(),
+                Err(ConfigError::MaxWaitNeedsASequence)
+            )),
+            Err(error) => panic!("a one-second wait is expressible: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_a_sequenced_numbered_message_with_a_wait_is_valid() {
+        let built = Message::new("BUY 100", NonZeroU32::MIN)
+            .in_sequence(sequence())
+            .with_max_wait(Duration::from_secs(1));
+        match built {
+            Ok(message) => assert!(message.validate().is_ok()),
+            Err(error) => panic!("a one-second wait is expressible: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_the_plain_shapes_are_valid() {
+        assert!(Message::fire_and_forget("hello").validate().is_ok());
+        assert!(Message::new("hello", NonZeroU32::MIN).validate().is_ok());
+        assert!(
+            Message::new("hello", NonZeroU32::MIN)
+                .in_sequence(sequence())
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_a_zero_max_wait_is_a_boundary_not_an_error() {
+        // Zero means "do not wait for the ones before it", which is a request
+        // the server can honour.
+        let built = Message::new("BUY 100", NonZeroU32::MIN)
+            .in_sequence(sequence())
+            .with_max_wait(Duration::ZERO);
+        match built {
+            Ok(message) => {
+                assert!(message.validate().is_ok());
+                assert_eq!(message.into_outgoing().max_wait_millis, Some(0));
+            }
+            Err(error) => panic!("zero is expressible in milliseconds: {error}"),
+        }
     }
 
     #[test]

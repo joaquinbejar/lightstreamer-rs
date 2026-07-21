@@ -114,6 +114,11 @@ async fn watch_session(mut events: SessionEvents, updates_seen: Arc<AtomicU64>) 
         match event {
             SessionEvent::Connected(connected) => match &connected.continuity {
                 Continuity::New => {
+                    // Printed here because this is a public demo server and
+                    // seeing the id is the point. The crate itself never logs
+                    // it: `LS_session` is what a control request names the
+                    // session with, so against a real account treat it the way
+                    // you treat a token.
                     banner(&format!("session {} opened", connected.session_id));
                 }
                 Continuity::Preserved => {

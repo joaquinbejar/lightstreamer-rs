@@ -152,6 +152,9 @@ async fn watch_session(mut events: SessionEvents) {
     while let Some(event) = events.next().await {
         match event {
             SessionEvent::Connected(connected) => match &connected.continuity {
+                // The id is printed because this is the public demo server. The
+                // crate never logs it itself: it is what a control request
+                // names the session with, so treat it as a token elsewhere.
                 Continuity::New => println!("session {} opened", connected.session_id),
                 Continuity::Preserved => println!("reconnected; nothing was lost"),
                 Continuity::Recovered { requested_from } => {

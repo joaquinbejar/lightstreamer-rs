@@ -60,13 +60,25 @@ use std::sync::Arc;
 ///
 /// # Examples
 ///
-/// ```ignore
-/// match update.field_by_name("bid") {
-///     Some(FieldValue::Text(bid)) => println!("bid is {bid}"),
-///     Some(FieldValue::Null) => println!("there is no bid"),
-///     None => println!("this subscription has no `bid` field"),
+/// An [`ItemUpdate`] is obtained from a live subscription, so the example is
+/// written as the function you would pass one to — which compiles, and so
+/// keeps saying something true:
+///
+/// ```
+/// use lightstreamer_rs::{FieldValue, ItemUpdate};
+///
+/// fn report_bid(update: &ItemUpdate) {
+///     match update.field_by_name("bid") {
+///         Some(FieldValue::Text(bid)) => println!("bid is {bid}"),
+///         Some(FieldValue::Null) => println!("there is no bid"),
+///         None => println!("this subscription has no `bid` field"),
+///     }
 /// }
 /// ```
+///
+/// The three arms are the three answers, and they are not
+/// interchangeable: `Text("")` is a fourth thing again — a value that happens
+/// to be empty. Use [`is_empty_text`](FieldValue::is_empty_text) to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldValue<'a> {
     /// The field has no value — the `#` marker
@@ -441,11 +453,22 @@ impl SubscriptionSchema {
 /// subscription, plus which of its fields this update actually changed.
 ///
 /// This is what a caller consumes from the subscription's event stream
-/// (`docs/adr/0003-typed-event-stream-as-delivery-surface.md`):
+/// (`docs/adr/0003-typed-event-stream-as-delivery-surface.md`) — but not
+/// *directly*: [`Updates`](crate::Updates) yields a
+/// [`SubscriptionEvent`](crate::SubscriptionEvent), of which an update is one
+/// variant among the things that can happen to a subscription. Matching it out
+/// is the loop:
 ///
-/// ```ignore
-/// while let Some(update) = updates.next().await {
-///     println!("{}: {:?}", update.item_name(), update.changed_fields());
+/// ```
+/// use futures_util::StreamExt;
+/// use lightstreamer_rs::{SubscriptionEvent, Updates};
+///
+/// async fn print_changes(mut updates: Updates) {
+///     while let Some(event) = updates.next().await {
+///         if let SubscriptionEvent::Update(update) = event {
+///             println!("{}: {:?}", update.item_name(), update.changed_fields());
+///         }
+///     }
 /// }
 /// ```
 ///

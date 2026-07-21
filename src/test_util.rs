@@ -393,12 +393,12 @@ impl ItemUpdateBuilder {
 ///
 /// ```
 /// use lightstreamer_rs::test_util::ConnectedBuilder;
-/// use lightstreamer_rs::{Connected, Continuity, SessionEvent};
+/// use lightstreamer_rs::{Connected, Continuity, SessionEvent, StateValidity};
 ///
-/// // Your crate's rule, as `lib.rs` describes it: keep what you computed
-/// // unless a *new* session replaced the one you computed it from.
+/// // Your crate's rule, as `lib.rs` describes it: keep what you computed only
+/// // while the session it was computed from is demonstrably still there.
 /// fn keep_derived_state(connected: &Connected) -> bool {
-///     connected.continuity.is_preserved()
+///     connected.continuity.state_validity() == StateValidity::Valid
 /// }
 ///
 /// let rebound = ConnectedBuilder::new("S1234abcd", Continuity::Preserved).build();
@@ -981,7 +981,10 @@ mod tests {
         )
         .build();
         assert_eq!(replaced.session_id, "S5678efgh");
-        assert!(!replaced.continuity.is_preserved());
+        assert_eq!(
+            replaced.continuity.state_validity(),
+            crate::StateValidity::Invalid
+        );
         assert_eq!(
             replaced.continuity,
             Continuity::Replaced {
@@ -992,7 +995,10 @@ mod tests {
         let recovered =
             ConnectedBuilder::new("S1234abcd", Continuity::Recovered { requested_from: 42 })
                 .build();
-        assert!(recovered.continuity.is_preserved());
+        assert_eq!(
+            recovered.continuity.state_validity(),
+            crate::StateValidity::Pending
+        );
     }
 
     #[test]
@@ -1063,7 +1069,13 @@ mod tests {
         assert_eq!(subscription_id(7).get(), 7);
         assert_eq!(subscription_id(7), subscription_id(7));
         assert_ne!(subscription_id(7), subscription_id(8));
-        assert_eq!(subscription_id(7).to_string(), "subscription#7");
+        // The rendering names the owning client too, because the number alone
+        // is only unique within one of them.
+        assert!(
+            subscription_id(7).to_string().ends_with("subscription#7"),
+            "{}",
+            subscription_id(7)
+        );
     }
 
     // -- MessageOutcome ------------------------------------------------------

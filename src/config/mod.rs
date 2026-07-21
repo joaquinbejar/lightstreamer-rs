@@ -35,6 +35,19 @@ use crate::protocol::request::ConnectionMode;
 use crate::session::backoff::BackoffPolicy;
 use crate::session::options::{Credentials as SessionCredentials, SessionOptions};
 
+/// The longest any timing in this crate may be set to: 365 days.
+///
+/// A choice of this crate, and an upper bound rather than a recommendation —
+/// every sensible value is orders of magnitude below it. It exists because a
+/// duration is added to an [`Instant`](std::time::Instant) to make a deadline,
+/// and that addition is not total: past the runtime timer's own range the
+/// arithmetic overflows, and an overflowed deadline is an expired one. A
+/// timeout of [`Duration::MAX`] would then mean "give up at once" — the exact
+/// opposite of what it says. Refusing the value at configuration time is the
+/// only place that inversion can be caught while it is still a caller's
+/// mistake rather than a client that retries in a loop.
+pub const MAX_TIMING: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// A configuration value that cannot be used as given.
 ///
 /// Every variant names the one thing that is wrong and, where it helps, the
@@ -73,6 +86,43 @@ pub enum ConfigError {
     MissingHost {
         /// The address as supplied.
         address: String,
+    },
+
+    /// The server address carries a `user:password@` prefix.
+    ///
+    /// Refused rather than stripped, and deliberately reported without
+    /// quoting the address: an address that reached an error message would
+    /// take the credential in it into whatever log the error is written to.
+    /// Supply credentials with [`Credentials`] instead, where this crate
+    /// knows to redact them.
+    #[error("server address must not contain credentials; use Credentials instead")]
+    AddressHasUserinfo,
+
+    /// The host part of the server address is not a host.
+    #[error(
+        "`{host}` is not a host: an IPv6 literal must be bracketed, and no host may contain whitespace"
+    )]
+    InvalidHost {
+        /// The host as supplied.
+        host: String,
+    },
+
+    /// The port part of the server address is not a port.
+    #[error("`{port}` is not a port: expected a number from 1 to 65535")]
+    InvalidPort {
+        /// The port as supplied.
+        port: String,
+    },
+
+    /// What follows the host in the server address is not a usable base path.
+    ///
+    /// TLCP fixes the endpoint path [`docs/spec/01-foundations.md` §6.2.1], so
+    /// a query, a fragment or a `..` segment either means something this crate
+    /// would silently drop or aims the connection at a different resource.
+    #[error("`{path}` is not a base path: no query, fragment or `..` segment is allowed")]
+    InvalidAddressPath {
+        /// The path as supplied.
+        path: String,
     },
 
     /// The Adapter Set name was empty or only whitespace.
@@ -133,6 +183,57 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// A snapshot length was asked for in a mode that does not admit one.
+    ///
+    /// `LS_snapshot` as a number of events is "admitted only if `LS_mode` is
+    /// `DISTINCT`" [`docs/spec/03-requests.md` §6.1].
+    #[error("a snapshot length is admitted only with SubscriptionMode::Distinct, not {mode}")]
+    SnapshotLengthNeedsDistinct {
+        /// The mode the subscription was built with.
+        mode: &'static str,
+    },
+
+    /// A snapshot was asked for in [`SubscriptionMode::Raw`](crate::SubscriptionMode::Raw),
+    /// which keeps no item state and so has none to send
+    /// [`docs/spec/03-requests.md` §6.1].
+    #[error("a snapshot is not available with SubscriptionMode::Raw")]
+    SnapshotNeedsAStatefulMode,
+
+    /// A maximum frequency was asked for in
+    /// [`SubscriptionMode::Raw`](crate::SubscriptionMode::Raw), which the
+    /// server does not filter [`docs/spec/03-requests.md` §6.1].
+    #[error("a maximum frequency is not applied with SubscriptionMode::Raw")]
+    FrequencyNeedsAFilteredMode,
+
+    /// A buffer size was asked for in a mode the server does not buffer.
+    ///
+    /// `LS_requested_buffer_size` is considered "only if `LS_mode` is `MERGE`
+    /// or `DISTINCT`" [`docs/spec/03-requests.md` §6.1].
+    #[error("a buffer size applies only to SubscriptionMode::Merge or ::Distinct, not {mode}")]
+    BufferSizeNeedsMergeOrDistinct {
+        /// The mode the subscription was built with.
+        mode: &'static str,
+    },
+
+    /// A buffer size was asked for alongside an unfiltered frequency, which
+    /// the server ignores [`docs/spec/03-requests.md` §6.1].
+    #[error("a buffer size is ignored with MaxFrequency::Unfiltered; set one or the other")]
+    BufferSizeWithUnfilteredFrequency,
+
+    /// A [`Message::fire_and_forget`](crate::Message::fire_and_forget) message
+    /// was placed in a sequence.
+    ///
+    /// The two are inseparable in the protocol: `LS_msg_prog` is "mandatory
+    /// whenever `LS_sequence` is specified" and a fire-and-forget message is
+    /// precisely one with no progressive [`docs/spec/03-requests.md` §12.1].
+    #[error("a fire-and-forget message cannot be placed in a sequence: it carries no progressive")]
+    SequencedMessageNeedsAProgressive,
+
+    /// A maximum wait was set on a message that is in no sequence, where the
+    /// server ignores it [`docs/spec/03-requests.md` §12.1].
+    #[error("a maximum wait applies only to a message in a sequence")]
+    MaxWaitNeedsASequence,
+
     /// A duration that must be positive was zero.
     #[error("`{field}` must be greater than zero")]
     ZeroDuration {
@@ -140,9 +241,13 @@ pub enum ConfigError {
         field: &'static str,
     },
 
-    /// A duration that goes on the wire as a whole number of milliseconds does
-    /// not fit one.
-    #[error("`{field}` is too large to express in milliseconds")]
+    /// A duration is longer than this crate's timers are defined for.
+    ///
+    /// Either it does not fit the whole number of milliseconds the wire
+    /// carries, or it exceeds [`MAX_TIMING`]. Both are refused here rather
+    /// than clamped: a deadline that overflowed would become an *immediate*
+    /// one, inverting the very setting that produced it.
+    #[error("`{field}` is longer than the supported maximum of {MAX_TIMING:?}")]
     DurationTooLarge {
         /// Which knob, by the name of its builder method.
         field: &'static str,
@@ -348,8 +453,12 @@ impl ClientConfigBuilder {
     ///   or inactivity commitment that was set, is zero, or if the first retry
     ///   delay is zero. A zero `open_timeout` would abandon every attempt
     ///   before it started; a zero retry delay would reconnect in a hot loop.
-    /// - [`ConfigError::DurationTooLarge`] if a value that travels as a whole
-    ///   number of milliseconds does not fit one.
+    /// - [`ConfigError::DurationTooLarge`] if any duration exceeds
+    ///   [`MAX_TIMING`], or if a value that travels as a whole number of
+    ///   milliseconds does not fit one. Every timing is checked, including the
+    ///   keepalive slack and both retry delays: an overflowed deadline is an
+    ///   expired one, so a duration too large to add to an instant would
+    ///   silently become the opposite of what it says.
     /// - [`ConfigError::RetryCeilingBelowInitial`] if the reconnection ceiling
     ///   is below the first delay.
     ///
@@ -374,18 +483,24 @@ impl ClientConfigBuilder {
     /// ```
     pub fn build(self) -> Result<ClientConfig, ConfigError> {
         require_positive("open_timeout", self.options.open_timeout())?;
+        require_within_maximum("open_timeout", self.options.open_timeout())?;
+        require_within_maximum("keepalive_slack", self.options.keepalive_slack())?;
 
         if let Some(hint) = self.options.keepalive_hint() {
             require_positive("keepalive_hint", hint)?;
+            require_within_maximum("keepalive_hint", hint)?;
             require_millis("keepalive_hint", hint)?;
         }
         if let Some(commitment) = self.options.inactivity_commitment() {
             require_positive("inactivity_commitment", commitment)?;
+            require_within_maximum("inactivity_commitment", commitment)?;
             require_millis("inactivity_commitment", commitment)?;
         }
 
         let retry = self.options.retry();
         require_positive("retry.initial_delay", retry.initial_delay())?;
+        require_within_maximum("retry.initial_delay", retry.initial_delay())?;
+        require_within_maximum("retry.max_delay", retry.max_delay())?;
         if retry.max_delay() < retry.initial_delay() {
             return Err(ConfigError::RetryCeilingBelowInitial {
                 initial: retry.initial_delay(),
@@ -414,6 +529,14 @@ fn zero_duration(field: &'static str) -> ConfigError {
 fn require_positive(field: &'static str, value: Duration) -> Result<(), ConfigError> {
     if value.is_zero() {
         return Err(zero_duration(field));
+    }
+    Ok(())
+}
+
+/// Checks that a duration is one this crate's timers are defined for.
+fn require_within_maximum(field: &'static str, value: Duration) -> Result<(), ConfigError> {
+    if value > MAX_TIMING {
+        return Err(ConfigError::DurationTooLarge { field });
     }
     Ok(())
 }
@@ -574,6 +697,104 @@ mod tests {
             .with_options(ConnectionOptions::default().with_retry(retry))
             .build();
         assert!(built.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // A-08: no timing may be large enough to overflow a deadline
+    // -----------------------------------------------------------------------
+
+    /// Applies one duration to every timing knob in turn.
+    fn with_each_timing(value: Duration) -> Vec<(&'static str, Result<ClientConfig, ConfigError>)> {
+        let retry_initial = RetryPolicy::default()
+            .with_initial_delay(value)
+            .with_max_delay(value);
+        // The ceiling is checked against the first delay too, so that one is
+        // pinned at the smallest legal value while the ceiling varies.
+        let retry_max = RetryPolicy::default()
+            .with_initial_delay(Duration::from_nanos(1))
+            .with_max_delay(value);
+        vec![
+            (
+                "open_timeout",
+                ClientConfig::builder(address())
+                    .with_options(ConnectionOptions::default().with_open_timeout(value))
+                    .build(),
+            ),
+            (
+                "keepalive_slack",
+                ClientConfig::builder(address())
+                    .with_options(ConnectionOptions::default().with_keepalive_slack(value))
+                    .build(),
+            ),
+            (
+                "keepalive_hint",
+                ClientConfig::builder(address())
+                    .with_options(ConnectionOptions::default().with_keepalive_hint(Some(value)))
+                    .build(),
+            ),
+            (
+                "inactivity_commitment",
+                ClientConfig::builder(address())
+                    .with_options(
+                        ConnectionOptions::default().with_inactivity_commitment(Some(value)),
+                    )
+                    .build(),
+            ),
+            (
+                "retry.initial_delay",
+                ClientConfig::builder(address())
+                    .with_options(ConnectionOptions::default().with_retry(retry_initial))
+                    .build(),
+            ),
+            (
+                "retry.max_delay",
+                ClientConfig::builder(address())
+                    .with_options(ConnectionOptions::default().with_retry(retry_max))
+                    .build(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_config_accepts_every_timing_at_the_supported_maximum() {
+        for (field, built) in with_each_timing(MAX_TIMING) {
+            assert!(built.is_ok(), "{field} was rejected at the maximum");
+        }
+    }
+
+    #[test]
+    fn test_config_rejects_every_timing_one_step_past_the_maximum() {
+        let over = match MAX_TIMING.checked_add(Duration::from_nanos(1)) {
+            Some(over) => over,
+            None => Duration::MAX,
+        };
+        for (field, built) in with_each_timing(over) {
+            assert!(
+                matches!(built, Err(ConfigError::DurationTooLarge { field: named }) if named == field),
+                "{field} was accepted one step past the maximum"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_rejects_every_timing_at_duration_max() {
+        // The value that would otherwise overflow the deadline arithmetic and
+        // become an *immediate* one.
+        for (field, built) in with_each_timing(Duration::MAX) {
+            assert!(
+                matches!(built, Err(ConfigError::DurationTooLarge { field: named }) if named == field),
+                "{field} accepted Duration::MAX"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_accepts_every_timing_at_its_smallest_usable_value() {
+        // One nanosecond is aggressive but coherent everywhere it is allowed;
+        // zero is separately refused where it would invert behaviour.
+        for (field, built) in with_each_timing(Duration::from_nanos(1)) {
+            assert!(built.is_ok(), "{field} was rejected at one nanosecond");
+        }
     }
 
     #[test]

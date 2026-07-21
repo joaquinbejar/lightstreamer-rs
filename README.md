@@ -95,9 +95,13 @@ Cargo turns it on for your tests and leaves your release build untouched:
 lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["test-util"] }
 ```
 
+<!-- `ignore`, and deliberately: `my_parser` and `my_state_policy` are *your*
+     code, so this block cannot compile on its own. Everything it calls on this
+     crate is covered by a running doctest on `test_util`. -->
+
 ```rust,ignore
 use lightstreamer_rs::test_util::{ConnectedBuilder, ItemUpdateBuilder};
-use lightstreamer_rs::{Continuity, FieldValue};
+use lightstreamer_rs::{Continuity, FieldValue, StateValidity};
 
 let update = ItemUpdateBuilder::new("CS.D.EURUSD.CFD.IP", ["BID", "OFFER"])
     .changed("BID", FieldValue::Text("1.0921"))
@@ -110,6 +114,7 @@ let replaced = ConnectedBuilder::new("S5678", Continuity::Replaced {
     previous_session_id: Some("S1234".to_owned()),
 })
 .build();
+assert_eq!(replaced.continuity.state_validity(), StateValidity::Invalid);
 assert!(my_state_policy(&replaced).must_rebuild());
 ```
 
@@ -134,7 +139,11 @@ async fn main() -> lightstreamer_rs::Result<()> {
         .with_adapter_set(AdapterSet::try_new("DEMO")?)
         .build()?;
 
-    let (client, _session_events) = Client::connect(config).await?;
+    // Not interested in session events: opting out is a `drop`, not an
+    // underscore. A stream that is held but never read stalls the client
+    // once it fills.
+    let (client, session_events) = Client::connect(config).await?;
+    drop(session_events);
 
     let mut updates = client
         .subscribe(
@@ -191,11 +200,18 @@ TLCP distinguishes *this field has no value* from *this field is the empty
 string*, and so does this crate — all the way to your code. A field value is a
 `FieldValue`, not a `&str`:
 
+<!-- `ignore` only because this README is not compiled; the same example runs
+     as a doctest on `FieldValue`, which is what keeps it honest. -->
+
 ```rust,ignore
-match update.field_by_name("close") {
-    Some(FieldValue::Text(text)) => println!("closed at {text:?}"),  // may be ""
-    Some(FieldValue::Null)       => println!("no closing price at all"),
-    None                         => println!("no such field in this schema"),
+use lightstreamer_rs::{FieldValue, ItemUpdate};
+
+fn report_close(update: &ItemUpdate) {
+    match update.field_by_name("close") {
+        Some(FieldValue::Text(text)) => println!("closed at {text:?}"),  // may be ""
+        Some(FieldValue::Null)       => println!("no closing price at all"),
+        None                         => println!("no such field in this schema"),
+    }
 }
 ```
 
@@ -213,17 +229,26 @@ than deciding for you.
 Reconnection is automatic. What is *not* automatic is pretending nothing
 happened. `SessionEvent::Connected` carries a `Continuity`:
 
-| Continuity | What happened | Your derived state |
-|---|---|---|
-| `New` | first connection | build it |
-| `Preserved` | same session, nothing missed | still valid |
-| `Recovered { .. }` | same session, resumed from a known point | still valid |
-| `Replaced { .. }` | a **new** session; subscriptions re-executed | **discard it** |
+| Continuity | What happened | Your derived state | `state_validity()` |
+|---|---|---|---|
+| `New` | first connection | build it | `Invalid` |
+| `Preserved` | same session, nothing missed | still valid | `Valid` |
+| `Recovered { .. }` | same session, resumed from a known point | **not known yet** | `Pending` |
+| `Replaced { .. }` | a **new** session; subscriptions re-executed | **discard it** | `Invalid` |
 
-An application holding an order book, a portfolio or a cache needs that last
-row. TLCP is one of the few protocols that provides the distinction, and
+An application holding an order book, a portfolio or a cache needs the last
+two rows. TLCP is one of the few protocols that provides the distinction, and
 hiding it would be the single most expensive convenience this crate could
 offer.
+
+`Continuity::state_validity()` is that table asked as a question, and it
+deliberately has three answers rather than two. `Recovered` cannot be answered
+at the moment it arrives: whether the recovery skipped anything is something
+only the server can say, and it does — in the `SessionEvent::Recovered` that
+follows, where `Recovery::is_lossless()` settles it. `New` answers `Invalid`
+because there is no earlier session *of this client* to have preserved
+anything, which matters to an application whose state outlived a previous
+client.
 
 #### Errors carry the server's own code
 

@@ -122,7 +122,12 @@ struct IgSessionBody {
 }
 
 /// Everything needed to open a TLCP session against IG.
-#[derive(Debug)]
+///
+/// `Debug` is written by hand rather than derived. Three of these four fields
+/// authenticate or identify — two bearer tokens and an account number — and a
+/// derived `Debug` would put all three in the first log line, panic message or
+/// `dbg!` that touched this value. The same rule this crate applies to
+/// `Credentials` applies to whatever you build them from.
 struct IgSession {
     /// The Lightstreamer server assigned to this account.
     lightstreamer_endpoint: String,
@@ -132,6 +137,17 @@ struct IgSession {
     cst: String,
     /// IG's account security token, from the `X-SECURITY-TOKEN` header.
     security_token: String,
+}
+
+impl std::fmt::Debug for IgSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IgSession")
+            .field("lightstreamer_endpoint", &self.lightstreamer_endpoint)
+            .field("current_account_id", &"<redacted>")
+            .field("cst", &"<redacted>")
+            .field("security_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[tokio::main]
@@ -229,7 +245,9 @@ async fn log_in() -> Result<IgSession, Box<dyn std::error::Error>> {
 
 /// Opens the TLCP session and prints everything that arrives.
 async fn connect_and_stream(session: IgSession) -> Result<(), Box<dyn std::error::Error>> {
-    println!("account {}", session.current_account_id);
+    // The account id is not printed: it is the TLCP user name here, and this
+    // example's output is the kind of thing that ends up pasted into an issue.
+    // The endpoint is not a secret and is the one thing worth confirming.
     println!("streaming endpoint: {}", session.lightstreamer_endpoint);
 
     // --- Step 2: connect to Lightstreamer with those tokens ---------------
@@ -241,7 +259,12 @@ async fn connect_and_stream(session: IgSession) -> Result<(), Box<dyn std::error
         .with_credentials(Credentials::new(&session.current_account_id, ls_password))
         .build()?;
 
-    let (client, _session_events) = Client::connect(config).await?;
+    // This example follows the prices only. Opting out of the session events
+    // is an explicit `drop`: binding them to `_session_events` would keep the
+    // stream alive and unread, and an unread stream stalls the client once it
+    // fills.
+    let (client, session_events) = Client::connect(config).await?;
+    drop(session_events);
     println!("connected to Lightstreamer\n");
 
     // --- Step 3: subscribe ------------------------------------------------

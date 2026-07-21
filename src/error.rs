@@ -13,6 +13,17 @@
 //! semantic version becomes part of this crate's. That was a deliberate
 //! decision recorded on the type itself.
 //!
+//! # No unreachable variant, either
+//!
+//! Every variant of [`Error`] is one this crate can produce or one a caller
+//! can meaningfully build — see the note on the type. A variant that merely
+//! *sounded* plausible would be worse than a missing one: it invites a match
+//! arm that never runs and a recovery path that is never tested. The parser's
+//! own failures are deliberately not among them. A line this client cannot
+//! read is never fatal and never a `Result`: it arrives as
+//! [`SessionEvent::Unrecognized`](crate::SessionEvent), with the line intact,
+//! so that a server newer than this crate cannot break it.
+//!
 //! # The two code catalogs
 //!
 //! TLCP has exactly two catalogs of numeric codes, and they overlap: fourteen
@@ -33,8 +44,8 @@
 
 use std::fmt;
 
+use crate::client::DisconnectReason;
 use crate::config::ConfigError;
-use crate::protocol::ProtocolError;
 use crate::session::{ServerCause, SessionClosed};
 use crate::transport::TransportError;
 
@@ -135,9 +146,22 @@ impl From<ServerCause> for ServerError {
 ///   is simply over.
 /// - [`Error::Transport`] — bytes could not be moved. Usually a network or
 ///   TLS problem.
-/// - [`Error::Protocol`] — a request could not be encoded, or a line from the
-///   server could not be understood.
+/// - [`Error::ForeignSubscription`] — a handle from another client. Nothing
+///   was sent.
 /// - [`Error::Internal`] — a bug in this crate. Please report it.
+///
+/// # Which of these this crate returns, and which you construct
+///
+/// Everything above is *returned* by some call, except one:
+/// [`Error::Request`] is the way to **propagate** a refusal that arrived as an
+/// event. A refused control request is not the return value of anything —
+/// it reaches you as [`SessionEvent::RequestRejected`](crate::SessionEvent) or
+/// [`SubscriptionEvent::Rejected`](crate::SubscriptionEvent), because it
+/// happens long after the call that caused it returned. Wrapping the
+/// [`ServerError`] it carries in `Error::Request` is what lets an application
+/// hand it to `?` alongside the errors this crate returns, and
+/// [`ClosedReason::into_error`](crate::ClosedReason::into_error) does the same
+/// for the session-level events.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -174,6 +198,13 @@ pub enum Error {
     ReconnectExhausted {
         /// How many consecutive attempts failed.
         attempts: u32,
+        /// Why the last attempt failed, when there was one to report.
+        ///
+        /// Kept because the count on its own is not diagnosable: "eight
+        /// attempts failed" is the same sentence whether the credentials were
+        /// refused, the host did not resolve, or the connection kept going
+        /// silent. Boxed only to keep [`Error`] small.
+        last: Option<Box<DisconnectReason>>,
     },
 
     /// The client is no longer connected, because it was disconnected or
@@ -188,10 +219,19 @@ pub enum Error {
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
 
-    /// The server sent something this client could not interpret as valid
-    /// TLCP, or the client was asked to build a request it cannot encode.
-    #[error("protocol error: {0}")]
-    Protocol(#[from] ProtocolError),
+    /// A [`SubscriptionId`](crate::SubscriptionId) created by a different
+    /// client was passed to
+    /// [`Client::unsubscribe`](crate::Client::unsubscribe).
+    ///
+    /// Nothing was sent. Each client numbers its subscriptions from one, so
+    /// the same number names a different subscription on each of them; acting
+    /// on it would have cancelled somebody else's data.
+    #[error("subscription {id} was not created by this client")]
+    ForeignSubscription {
+        /// The number the handle carried, as
+        /// [`SubscriptionId::get`](crate::SubscriptionId::get) reports it.
+        id: u64,
+    },
 
     /// This crate could not do something it should always be able to do.
     ///
@@ -253,9 +293,10 @@ impl From<SessionClosed> for Error {
         match closed {
             SessionClosed::ByClient { .. } => Self::Disconnected,
             SessionClosed::ByServer { cause } => Self::Session(cause.into()),
-            SessionClosed::RetriesExhausted { attempts, .. } => {
-                Self::ReconnectExhausted { attempts }
-            }
+            SessionClosed::RetriesExhausted { attempts, last } => Self::ReconnectExhausted {
+                attempts,
+                last: last.map(|reason| Box::new(DisconnectReason::from(reason))),
+            },
             SessionClosed::Internal { reason } => Self::Internal { reason },
         }
     }
@@ -296,16 +337,25 @@ mod tests {
         assert_eq!(request.server_error().map(ServerError::code), Some(23));
         assert!(Error::Disconnected.server_error().is_none());
         assert!(
-            Error::ReconnectExhausted { attempts: 3 }
-                .server_error()
-                .is_none()
+            Error::ReconnectExhausted {
+                attempts: 3,
+                last: None
+            }
+            .server_error()
+            .is_none()
         );
     }
 
     #[test]
     fn test_error_knows_which_conditions_end_the_session() {
         assert!(Error::Session(ServerError::new(1, "")).is_session_terminal());
-        assert!(Error::ReconnectExhausted { attempts: 8 }.is_session_terminal());
+        assert!(
+            Error::ReconnectExhausted {
+                attempts: 8,
+                last: None
+            }
+            .is_session_terminal()
+        );
         assert!(Error::Disconnected.is_session_terminal());
         assert!(!Error::Request(ServerError::new(19, "")).is_session_terminal());
         assert!(!Error::Config(ConfigError::EmptyServerAddress).is_session_terminal());
@@ -333,13 +383,54 @@ mod tests {
         });
         assert!(matches!(
             exhausted,
-            Error::ReconnectExhausted { attempts: 8 }
+            Error::ReconnectExhausted {
+                attempts: 8,
+                last: None
+            }
         ));
 
         let internal = Error::from(SessionClosed::Internal {
             reason: "cannot encode".to_owned(),
         });
         assert!(matches!(internal, Error::Internal { .. }));
+    }
+
+    #[test]
+    fn test_exhaustion_keeps_the_last_thing_that_went_wrong() {
+        // A-04: the attempt count alone cannot be acted on. What failed the
+        // last time must survive the mapping into the public taxonomy.
+        let closed = SessionClosed::RetriesExhausted {
+            attempts: 8,
+            last: Some(crate::session::UnbindReason::KeepaliveExpired {
+                budget: std::time::Duration::from_secs(8),
+            }),
+        };
+        match Error::from(closed) {
+            Error::ReconnectExhausted {
+                attempts: 8,
+                last: Some(reason),
+            } => assert!(matches!(*reason, DisconnectReason::Stalled { .. })),
+            other => panic!("the last cause was discarded: {other:?}"),
+        }
+
+        // And a refusal keeps its server code rather than becoming a count.
+        let refused = SessionClosed::RetriesExhausted {
+            attempts: 3,
+            last: Some(crate::session::UnbindReason::Rejected {
+                cause: ServerCause {
+                    code: 1,
+                    message: "User/password check failed".to_owned(),
+                },
+            }),
+        };
+        match Error::from(refused) {
+            Error::ReconnectExhausted {
+                last: Some(reason), ..
+            } => {
+                assert!(matches!(*reason, DisconnectReason::Refused(cause) if cause.code() == 1));
+            }
+            other => panic!("the last cause was discarded: {other:?}"),
+        }
     }
 
     #[test]

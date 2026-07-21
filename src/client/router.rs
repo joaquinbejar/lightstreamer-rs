@@ -61,6 +61,7 @@ use std::collections::HashMap;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::client::ClientId;
 use crate::client::events::{
     ClosedReason, Connected, Resubscribed, ServerInfo, SessionEvent, SubscriptionId,
 };
@@ -137,6 +138,9 @@ struct Registered {
 /// The fan-out task.
 #[derive(Debug)]
 pub(crate) struct Router {
+    /// The client this router belongs to, which every handle it publishes is
+    /// stamped with. See [`SubscriptionId`].
+    client: ClientId,
     /// Events from the session driver.
     session_events: mpsc::Receiver<WireEvent>,
     /// Requests from the client and from dropped streams.
@@ -157,6 +161,7 @@ pub(crate) struct Router {
 impl Router {
     /// Assembles the task. It does nothing until [`Router::run`] is polled.
     pub(crate) fn new(
+        client: ClientId,
         session_events: mpsc::Receiver<WireEvent>,
         commands: mpsc::UnboundedReceiver<RouterCommand>,
         session_out: mpsc::Sender<SessionEvent>,
@@ -165,6 +170,7 @@ impl Router {
         stop: watch::Receiver<bool>,
     ) -> Self {
         Self {
+            client,
             session_events,
             commands,
             session_out: Some(session_out),
@@ -277,7 +283,11 @@ impl Router {
             }
 
             WireEvent::Resubscribed(entries) => {
-                let entries: Vec<Resubscribed> = entries.into_iter().map(Into::into).collect();
+                let client = self.client;
+                let entries: Vec<Resubscribed> = entries
+                    .into_iter()
+                    .map(|entry| Resubscribed::from_entry(client, entry))
+                    .collect();
                 self.emit(SessionEvent::Resubscribed(entries)).await;
                 false
             }

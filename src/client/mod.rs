@@ -19,7 +19,11 @@
 //!     .with_adapter_set(AdapterSet::try_new("DEMO")?)
 //!     .build()?;
 //!
-//! let (client, _session_events) = Client::connect(config).await?;
+//! // Not interested in session events: `drop` opts out. Binding them to
+//! //`_session_events` would keep the stream alive and unread, which stalls
+//! // the client once it fills — see `SessionEvents`.
+//! let (client, session_events) = Client::connect(config).await?;
+//! drop(session_events);
 //!
 //! let mut updates = client
 //!     .subscribe(Subscription::new(
@@ -46,7 +50,7 @@ mod updates;
 
 pub use events::{
     ClosedReason, Connected, Continuity, DisconnectReason, Recovery, RecoveryOutcome, Resubscribed,
-    ServerInfo, SessionEvent, SessionEvents, SubscriptionId,
+    ServerInfo, SessionEvent, SessionEvents, StateValidity, SubscriptionId,
 };
 pub use message::{Message, MessageOutcome, MessageResult, SequenceName};
 pub use subscription::{
@@ -65,6 +69,48 @@ use crate::transport::ws::WsTransport;
 
 use self::events::SessionEvents as SessionEventStream;
 use self::router::{Router, RouterCommand};
+
+/// Hands out one identity per [`Client`] built in this process.
+///
+/// Starts above [`ClientId::DETACHED`] so that no real client can ever share
+/// an identity with a hand-made [`crate::test_util`] handle.
+static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Which [`Client`] a [`SubscriptionId`] came from.
+///
+/// Not exposed: a caller has no use for it, and its whole job is to make a
+/// handle from one client unusable on another. See [`SubscriptionId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ClientId(u64);
+
+impl ClientId {
+    /// The identity of a handle that belongs to no client, which
+    /// [`crate::test_util`] mints. It matches no real client, so such a handle
+    /// can name a subscription in an assertion but never cancel one.
+    #[cfg(feature = "test-util")]
+    pub(crate) const DETACHED: Self = Self(0);
+
+    /// The next unused identity.
+    ///
+    /// Fails rather than wrapping. Reaching this needs 2⁶⁴ clients in one
+    /// process, but a wrapped identity would silently make two clients'
+    /// handles interchangeable again, which is the whole thing being
+    /// prevented.
+    fn allocate() -> Result<Self> {
+        use std::sync::atomic::Ordering::Relaxed;
+        NEXT_CLIENT_ID
+            .fetch_update(Relaxed, Relaxed, |current| current.checked_add(1))
+            .map(Self)
+            .map_err(|_| Error::Internal {
+                reason: "this process has run out of client identities".to_owned(),
+            })
+    }
+
+    /// The identity as a number, for `Display` and for logs.
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// The channel sizes and budgets a client is built with.
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +170,9 @@ fn stage(staged: &mut std::collections::VecDeque<SessionEvent>, event: SessionEv
 /// then ends when the last reference goes, which is the same rule stated once.
 #[derive(Debug)]
 pub struct Client {
+    /// This client's identity, carried by every [`SubscriptionId`] it hands
+    /// out so that another client's handle cannot be spent here.
+    id: ClientId,
     handle: SessionHandle,
     router: mpsc::UnboundedSender<RouterCommand>,
     update_capacity: std::num::NonZeroUsize,
@@ -187,7 +236,8 @@ impl Client {
     ///   Adapter Set (code 2) are the usual ones.
     /// - [`Error::ReconnectExhausted`] if every attempt allowed by
     ///   [`RetryPolicy`](crate::RetryPolicy) failed. Codes the specification
-    ///   marks temporary are retried before this is reported.
+    ///   marks temporary are retried before this is reported, and the last
+    ///   failure is carried in the error rather than reduced to a count.
     /// - [`Error::Internal`] if this crate could not build a request it should
     ///   always be able to build.
     ///
@@ -240,6 +290,7 @@ impl Client {
             session_event: session_capacity,
             shutdown_timeout,
         } = capacities;
+        let id = ClientId::allocate()?;
         let (driver, handle, session_events) =
             session::connect(transport, options).map_err(|error| Error::Internal {
                 reason: error.to_string(),
@@ -252,6 +303,7 @@ impl Client {
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let router = Router::new(
+            id,
             session_events,
             router_rx,
             session_out_tx,
@@ -299,14 +351,21 @@ impl Client {
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(Error::Disconnected),
         };
+        // Deliberately without the session identifier. `LS_session` is what a
+        // control request or a rebind names the session with
+        // [`docs/spec/03-requests.md` §5.1], so it is a bearer value, and this
+        // crate does not put one in a log line on a caller's behalf. It is on
+        // `Connected` for a caller who wants to.
         tracing::info!(
-            session = %connected.session_id,
+            client = id.get(),
             keepalive = ?connected.keepalive,
+            request_limit_bytes = connected.request_limit_bytes,
             "session established"
         );
 
         Ok((
             Self {
+                id,
                 handle,
                 router: router_tx,
                 update_capacity,
@@ -332,13 +391,20 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Disconnected`] if the session has already stopped, or
-    /// [`Error::Internal`] if this client has run out of the identifiers it
-    /// names subscriptions by — which takes 2⁶⁴ of them, and is reported
-    /// rather than wrapped around because a reused identifier would silently
-    /// conflate two subscriptions. Everything the *server* has to say about
-    /// the subscription arrives on the returned stream instead, where it can
-    /// be interleaved correctly with the data.
+    /// - [`Error::Config`] if the subscription's options and its mode cannot
+    ///   go together — see [`Subscription::validate`], which this calls before
+    ///   anything is sent. Checking here rather than at encoding time is what
+    ///   makes an impossible subscription a mistake you see at the call site
+    ///   instead of a stream that quietly never activates.
+    /// - [`Error::Disconnected`] if the session has already stopped.
+    /// - [`Error::Internal`] if this client has run out of the identifiers it
+    ///   names subscriptions by — which takes 2⁶⁴ of them, and is reported
+    ///   rather than wrapped around because a reused identifier would silently
+    ///   conflate two subscriptions.
+    ///
+    /// Everything the *server* has to say about the subscription arrives on
+    /// the returned stream instead, where it can be interleaved correctly with
+    /// the data.
     ///
     /// # Examples
     ///
@@ -378,6 +444,11 @@ impl Client {
     /// ```
     #[tracing::instrument(skip(self, subscription), fields(mode = subscription.mode().as_str()))]
     pub async fn subscribe(&self, subscription: Subscription) -> Result<Updates> {
+        // Before anything is allocated or registered: a combination the mode
+        // does not admit is the caller's mistake, and it is one here rather
+        // than a `Deferred` on a stream that never activates.
+        subscription.validate()?;
+
         let manager = SubscriptionManager::new(
             subscription.mode().to_wire(),
             subscription.snapshot().is_requested(),
@@ -403,7 +474,7 @@ impl Client {
             .map_err(|error| Error::Internal {
                 reason: error.to_string(),
             })?;
-        let id = SubscriptionId::new(key);
+        let id = SubscriptionId::new(self.id, key);
         self.router
             .send(RouterCommand::Register {
                 id,
@@ -442,9 +513,16 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Disconnected`] if the session has already stopped, in which
-    /// case the subscription is gone regardless.
+    /// - [`Error::ForeignSubscription`] if the handle was created by a
+    ///   different client. Nothing is sent: every client numbers its
+    ///   subscriptions from one, so the same number names different data on
+    ///   each of them, and acting on it would cancel somebody else's.
+    /// - [`Error::Disconnected`] if the session has already stopped, in which
+    ///   case the subscription is gone regardless.
     pub async fn unsubscribe(&self, id: SubscriptionId) -> Result<()> {
+        if id.client() != self.id {
+            return Err(Error::ForeignSubscription { id: id.get() });
+        }
         self.handle
             .unsubscribe(id.key())
             .await
@@ -483,7 +561,9 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Disconnected`] if the session has already stopped.
+    /// - [`Error::Config`] if the message's parts cannot be sent together —
+    ///   see [`Message::validate`], which this calls first.
+    /// - [`Error::Disconnected`] if the session has already stopped.
     ///
     /// # Examples
     ///
@@ -503,6 +583,9 @@ impl Client {
     /// ```
     #[tracing::instrument(skip(self, message))]
     pub async fn send_message(&self, message: Message) -> Result<()> {
+        // The text is the caller's and may be anything, so nothing about the
+        // message is logged; what is checked here is only its shape.
+        message.validate()?;
         self.handle
             .send_message(message.into_outgoing())
             .await
@@ -637,8 +720,18 @@ mod tests {
     use crate::subscription::manager::SubscriptionManager;
     use std::time::Duration;
 
+    /// A fresh client identity, as [`Client::assemble`] would allocate one.
+    fn a_client_id() -> ClientId {
+        match ClientId::allocate() {
+            Ok(id) => id,
+            Err(error) => panic!("this process has client identities left: {error}"),
+        }
+    }
+
     /// Everything a router test needs, wired but with no session behind it.
     struct Harness {
+        /// The identity the router stamps its handles with.
+        client: ClientId,
         /// Pretends to be the session driver.
         session_tx: mpsc::Sender<WireEvent>,
         commands: mpsc::UnboundedSender<RouterCommand>,
@@ -657,10 +750,20 @@ mod tests {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
-        let router = Router::new(session_rx, commands_rx, out_tx, unsub_tx, ready_tx, stop_rx);
+        let client = a_client_id();
+        let router = Router::new(
+            client,
+            session_rx,
+            commands_rx,
+            out_tx,
+            unsub_tx,
+            ready_tx,
+            stop_rx,
+        );
         tokio::spawn(router.run());
 
         Harness {
+            client,
             session_tx,
             commands: commands_tx,
             session_events: SessionEvents::with_staged(std::collections::VecDeque::new(), out_rx),
@@ -760,19 +863,24 @@ mod tests {
         let mut events = harness.session_events;
         match events.next().await {
             Some(SessionEvent::Connected(connected)) => {
-                assert!(connected.continuity.is_preserved());
+                assert_eq!(connected.continuity.state_validity(), StateValidity::Valid);
                 assert!(matches!(connected.continuity, Continuity::Preserved));
             }
             other => panic!("expected a preserved bind, got {other:?}"),
         }
         match events.next().await {
             Some(SessionEvent::Connected(connected)) => {
-                assert!(!connected.continuity.is_preserved());
+                assert_eq!(
+                    connected.continuity.state_validity(),
+                    StateValidity::Invalid
+                );
             }
             other => panic!("expected a replaced bind, got {other:?}"),
         }
         match events.next().await {
-            Some(SessionEvent::Closed(ClosedReason::ReconnectExhausted { attempts: 8 })) => {}
+            Some(SessionEvent::Closed(ClosedReason::ReconnectExhausted {
+                attempts: 8, ..
+            })) => {}
             other => panic!("expected a definitive loss, got {other:?}"),
         }
         // Terminal: the stream ends.
@@ -801,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn test_dropping_an_update_stream_asks_for_an_unsubscription() {
         let mut harness = harness(8);
-        let id = SubscriptionId::new(a_key().await);
+        let id = SubscriptionId::new(harness.client, a_key().await);
         let (events_tx, events_rx) = mpsc::channel(4);
         assert!(
             harness
@@ -831,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn test_updates_are_bounded_and_block_rather_than_drop() {
         let harness = harness(8);
-        let id = SubscriptionId::new(a_key().await);
+        let id = SubscriptionId::new(harness.client, a_key().await);
         // One slot only: the second update has nowhere to go until the caller
         // reads, and the router must wait rather than discard it.
         let (events_tx, mut events_rx) = mpsc::channel(1);
@@ -903,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn test_an_undecodable_notification_is_surfaced_not_swallowed() {
         let harness = harness(8);
-        let id = SubscriptionId::new(a_key().await);
+        let id = SubscriptionId::new(harness.client, a_key().await);
         let (events_tx, mut events_rx) = mpsc::channel(4);
         assert!(
             harness
@@ -1014,7 +1122,7 @@ mod tests {
         harness: &Harness,
         capacity: usize,
     ) -> (SubscriptionId, mpsc::Receiver<SubscriptionEvent>) {
-        let id = SubscriptionId::new(a_key().await);
+        let id = SubscriptionId::new(harness.client, a_key().await);
         let (events_tx, events_rx) = mpsc::channel(capacity);
         assert!(
             harness
@@ -1541,11 +1649,21 @@ mod tests {
         .await
         .expect("connect must not hang once the retries are spent");
 
-        assert!(
-            matches!(outcome, Err(Error::ReconnectExhausted { .. })),
-            "expected exhaustion, got {:?}",
-            outcome.map(|(_, _)| ())
-        );
+        // A-04: exhaustion carries the last thing that went wrong. A count on
+        // its own reads the same whether the host did not resolve or the
+        // server refused the credentials.
+        match outcome {
+            Err(Error::ReconnectExhausted {
+                last: Some(reason), ..
+            }) => assert!(
+                matches!(*reason, DisconnectReason::ConnectionFailed { .. }),
+                "expected the scripted connection failure, got {reason:?}"
+            ),
+            other => panic!(
+                "expected exhaustion with a cause, got {:?}",
+                other.map(|_| ())
+            ),
+        }
     }
 
     /// C-09. `disconnect()` must mean the session is over, not that a request
@@ -1653,6 +1771,7 @@ mod tests {
         let (router_tx, mut router_rx) = mpsc::unbounded_channel();
         let (alive_tx, _alive_rx) = mpsc::channel(1);
         let client = Client {
+            id: a_client_id(),
             handle: handle.clone(),
             router: router_tx,
             update_capacity: std::num::NonZeroUsize::new(8).unwrap_or(std::num::NonZeroUsize::MIN),
@@ -1700,12 +1819,87 @@ mod tests {
         );
     }
 
+    /// A-07. Two clients number their subscriptions from one, so their handles
+    /// carry the same number. Spending one on the other must fail with a typed
+    /// error and must not reach the wire.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_handle_from_one_client_cannot_unsubscribe_another() {
+        async fn a_client() -> (Client, Updates, std::sync::Arc<std::sync::Mutex<ScriptLog>>) {
+            let transport = ScriptedTransport::new(vec![Some(vec![
+                Say::Line(CONOK),
+                Say::AwaitControls(usize::MAX),
+            ])]);
+            let log = transport.log();
+            let (client, events) = Client::assemble(transport, session_options(), capacities(16))
+                .await
+                .expect("the session bound");
+            drop(events);
+            let updates = client
+                .subscribe(Subscription::new(
+                    SubscriptionMode::Merge,
+                    ItemGroup::from_items(["item1"]).expect("a valid group"),
+                    FieldSchema::from_fields(["price"]).expect("a valid schema"),
+                ))
+                .await
+                .expect("the subscription was queued");
+            (client, updates, log)
+        }
+
+        // The `Updates` streams are held, not dropped: dropping one
+        // unsubscribes, which is the thing a cross-client unsubscribe must not
+        // be confused with.
+        let (first, first_updates, _) = a_client().await;
+        let (second, second_updates, second_log) = a_client().await;
+        let (first_id, second_id) = (first_updates.id(), second_updates.id());
+
+        // The premise: the numbers really do collide.
+        assert_eq!(
+            first_id.get(),
+            second_id.get(),
+            "each client numbers its subscriptions from one"
+        );
+        assert_ne!(first_id, second_id, "the handles are still distinct");
+
+        // The subscription each client did ask for reached the wire, so the
+        // absence of a `delete` below is not the transport being idle.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let before = second_log.lock().expect("the log is not poisoned").clone();
+        assert!(
+            before
+                .controls
+                .iter()
+                .any(|parameters| parameters.contains("LS_op=add")),
+            "the second client's own subscription was sent: {:?}",
+            before.controls
+        );
+
+        match second.unsubscribe(first_id).await {
+            Err(Error::ForeignSubscription { id }) => assert_eq!(id, first_id.get()),
+            other => panic!("a foreign handle was accepted: {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after = second_log.lock().expect("the log is not poisoned").clone();
+        assert!(
+            !after
+                .controls
+                .iter()
+                .any(|parameters| parameters.contains("LS_op=delete")),
+            "nothing was sent for a handle this client does not own: {:?}",
+            after.controls
+        );
+
+        // Its own handle still works.
+        assert!(second.unsubscribe(second_id).await.is_ok());
+        drop((first, second, first_updates, second_updates));
+    }
+
     /// C-05. A blocked delivery that discovers a dropped receiver must not
     /// swallow the unsubscription the drop itself asked for.
     #[tokio::test]
     async fn test_a_stream_dropped_while_the_router_is_blocked_still_unsubscribes() {
         let mut harness = harness(8);
-        let id = SubscriptionId::new(a_key().await);
+        let id = SubscriptionId::new(harness.client, a_key().await);
         // One slot: the second event has nowhere to go, so the router blocks
         // inside the send — the state in which the receiver then disappears.
         let (events_tx, events_rx) = mpsc::channel(1);
@@ -1774,7 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn test_the_router_stops_while_a_callers_stream_is_full() {
         let harness = harness(1);
-        let id = SubscriptionId::new(a_key().await);
+        let id = SubscriptionId::new(harness.client, a_key().await);
         let (events_tx, _events_rx) = mpsc::channel(1);
         assert!(
             harness
