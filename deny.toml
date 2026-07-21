@@ -50,6 +50,11 @@ ignore = []
 # `license-not-encountered` warnings for them are expected and harmless. A
 # genuinely new license -- one not already on this list -- still fails the
 # check and needs an explicit policy decision, which is the point.
+#
+# DO NOT delete an entry just to silence its `license-not-encountered`
+# warning. That warning means "unused today", not "wrong" -- removing the
+# entry narrows the license policy, which is a deliberate decision requiring
+# the same scrutiny as adding one, not warning-log cleanup.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

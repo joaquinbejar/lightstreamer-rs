@@ -26,6 +26,10 @@ CHECK_SPANISH_CHARS := áéíóúñÁÉÍÓÚÑ¿¡
 # comments. Every other tracked `.rs` file under src/ and examples/ is
 # checked, including any new file added later. Computed once here (not
 # inline in the recipe) so the recipe needs no nested shell quoting.
+#
+# DO NOT remove this exclusion as a tidy-up. It is load-bearing: without it,
+# `check-spanish` fails on these two files' legitimate UTF-8 fixtures, in a
+# way that looks like a bug in the gate rather than in the source.
 CHECK_SPANISH_EXCLUDE := src/protocol/escaping.rs src/subscription/update.rs
 CHECK_SPANISH_EXCLUDE_RE := $(shell echo $(CHECK_SPANISH_EXCLUDE) | tr ' ' '|')
 
