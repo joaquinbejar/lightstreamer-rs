@@ -5,7 +5,11 @@ importantly the first stable `1.0.0`. It exists because `1.0.0` is not just a
 version bump: it is the first release under the new MIT licence
 (`docs/adr/0001-mit-relicensing-clean-room.md`), and getting the release
 mechanics wrong would undermine the clean-room claim the whole rewrite rests
-on. Read `CLAUDE.md`'s clean-room section first if you have not.
+on. Read the clean-room section of `CLAUDE.md` first if you have not. (It and
+the review referenced below are working-copy documents, kept out of version
+control; if you are reading this from a published crate they are not beside
+it, and `docs/adr/0001-mit-relicensing-clean-room.md` carries the same rule
+in shipped form.)
 
 ## 1. Every push already gates on this
 

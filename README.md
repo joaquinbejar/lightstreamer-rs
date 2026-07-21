@@ -42,9 +42,12 @@ every wire behaviour.
   silently trusted.
 - **Typed errors**: server codes preserved as numbers, tagged with which of
   the protocol's two overlapping code catalogs they came from.
-- **Bounded and lossless**: every stream has a fixed capacity and blocks
-  rather than discarding, so a slow consumer stalls the client instead of
-  losing data behind your back.
+- **Bounded and lossless while it runs**: every stream has a fixed capacity and
+  blocks rather than discarding, so a slow consumer stalls the client instead
+  of losing data behind your back. The one exemption is an ordered stop —
+  `disconnect()`, or dropping the client — which is signalled out of band so
+  that a stalled stream can never make the client unstoppable; anything
+  undelivered at that moment goes with the streams it belonged to.
 - **Forward compatible**: an unknown notification or an unrecognized literal
   is surfaced with its raw text intact, never fatal.
 - **No `unsafe`**: `#![forbid(unsafe_code)]`, no `unwrap` or `expect` in
@@ -289,6 +292,7 @@ src/
 ├── client/            # the public façade
 ├── config/            # validated builder configuration
 ├── error.rs           # the public error taxonomy
+├── test_util.rs       # feature `test-util`: builders for the event payloads
 └── lib.rs             # crate docs and the public surface
 docs/
 ├── SPEC.md            # distilled TLCP reference; spec section → module map
@@ -306,10 +310,12 @@ it came from. That trail is not documentation hygiene — it is what makes the
 implementation auditable, and it ships with the crate.
 
 Where the specification does not determine a behaviour, the source says so:
-87 `SPEC-AMBIGUITY` comments mark points where the document is silent,
-ambiguous, or contradicts its own examples. Each takes the defensive option
-and names the gap instead of guessing. They are resolved empirically against a
-real server as they are hit — never by intuition
+93 `SPEC-AMBIGUITY` comments mark the places where the document is silent,
+ambiguous, or contradicts its own examples — the source-side counterpart of the
+91 `⚠️ Spec unclear:` flags raised while distilling
+[`docs/spec/`](docs/spec/). Each takes the defensive option and names the gap
+instead of guessing. They are resolved
+empirically against a real server as they are hit — never by intuition
 ([ADR-0006](docs/adr/0006-empirical-resolution-of-spec-ambiguities.md)).
 
 Out of scope: Mobile Push Notifications (MPN), surveyed in
@@ -329,18 +335,28 @@ Under active development toward `1.0.0`.
 | HTTP streaming and long polling | designed, not yet implemented ([ADR-0002](docs/adr/0002-all-three-transports-in-1-0-0.md)) |
 | MPN | out of scope |
 
-Around 500 tests, all hermetic — no network, no real timers. The examples are
-the live verification, and four of them have been run against real servers.
+Nearly 600 tests, all hermetic — no network, no real timers. The examples are
+the live verification, and all five have been run against real servers.
+
+`1.0.0-alpha.1` is an alpha for a reason: a repository-wide review is open
+against this tree, and the two missing transports are not the only thing
+between it and a stable release. Treat the API as still moving.
 
 ### Development
 
 ```bash
-cargo test                                              # unit tests and doctests
-cargo test --features json-patch                        # with JSON Patch decoding
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
+make pre-push                                           # everything CI runs
+make test                                               # the three-leg feature matrix
+make lint                                               # clippy, all targets and features
+make check                                              # fast gate: tests, lint, fmt
 cargo run --example demo_quotes                         # live smoke test
 ```
+
+`make pre-push` runs exactly what `.github/workflows/ci.yml` runs — formatting,
+Clippy, the feature-matrix tests, a release build, rustdoc and doctests,
+`cargo deny`, the MSRV build, the packaged-file-list check and the English-only
+comment check — so green locally means green in CI. `make help` lists every
+target.
 
 ### Version 1.0: a rewrite, and a licence change
 
@@ -383,7 +399,8 @@ Contributions are welcome:
 1. Fork the repository.
 2. Create a feature branch: `git checkout -b feature/my-feature`.
 3. Make your changes.
-4. Run the checks: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`.
+4. Run the checks: `make pre-push` — the same set CI runs, so a green run
+   locally means a green run there.
 5. Push the branch and open a pull request.
 
 **One rule is absolute.** This crate's MIT licence rests on the claim that no

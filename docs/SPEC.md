@@ -53,8 +53,9 @@ material, cites it, and is tested against the fixtures quoted there.
 | §01 ch.6 request syntax, §03 all requests | `src/protocol/request.rs` | `protocol-expert` |
 | §01 ch.7 line format + parsing algorithm, §04 all notifications | `src/protocol/response.rs` | `protocol-expert` |
 | §01 §7.2 percent-encoding, §04 §2 second-level value syntax (`#`/`$`, unchanged-field runs) | `src/protocol/escaping.rs` | `protocol-expert` |
-| §04 §2 update decoding, diff application, COMMAND key/command semantics | `src/subscription/update.rs` | `protocol-expert` |
-| §01 ch.6 transport framing (HTTP paths/methods, WS subprotocol) | `src/transport/{ws,http}.rs` | `transport-expert` |
+| §04 §2 update decoding and diff application | `src/subscription/update.rs` | `protocol-expert` |
+| §04 §2 COMMAND key/command semantics, snapshot classification | `src/subscription/item_update.rs` | `protocol-expert` |
+| §01 ch.6 transport framing (WS subprotocol; HTTP paths/methods) | `src/transport/ws.rs`; `src/transport/http.rs` *(not written)* | `transport-expert` |
 | §02 the state machine, rebind/loop, recovery, definitive loss, long polling | `src/session/mod.rs` | `transport-expert` |
 | §02 ch.8 liveness — keepalive, `PROBE`, reverse heartbeat, content-length limits | `src/session/liveness.rs` | `transport-expert` |
 | §03 control operations, subscription id allocation, resubscribe-on-recovery | `src/subscription/manager.rs` | `transport-expert` |
@@ -65,17 +66,23 @@ material, cites it, and is tested against the fixtures quoted there.
 ## What the specification does not decide — now recorded as ADRs
 
 The distillation surfaced five decisions the specification leaves to the
-implementer. All are settled; see [`README.md`](README.md) for the full ADR
-inventory.
+implementer. All are settled. Two more ADRs exist that did not come from the
+distillation — ADR-0001 (the relicensing itself) and ADR-0007 (the shape of the
+Transport port, written once the implementation made the choice concrete); see
+[`README.md`](README.md) for the full seven-entry inventory.
 
 1. **Which diff algorithms to advertise** — [ADR-0004](adr/0004-supported-diffs-derived-from-decoders.md).
    Implement every algorithm the spec defines, and *derive* the
    `LS_supported_diffs` value from the decoder registry so the advertisement
    and the implementation cannot drift.
 2. **Transport scope for 1.0.0** — [ADR-0002](adr/0002-all-three-transports-in-1-0-0.md).
-   WebSocket, HTTP streaming, and long polling all ship, behind one port.
+   WebSocket, HTTP streaming, and long polling all ship, behind one port —
+   whose shape [ADR-0007](adr/0007-transport-port-shape.md) then fixed. Only
+   WebSocket is implemented, so this decision is not yet kept.
 3. **The event surface** — [ADR-0003](adr/0003-typed-event-stream-as-delivery-surface.md).
    A typed `Stream` of exhaustively-matchable events; no listener traits.
+   Amended 2026-07-21: delivery is bounded and lossless *while the client is
+   running*, and an ordered stop is the single exemption from backpressure.
 4. **How recovery is surfaced** — [ADR-0005](adr/0005-recovery-is-visible-in-the-event-stream.md).
    Reconnection is automatic, its consequences are explicit: continuity
    preserved vs session re-established vs definitively lost.
@@ -90,23 +97,37 @@ inventory.
 ## Implementation order
 
 Derived from the dependency structure above — each milestone is testable before
-the next begins:
+the next begins. Steps 1–6 are **written**; step 7 is not. "Written" is not
+"finished": an open repository-wide review records findings against every one
+of them, and its verdict is that the tree is not yet a release candidate.
 
-1. **`protocol` core** — line format, parsing algorithm, percent-encoding,
+1. ✅ **`protocol` core** — line format, parsing algorithm, percent-encoding,
    request encoding. Pure, no I/O, fixtures lifted verbatim from §01/§03/§04.
-2. **Update decoding** — the pipe-separated list, `#`/`$`, unchanged-field
+   `src/protocol/{escaping,request,response}.rs`.
+2. ✅ **Update decoding** — the pipe-separated list, `#`/`$`, unchanged-field
    runs, diff application, COMMAND-mode item state. Still pure. This is the
    highest-risk decoding surface in the protocol; it earns exhaustive tests.
-3. **Transport port + WebSocket** — framing only, no protocol semantics.
-4. **Session state machine** — creation, bind, loop/rebind, recovery, liveness.
-   Tested as a state machine against the §02 transcripts, not against a socket.
-5. **Subscription manager** — control operations, id allocation, resubscribe.
-6. **Public API** — client façade, config, error taxonomy, rustdoc, examples.
-7. **HTTP streaming and long polling** — the second and third transports
+   `src/subscription/{update,item_update}.rs`.
+3. ✅ **Transport port + WebSocket** — framing only, no protocol semantics.
+   `src/transport/{mod,ws}.rs`, shaped by ADR-0007.
+4. ✅ **Session state machine** — creation, bind, loop/rebind, recovery,
+   liveness. Tested as a state machine against the §02 transcripts, not against
+   a socket. `src/session/{mod,liveness,backoff,options}.rs`.
+5. ✅ **Subscription manager** — control operations, id allocation, resubscribe.
+   `src/subscription/manager.rs`.
+6. ✅ **Public API** — client façade, config, error taxonomy, rustdoc,
+   examples. `src/{client,config}/*`, `src/error.rs`, `src/lib.rs`, and the
+   five programs in `examples/`. The off-by-default `test-util` feature
+   (`src/test_util.rs`) belongs to this step: the payloads this crate delivers
+   are unconstructible from outside it by design, which would otherwise make a
+   consumer's own handling of them untestable.
+7. ⬜ **HTTP streaming and long polling** — the second and third transports
    against the now-proven port (ADR-0002), each re-running the full lifecycle
-   test suite from step 4.
+   test suite from step 4. **Not started.** This is the one place where the
+   implementation contradicts an accepted ADR, and `1.0.0` cannot be published
+   until either the transports exist or ADR-0002 is explicitly superseded.
 
-Steps 1 and 2 are the foundation everything else rests on, and they are the two
-that are entirely testable from this reference alone. Write them first, and
-write them to a standard where the tests read as an executable copy of the
-specification.
+Steps 1 and 2 were the foundation everything else rests on, and they are the two
+that are entirely testable from this reference alone. They were written first,
+to a standard where the tests read as an executable copy of the specification;
+hold anything added to them to the same one.

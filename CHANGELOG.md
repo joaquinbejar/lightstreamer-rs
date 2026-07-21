@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] — 1.0.0
 
+The manifest currently declares `1.0.0-alpha.1`. It becomes `1.0.0` when the
+release gates in `RELEASING.md` are green; until then this section describes
+what `1.0.0` will contain, not what has been published.
+
 ### Licence
 
 **This release is licensed under MIT.** Versions up to and including 0.3.3 were
@@ -34,6 +38,15 @@ The most visible differences:
 - **Reconnection reports its consequences.** The caller can tell a recovered
   session from a replaced one from a definitively lost one
   (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
+- **Delivery is bounded and lossless while the client is running.** Every
+  stream has a fixed capacity and blocks rather than discarding, so a slow
+  consumer stalls the client instead of losing data silently. The single
+  exemption is an ordered stop — `Client::disconnect`, or dropping the
+  `Client` — which is signalled out of band and races every blocking delivery,
+  so that a stream nobody is reading can never make the client unstoppable.
+  Anything undelivered at that moment is discarded with the streams it belonged
+  to (`docs/adr/0003-typed-event-stream-as-delivery-surface.md`, *Amendment:
+  the stop lane*).
 
 ### Added
 
@@ -66,6 +79,13 @@ The most visible differences:
   supplies the builders. It pulls in no dependency and adds nothing to the
   default public surface; enable it under `[dev-dependencies]`.
 
+### Requirements
+
+- **MSRV is Rust 1.88**, declared as `rust-version` in `Cargo.toml` and
+  exercised by a CI job that reads it from there. Let-chains in the transport
+  and subscription layers are what set it.
+- Rust 2024 edition.
+
 ### Known gaps
 
 - HTTP streaming and HTTP long polling are specified and designed for but not
@@ -81,5 +101,13 @@ The most visible differences:
 
 ## Versions 0.3.3 and earlier
 
-Published under **GPL-3.0-only**. See the repository's `legacy-gpl` branch and
-the `v0.*` tags for their source.
+Published under **GPL-3.0-only**, and they stay that way: they are not yanked,
+relabeled, or re-published. Their source is preserved on the repository's
+`legacy-gpl` branch and under the `v0.*` tags, which is how the GPL obligation
+to keep offering it is honoured.
+
+That source is offered to satisfy the licence, and for no other purpose. It is
+**not** an admissible reference for work on `1.0.0` and must not be read,
+copied from, or described by anyone contributing to this tree — the MIT
+relicensing rests on the claim that no code here derives from it
+(`docs/adr/0001-mit-relicensing-clean-room.md`).
