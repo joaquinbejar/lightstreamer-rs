@@ -1,0 +1,654 @@
+//! Everything a client needs to be told before it can open a session.
+//!
+//! Configuration arrives through typed, checked values — never through the
+//! environment. This is a library: reading `LS_PASSWORD` out of the process
+//! environment behind the caller's back would make the crate's behaviour
+//! depend on something the caller did not write down, and would put a secret
+//! somewhere this crate has no business looking. Credentials are supplied by
+//! the caller, are never logged, and never appear in an error.
+//!
+//! # Shape of the API
+//!
+//! ```
+//! use lightstreamer_rs::{AdapterSet, ClientConfig, Credentials, ServerAddress};
+//!
+//! let config = ClientConfig::builder(ServerAddress::try_new("https://push.lightstreamer.com")?)
+//!     .with_adapter_set(AdapterSet::try_new("DEMO")?)
+//!     .with_credentials(Credentials::anonymous())
+//!     .build()?;
+//!
+//! assert_eq!(config.address().as_str(), "https://push.lightstreamer.com");
+//! # Ok::<(), lightstreamer_rs::ConfigError>(())
+//! ```
+
+mod address;
+mod credentials;
+mod options;
+
+use std::time::Duration;
+
+pub use address::ServerAddress;
+pub use credentials::{AdapterSet, Credentials};
+pub use options::{ConnectionOptions, RetryPolicy, Transport};
+
+use crate::protocol::request::ConnectionMode;
+use crate::session::backoff::BackoffPolicy;
+use crate::session::options::{Credentials as SessionCredentials, SessionOptions};
+
+/// A configuration value that cannot be used as given.
+///
+/// Every variant names the one thing that is wrong and, where it helps, the
+/// offending value. No variant ever carries a password: a credential that
+/// reached an error message would end up in whatever log the caller writes the
+/// error to.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// The server address was empty or only whitespace.
+    #[error("server address is empty")]
+    EmptyServerAddress,
+
+    /// The server address has no `scheme://` prefix.
+    ///
+    /// The scheme is required rather than guessed, because defaulting to TLS
+    /// or to plain text would each be wrong half the time and neither would be
+    /// visible to the caller.
+    #[error(
+        "server address `{address}` has no scheme: expected ws://, wss://, http:// or https://"
+    )]
+    MissingScheme {
+        /// The address as supplied.
+        address: String,
+    },
+
+    /// The server address names a scheme this crate cannot speak.
+    #[error("unsupported scheme `{scheme}`: expected ws, wss, http or https")]
+    UnsupportedScheme {
+        /// The scheme as supplied, lowercased.
+        scheme: String,
+    },
+
+    /// The server address has a scheme but no host after it.
+    #[error("server address `{address}` has no host")]
+    MissingHost {
+        /// The address as supplied.
+        address: String,
+    },
+
+    /// The Adapter Set name was empty or only whitespace.
+    ///
+    /// To request the server's `DEFAULT` Adapter Set, leave the name unset
+    /// instead: naming the empty string is a different request, and not one a
+    /// caller means [`docs/spec/03-requests.md` §2.1].
+    #[error("adapter set name is empty; leave it unset to use the server's DEFAULT")]
+    EmptyAdapterSet,
+
+    /// The Adapter Set name contains an ASCII control character.
+    #[error("adapter set name contains a control character")]
+    AdapterSetControlCharacter,
+
+    /// A subscription named no items.
+    #[error("subscription names no items")]
+    EmptyItemGroup,
+
+    /// An item group contains an ASCII control character.
+    #[error("item group contains a control character")]
+    ItemGroupControlCharacter,
+
+    /// An item name in a list contains whitespace, which would split it into
+    /// two items once the list is joined.
+    #[error("item name `{name}` contains whitespace; item names are separated by spaces")]
+    ItemNameHasWhitespace {
+        /// The offending name.
+        name: String,
+    },
+
+    /// A subscription named no fields.
+    #[error("subscription names no fields")]
+    EmptyFieldSchema,
+
+    /// A field schema contains an ASCII control character.
+    #[error("field schema contains a control character")]
+    FieldSchemaControlCharacter,
+
+    /// A field name in a list contains whitespace, which would split it into
+    /// two fields once the list is joined.
+    #[error("field name `{name}` contains whitespace; field names are separated by spaces")]
+    FieldNameHasWhitespace {
+        /// The offending name.
+        name: String,
+    },
+
+    /// A message sequence name is not a legal identifier.
+    #[error("`{name}` is not a sequence name: expected letters, digits and underscores")]
+    InvalidSequenceName {
+        /// The name as supplied.
+        name: String,
+    },
+
+    /// A frequency limit is not a decimal number with a dot separator.
+    #[error("`{value}` is not a frequency: expected a decimal number such as `2` or `0.5`")]
+    InvalidFrequency {
+        /// The text as supplied.
+        value: String,
+    },
+
+    /// A duration that must be positive was zero.
+    #[error("`{field}` must be greater than zero")]
+    ZeroDuration {
+        /// Which knob, by the name of its builder method.
+        field: &'static str,
+    },
+
+    /// A duration that goes on the wire as a whole number of milliseconds does
+    /// not fit one.
+    #[error("`{field}` is too large to express in milliseconds")]
+    DurationTooLarge {
+        /// Which knob, by the name of its builder method.
+        field: &'static str,
+    },
+
+    /// The reconnection ceiling is below the first reconnection delay, so the
+    /// schedule could never be honoured.
+    #[error("retry max_delay ({max:?}) is below initial_delay ({initial:?})")]
+    RetryCeilingBelowInitial {
+        /// The configured first delay.
+        initial: Duration,
+        /// The configured ceiling.
+        max: Duration,
+    },
+}
+
+/// Everything needed to open a session, checked and ready to use.
+///
+/// Build one with [`ClientConfig::builder`]; the fields are private so a
+/// configuration that failed a check cannot exist. Hand it to
+/// [`Client::connect`](crate::Client::connect).
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use lightstreamer_rs::{
+///     AdapterSet, ClientConfig, ConnectionOptions, Credentials, ServerAddress,
+/// };
+///
+/// let config = ClientConfig::builder(ServerAddress::try_new("wss://push.example.com")?)
+///     .with_adapter_set(AdapterSet::try_new("MY_ADAPTERS")?)
+///     .with_credentials(Credentials::new("alice", "hunter2"))
+///     .with_options(ConnectionOptions::default().with_open_timeout(Duration::from_secs(5)))
+///     .build()?;
+///
+/// assert_eq!(config.adapter_set().map(AdapterSet::as_str), Some("MY_ADAPTERS"));
+/// # Ok::<(), lightstreamer_rs::ConfigError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConfig {
+    address: ServerAddress,
+    adapter_set: Option<AdapterSet>,
+    credentials: Credentials,
+    transport: Transport,
+    options: ConnectionOptions,
+}
+
+impl ClientConfig {
+    /// Starts building a configuration for a server.
+    ///
+    /// The address is the only value with no sensible default, so it is taken
+    /// here rather than left to be forgotten.
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub fn builder(address: ServerAddress) -> ClientConfigBuilder {
+        ClientConfigBuilder {
+            address,
+            adapter_set: None,
+            credentials: Credentials::anonymous(),
+            transport: Transport::default(),
+            options: ConnectionOptions::default(),
+        }
+    }
+
+    /// The server this configuration points at.
+    #[must_use]
+    #[inline]
+    pub const fn address(&self) -> &ServerAddress {
+        &self.address
+    }
+
+    /// The Adapter Set that will serve the session, or `None` to let the
+    /// server use its `DEFAULT`.
+    #[must_use]
+    #[inline]
+    pub const fn adapter_set(&self) -> Option<&AdapterSet> {
+        self.adapter_set.as_ref()
+    }
+
+    /// The credentials the session will be created with.
+    #[must_use]
+    #[inline]
+    pub const fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+
+    /// The transport that will carry the session.
+    #[must_use]
+    #[inline]
+    pub const fn transport(&self) -> Transport {
+        self.transport
+    }
+
+    /// The timeouts, limits and reconnection policy.
+    #[must_use]
+    #[inline]
+    pub const fn options(&self) -> &ConnectionOptions {
+        &self.options
+    }
+
+    /// Translates into what the session state machine expects.
+    ///
+    /// Internal: [`SessionOptions`] is session machinery and is deliberately
+    /// not part of the public surface.
+    pub(crate) fn into_session_options(self) -> SessionOptions {
+        let (user, password) = self.credentials.into_parts();
+        let adapter_set = self.adapter_set.map(|set| set.as_str().to_owned());
+        let retry = self.options.retry();
+
+        SessionOptions {
+            credentials: SessionCredentials {
+                user,
+                password,
+                adapter_set,
+            },
+            connection: ConnectionMode::Streaming {
+                inactivity_millis: self
+                    .options
+                    .inactivity_commitment()
+                    .map(as_millis_saturating),
+                keepalive_millis: self.options.keepalive_hint().map(as_millis_saturating),
+                // The server's default is `true`, so the parameter is sent
+                // only to switch the notifications off
+                // [`docs/spec/03-requests.md` §2.1].
+                send_sync: if self.options.send_sync() {
+                    None
+                } else {
+                    Some(false)
+                },
+            },
+            content_length: self.options.content_length().map(std::num::NonZeroU64::get),
+            keepalive_slack: self.options.keepalive_slack(),
+            open_timeout: self.options.open_timeout(),
+            backoff: BackoffPolicy {
+                initial: retry.initial_delay(),
+                max: retry.max_delay(),
+                max_attempts: retry.max_attempts(),
+            },
+            event_capacity: self.options.session_event_capacity(),
+            command_capacity: SessionOptions::default().command_capacity,
+        }
+    }
+}
+
+/// Assembles a [`ClientConfig`], checking it once at the end.
+///
+/// The checks that involve more than one value — a reconnection ceiling below
+/// its own first delay, for instance — cannot be made one setter at a time, so
+/// [`ClientConfigBuilder::build`] is where all of them happen and where the
+/// typed error comes from.
+#[derive(Debug, Clone)]
+#[must_use = "builders do nothing unless .build() is called"]
+pub struct ClientConfigBuilder {
+    address: ServerAddress,
+    adapter_set: Option<AdapterSet>,
+    credentials: Credentials,
+    transport: Transport,
+    options: ConnectionOptions,
+}
+
+impl ClientConfigBuilder {
+    /// Names the Adapter Set that will serve the session.
+    ///
+    /// Left unset, the server uses an Adapter Set named `DEFAULT`
+    /// [`docs/spec/03-requests.md` §2.1].
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub fn with_adapter_set(mut self, adapter_set: AdapterSet) -> Self {
+        self.adapter_set = Some(adapter_set);
+        self
+    }
+
+    /// Supplies the credentials the session is created with.
+    ///
+    /// Defaults to [`Credentials::anonymous`].
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// Forces a particular transport.
+    ///
+    /// Defaults to [`Transport::WebSocket`], which is the only one this
+    /// release implements.
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub const fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Sets the timeouts, limits and reconnection policy.
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub fn with_options(mut self, options: ConnectionOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Checks everything and produces the configuration.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::ZeroDuration`] if `open_timeout`, or a keepalive hint
+    ///   or inactivity commitment that was set, is zero, or if the first retry
+    ///   delay is zero. A zero `open_timeout` would abandon every attempt
+    ///   before it started; a zero retry delay would reconnect in a hot loop.
+    /// - [`ConfigError::DurationTooLarge`] if a value that travels as a whole
+    ///   number of milliseconds does not fit one.
+    /// - [`ConfigError::RetryCeilingBelowInitial`] if the reconnection ceiling
+    ///   is below the first delay.
+    ///
+    /// A zero keepalive *slack* is accepted: it means "allow the server not
+    /// one millisecond past the interval it promised", which is aggressive but
+    /// coherent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use lightstreamer_rs::{
+    ///     ClientConfig, ConfigError, ConnectionOptions, ServerAddress,
+    /// };
+    ///
+    /// let rejected = ClientConfig::builder(ServerAddress::try_new("wss://push.example.com")?)
+    ///     .with_options(ConnectionOptions::default().with_open_timeout(Duration::ZERO))
+    ///     .build();
+    ///
+    /// assert!(matches!(rejected, Err(ConfigError::ZeroDuration { field: "open_timeout" })));
+    /// # Ok::<(), ConfigError>(())
+    /// ```
+    pub fn build(self) -> Result<ClientConfig, ConfigError> {
+        require_positive("open_timeout", self.options.open_timeout())?;
+
+        if let Some(hint) = self.options.keepalive_hint() {
+            require_positive("keepalive_hint", hint)?;
+            require_millis("keepalive_hint", hint)?;
+        }
+        if let Some(commitment) = self.options.inactivity_commitment() {
+            require_positive("inactivity_commitment", commitment)?;
+            require_millis("inactivity_commitment", commitment)?;
+        }
+
+        let retry = self.options.retry();
+        require_positive("retry.initial_delay", retry.initial_delay())?;
+        if retry.max_delay() < retry.initial_delay() {
+            return Err(ConfigError::RetryCeilingBelowInitial {
+                initial: retry.initial_delay(),
+                max: retry.max_delay(),
+            });
+        }
+
+        Ok(ClientConfig {
+            address: self.address,
+            adapter_set: self.adapter_set,
+            credentials: self.credentials,
+            transport: self.transport,
+            options: self.options,
+        })
+    }
+}
+
+/// Rejects a zero duration where a positive one is required.
+#[cold]
+#[inline(never)]
+fn zero_duration(field: &'static str) -> ConfigError {
+    ConfigError::ZeroDuration { field }
+}
+
+/// Checks that a duration is greater than zero.
+fn require_positive(field: &'static str, value: Duration) -> Result<(), ConfigError> {
+    if value.is_zero() {
+        return Err(zero_duration(field));
+    }
+    Ok(())
+}
+
+/// Checks that a duration fits the whole number of milliseconds the wire
+/// carries.
+fn require_millis(field: &'static str, value: Duration) -> Result<(), ConfigError> {
+    u64::try_from(value.as_millis())
+        .map(|_| ())
+        .map_err(|_| ConfigError::DurationTooLarge { field })
+}
+
+/// Converts to whole milliseconds, having already checked the value fits.
+///
+/// The saturation is unreachable for a value that passed
+/// [`require_millis`]; saturating rather than wrapping keeps a hypothetical
+/// bug from turning a huge interval into a tiny one.
+fn as_millis_saturating(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    fn address() -> ServerAddress {
+        match ServerAddress::try_new("wss://push.example.com") {
+            Ok(address) => address,
+            Err(error) => unreachable!("the fixture address is valid: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_config_builds_with_only_an_address() {
+        match ClientConfig::builder(address()).build() {
+            Ok(config) => {
+                assert_eq!(config.adapter_set(), None);
+                assert_eq!(config.transport(), Transport::WebSocket);
+                assert_eq!(config.credentials().user(), None);
+            }
+            Err(error) => panic!("a minimal configuration was rejected: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_config_keeps_what_it_was_given() {
+        let adapters = match AdapterSet::try_new("DEMO") {
+            Ok(set) => set,
+            Err(error) => unreachable!("the fixture adapter set is valid: {error}"),
+        };
+        let built = ClientConfig::builder(address())
+            .with_adapter_set(adapters)
+            .with_credentials(Credentials::new("alice", "hunter2"))
+            .with_options(ConnectionOptions::default().with_send_sync(false))
+            .build();
+
+        match built {
+            Ok(config) => {
+                assert_eq!(config.adapter_set().map(AdapterSet::as_str), Some("DEMO"));
+                assert_eq!(config.credentials().user(), Some("alice"));
+                assert!(config.credentials().has_password());
+                assert!(!config.options().send_sync());
+            }
+            Err(error) => panic!("rejected: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_config_rejects_a_zero_open_timeout() {
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_open_timeout(Duration::ZERO))
+            .build();
+        assert!(matches!(
+            built,
+            Err(ConfigError::ZeroDuration {
+                field: "open_timeout"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_rejects_a_zero_keepalive_hint() {
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_keepalive_hint(Some(Duration::ZERO)))
+            .build();
+        assert!(matches!(
+            built,
+            Err(ConfigError::ZeroDuration {
+                field: "keepalive_hint"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_rejects_a_zero_inactivity_commitment() {
+        let built = ClientConfig::builder(address())
+            .with_options(
+                ConnectionOptions::default().with_inactivity_commitment(Some(Duration::ZERO)),
+            )
+            .build();
+        assert!(matches!(
+            built,
+            Err(ConfigError::ZeroDuration {
+                field: "inactivity_commitment"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_rejects_a_duration_that_cannot_be_expressed_in_millis() {
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_keepalive_hint(Some(Duration::MAX)))
+            .build();
+        assert!(matches!(
+            built,
+            Err(ConfigError::DurationTooLarge {
+                field: "keepalive_hint"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_rejects_a_zero_first_retry_delay() {
+        let retry = RetryPolicy::default().with_initial_delay(Duration::ZERO);
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_retry(retry))
+            .build();
+        assert!(matches!(
+            built,
+            Err(ConfigError::ZeroDuration {
+                field: "retry.initial_delay"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_rejects_a_retry_ceiling_below_its_first_delay() {
+        let retry = RetryPolicy::default()
+            .with_initial_delay(Duration::from_secs(10))
+            .with_max_delay(Duration::from_secs(1));
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_retry(retry))
+            .build();
+        assert!(matches!(
+            built,
+            Err(ConfigError::RetryCeilingBelowInitial { .. })
+        ));
+    }
+
+    #[test]
+    fn test_config_accepts_an_equal_retry_ceiling_and_first_delay() {
+        let retry = RetryPolicy::default()
+            .with_initial_delay(Duration::from_secs(2))
+            .with_max_delay(Duration::from_secs(2));
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_retry(retry))
+            .build();
+        assert!(built.is_ok());
+    }
+
+    #[test]
+    fn test_config_accepts_a_zero_keepalive_slack() {
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_keepalive_slack(Duration::ZERO))
+            .build();
+        assert!(built.is_ok());
+    }
+
+    #[test]
+    fn test_config_accepts_unlimited_retries() {
+        let retry = RetryPolicy::default().with_max_attempts(None);
+        let built = ClientConfig::builder(address())
+            .with_options(ConnectionOptions::default().with_retry(retry))
+            .build();
+        assert!(built.is_ok());
+    }
+
+    #[test]
+    fn test_session_options_carry_the_configured_values() {
+        let adapters = match AdapterSet::try_new("DEMO") {
+            Ok(set) => set,
+            Err(error) => unreachable!("the fixture adapter set is valid: {error}"),
+        };
+        let retry = RetryPolicy::default()
+            .with_initial_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(2))
+            .with_max_attempts(NonZeroU32::new(3));
+        let config = ClientConfig::builder(address())
+            .with_adapter_set(adapters)
+            .with_credentials(Credentials::new("alice", "hunter2"))
+            .with_options(
+                ConnectionOptions::default()
+                    .with_inactivity_commitment(Some(Duration::from_secs(20)))
+                    .with_keepalive_hint(Some(Duration::from_secs(5)))
+                    .with_send_sync(false)
+                    .with_retry(retry),
+            )
+            .build();
+
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => panic!("rejected: {error}"),
+        };
+        let session = config.into_session_options();
+
+        assert_eq!(session.credentials.user.as_deref(), Some("alice"));
+        assert_eq!(session.credentials.adapter_set.as_deref(), Some("DEMO"));
+        assert_eq!(session.backoff.initial, Duration::from_millis(100));
+        assert_eq!(session.backoff.max, Duration::from_secs(2));
+        assert_eq!(session.backoff.max_attempts.map(NonZeroU32::get), Some(3));
+        match session.connection {
+            ConnectionMode::Streaming {
+                inactivity_millis,
+                keepalive_millis,
+                send_sync,
+            } => {
+                assert_eq!(inactivity_millis, Some(20_000));
+                assert_eq!(keepalive_millis, Some(5_000));
+                assert_eq!(send_sync, Some(false));
+            }
+            ConnectionMode::Polling { .. } => panic!("expected a streaming connection"),
+        }
+    }
+
+    #[test]
+    fn test_session_options_omit_send_sync_when_it_is_enabled() {
+        let config = match ClientConfig::builder(address()).build() {
+            Ok(config) => config,
+            Err(error) => panic!("rejected: {error}"),
+        };
+        match config.into_session_options().connection {
+            ConnectionMode::Streaming { send_sync, .. } => assert_eq!(send_sync, None),
+            ConnectionMode::Polling { .. } => panic!("expected a streaming connection"),
+        }
+    }
+}

@@ -12,7 +12,11 @@ homepage = "https://github.com/joaquinbejar/lightstreamer-rs"
 readme = "README.md"
 keywords = ["lightstreamer", "tlcp", "streaming", "realtime", "websocket"]
 categories = ["network-programming", "api-bindings"]
-exclude = ["/docs", "/rules", "/.claude", "/.github"]
+# `docs/` ships with the crate on purpose: `docs/spec/` and `docs/adr/` are the
+# citation trail behind the MIT relicensing (ADR-0001), and the published
+# artifact should carry its own provenance evidence rather than point at a
+# repository that may move.
+exclude = ["/rules", "/.claude", "/.github"]
 
 [features]
 default = []

@@ -73,11 +73,11 @@ use tokio::time::Instant;
 use crate::protocol::ProtocolError;
 use crate::protocol::request::{
     BindSession, CreateSession, DestroyCause, DestroySession, ForceRebind, Heartbeat,
-    MaxFrequencyLimit, ReconfigureSubscription, RequestId, RequestedBufferSize,
-    RequestedMaxFrequency, Snapshot, Subscribe, SubscriptionMode, TlcpRequest, TransportKind,
-    Unsubscribe,
+    MaxFrequencyLimit, MessageSend, ReconfigureSubscription, RequestId, RequestedBufferSize,
+    RequestedMaxFrequency, SequenceName, Snapshot, Subscribe, SubscriptionMode, TlcpRequest,
+    TransportKind, Unsubscribe,
 };
-use crate::protocol::response::{Notification, parse_line};
+use crate::protocol::response::{MessageSequence, Notification, parse_line};
 use crate::session::backoff::Backoff;
 use crate::session::liveness::{Liveness, LivenessAction};
 use crate::session::options::SessionOptions;
@@ -230,6 +230,100 @@ impl SubscriptionSpec {
     #[inline]
     fn wants_snapshot(&self) -> bool {
         matches!(self.snapshot, Some(Snapshot::On | Snapshot::Length(_)))
+    }
+}
+
+/// A message the caller wants delivered to the Metadata Adapter
+/// [`docs/spec/03-requests.md` §12].
+///
+/// As with [`SubscriptionSpec`], this is what the caller asked for; the
+/// session id and the `LS_reqId` belong to one particular connection and are
+/// filled in when the request is issued.
+///
+/// # The progressive is the caller's, not this client's
+///
+/// `LS_msg_prog` is "the progressive number of this message, starting at 1",
+/// it orders messages within a sequence, and it is what identifies the message
+/// in `MSGDONE`/`MSGFAIL` [`docs/spec/03-requests.md` §12.1]. This layer does
+/// **not** allocate it. The server tracks the numbering per session — its
+/// duplicate and skipped-progressive codes (`32`, `33`, `38`, `39`
+/// [`docs/spec/05-error-codes.md` §2]) are session-scoped — so a client-side
+/// counter would silently restart whenever a session was replaced, at exactly
+/// the moment the caller most needs to know what happened to a message. The
+/// caller owns the sequence numbering, and this layer never renumbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutgoingMessage {
+    /// `LS_message` — the payload. Its meaning is entirely the Metadata
+    /// Adapter's [`docs/spec/03-requests.md` §12.1].
+    pub(crate) message: String,
+    /// `LS_sequence` — messages sharing a sequence are processed in
+    /// `LS_msg_prog` order. `None` lets the server process the message at once,
+    /// possibly concurrently with others.
+    pub(crate) sequence: Option<SequenceName>,
+    /// `LS_msg_prog` — this message's position in its sequence, and its
+    /// identity in `MSGDONE`/`MSGFAIL`. Mandatory whenever a sequence is given
+    /// or an outcome is requested; [`MessageSend`] rejects the combination that
+    /// omits it, so a missing one surfaces as
+    /// [`MessageResult::NotSent`] rather than as a server error.
+    pub(crate) msg_prog: Option<NonZeroU32>,
+    /// `LS_max_wait` — how long the server may wait for earlier messages of the
+    /// same sequence before processing this one. Only meaningful alongside a
+    /// sequence.
+    pub(crate) max_wait_millis: Option<u64>,
+    /// `LS_outcome` — `Some(false)` suppresses the `MSGDONE`/`MSGFAIL`
+    /// notification, making the send fire-and-forget. `None` leaves the
+    /// server's default of `true` [`docs/spec/03-requests.md` §12.1].
+    pub(crate) outcome: Option<bool>,
+}
+
+impl OutgoingMessage {
+    /// A fire-and-forget message with no sequence and no progressive.
+    ///
+    /// `LS_outcome` is set to `false` because `LS_msg_prog` "is mandatory
+    /// whenever `LS_sequence` is specified or `LS_outcome` is set to `true`",
+    /// and `LS_outcome` defaults to `true`
+    /// [`docs/spec/03-requests.md` §12.1] — so a message with no progressive
+    /// can only be sent by explicitly declining the outcome.
+    #[must_use]
+    pub(crate) fn fire_and_forget(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            sequence: None,
+            msg_prog: None,
+            max_wait_millis: None,
+            outcome: Some(false),
+        }
+    }
+
+    /// A message identified by a progressive, whose outcome will be reported.
+    #[must_use]
+    pub(crate) fn numbered(message: impl Into<String>, msg_prog: NonZeroU32) -> Self {
+        Self {
+            message: message.into(),
+            sequence: None,
+            msg_prog: Some(msg_prog),
+            max_wait_millis: None,
+            outcome: None,
+        }
+    }
+
+    /// Places this message in an ordered sequence.
+    #[must_use = "builders do nothing unless the result is used"]
+    pub(crate) fn in_sequence(mut self, sequence: SequenceName) -> Self {
+        self.sequence = Some(sequence);
+        self
+    }
+
+    /// How this message identifies itself in `MSGDONE`/`MSGFAIL`.
+    #[must_use]
+    fn identity(&self) -> (MessageSequence, Option<u64>) {
+        let sequence = match &self.sequence {
+            Some(name) => MessageSequence::Named(name.as_str().to_owned()),
+            // The server echoes the literal `*` when the send named no
+            // sequence [`docs/spec/04-notifications.md` §4.1].
+            None => MessageSequence::Unspecified,
+        };
+        (sequence, self.msg_prog.map(|prog| u64::from(prog.get())))
     }
 }
 
@@ -523,6 +617,48 @@ pub(crate) struct ResubscribedEntry {
     pub(crate) snapshot_requested: bool,
 }
 
+/// Which subscription operation a control request was performing.
+///
+/// The distinction is not cosmetic: a refused `add` means the subscription
+/// does not exist, while a refused `delete` means it very much still does.
+/// A caller told only "rejected" would get one of the two backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriptionOperation {
+    /// `LS_op=add` — the subscription was never established. It has been
+    /// dropped from the desired set and will **not** be re-issued on a later
+    /// session.
+    Subscribe,
+    /// `LS_op=delete` — the subscription is **still active**; the caller's
+    /// request to remove it did not take effect.
+    Unsubscribe,
+    /// `LS_op=reconf` — the subscription is unchanged and still active; only
+    /// the frequency change failed.
+    Reconfigure,
+}
+
+/// What a control request was acting on.
+///
+/// Control responses correlate by `LS_reqId`, which is this layer's private
+/// sequence — the caller never sees one and so could never map a response back
+/// to the thing it asked for. Naming the target closes that gap: a rejection
+/// that cannot be routed to the subscription it killed is a silently lost
+/// subscription, whatever the event stream says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlTarget {
+    /// The request concerned the session as a whole — `force_rebind`,
+    /// `destroy`, `msg` — or the response could not be correlated to any
+    /// request at all.
+    Session,
+    /// The request concerned one subscription.
+    Subscription {
+        /// Which one, in the caller's own stable terms.
+        key: SubscriptionKey,
+        /// What was being attempted, and therefore what the failure means for
+        /// the subscription's state.
+        operation: SubscriptionOperation,
+    },
+}
+
 /// How a control request ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlOutcome {
@@ -539,6 +675,57 @@ pub(crate) enum ControlOutcome {
     /// encoder rejected the parameters. No server code exists for this.
     NotSent {
         /// What went wrong. Never contains a credential.
+        reason: String,
+    },
+}
+
+/// What became of one message sent with `msg`
+/// [`docs/spec/03-requests.md` §12].
+///
+/// A message can fail in three places, and the caller needs to tell them
+/// apart: it may never leave this client, the server may refuse to accept it,
+/// or the Metadata Adapter may fail while processing it. Only the third is a
+/// `MSGFAIL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MessageResult {
+    /// `MSGDONE` — the Metadata Adapter's `notifyUserMessage` returned without
+    /// raising [`docs/spec/04-notifications.md` §4.1].
+    Done {
+        /// The adapter's response text. Empty when it supplied none.
+        response: String,
+    },
+
+    /// `MSGFAIL` — the message was not delivered, or its processing failed
+    /// [`docs/spec/04-notifications.md` §4.2].
+    Failed {
+        /// The server's cause, code preserved. Appendix B codes `32`, `33`,
+        /// `38` and `39` concern the sequence numbering specifically
+        /// [`docs/spec/05-error-codes.md` §2].
+        cause: ServerCause,
+    },
+
+    /// `REQERR` or `ERROR` — the server refused the request outright, so no
+    /// `MSGDONE`/`MSGFAIL` will ever follow
+    /// [`docs/spec/03-requests.md` §13.2].
+    Refused {
+        /// The server's cause, code preserved.
+        cause: ServerCause,
+    },
+
+    /// The message never reached the server: nothing was bound to send it on,
+    /// the transport refused it, or its parameters could not be encoded.
+    ///
+    /// **Messages are not buffered.** A subscription is a statement of desired
+    /// state and is safely re-issued on whatever session comes next; a message
+    /// is a one-shot side effect whose ordering and de-duplication the server
+    /// tracks *per session* [`docs/spec/03-requests.md` §12.1;
+    /// `docs/spec/05-error-codes.md` §2, codes 32/33/38/39]. Re-issuing one
+    /// across a session replacement would restart the numbering the server
+    /// deduplicates against, so this client fails the send instead of
+    /// promising an ordering it cannot keep. Retrying is the caller's
+    /// decision, which is the only place the decision can be made correctly.
+    NotSent {
+        /// What stopped it. Never contains a credential.
         reason: String,
     },
 }
@@ -572,10 +759,37 @@ pub(crate) enum SessionEvent {
         retry_in: Option<Duration>,
     },
 
+    /// What became of a message the caller sent
+    /// [`docs/spec/03-requests.md` §12].
+    ///
+    /// `MSGDONE` and `MSGFAIL` **are** data notifications and are counted
+    /// toward the recovery progressive like any other
+    /// [`docs/spec/02-session-lifecycle.md` §5.3] — they simply reach the
+    /// caller through this typed variant instead of through
+    /// [`SessionEvent::Data`], because it can answer "what happened to my
+    /// message" in one match arm rather than three.
+    Message {
+        /// Its position in the session's data-notification count, or `None`
+        /// when the message never left this client and so the server never
+        /// counted anything.
+        progressive: Option<u64>,
+        /// The sequence the message was sent in, or
+        /// [`MessageSequence::Unspecified`].
+        sequence: MessageSequence,
+        /// The `LS_msg_prog` that identifies the message, or `None` when it
+        /// carried none — only possible with `LS_outcome=false`, in which case
+        /// the sole result that can arrive is [`MessageResult::NotSent`] or
+        /// [`MessageResult::Refused`].
+        prog: Option<u64>,
+        /// What became of it.
+        result: MessageResult,
+    },
+
     /// A data notification, with the progressive it carries for recovery
     /// purposes [`docs/spec/02-session-lifecycle.md` §5.3].
     ///
-    /// Duplicates suppressed after a recovery never appear here.
+    /// Duplicates suppressed after a recovery never appear here, and
+    /// `MSGDONE`/`MSGFAIL` arrive as [`SessionEvent::Message`] instead.
     Data {
         /// This notification's 1-based position in the session's data-
         /// notification count — the number `LS_recovery_from` would carry if
@@ -588,11 +802,18 @@ pub(crate) enum SessionEvent {
     },
 
     /// A control request was answered [`docs/spec/03-requests.md` §13].
+    ///
+    /// `target` is what makes this routable. A rejection carrying only a
+    /// request id would name a number the caller has never seen, leaving it
+    /// with a dead subscription and no way to know which one — the silent loss
+    /// this crate treats as a defect.
     ControlResponse {
         /// The request being answered, or `None` for an `ERROR`, which carries
         /// no request id because the server could not parse one
         /// [`docs/spec/03-requests.md` §13.2].
         request_id: Option<RequestId>,
+        /// What the request was acting on.
+        target: ControlTarget,
         /// What the server said.
         outcome: ControlOutcome,
     },
@@ -646,6 +867,16 @@ pub(crate) enum SessionCommand {
         key: SubscriptionKey,
         /// The new ceiling.
         max_frequency: MaxFrequencyLimit,
+    },
+
+    /// Send a message to the Metadata Adapter
+    /// [`docs/spec/03-requests.md` §12].
+    ///
+    /// Unlike a subscription this is never buffered; see
+    /// [`MessageResult::NotSent`].
+    SendMessage {
+        /// What to send.
+        message: Box<OutgoingMessage>,
     },
 
     /// Ask the server to unbind the session so it can be rebound — T2
@@ -724,6 +955,26 @@ impl SessionHandle {
     ) -> Result<(), SessionError> {
         self.send(SessionCommand::Reconfigure { key, max_frequency })
             .await
+    }
+
+    /// Sends a message to the Metadata Adapter
+    /// [`docs/spec/03-requests.md` §12].
+    ///
+    /// Returning `Ok` means the message was **queued for this driver**, not
+    /// that it reached the server. Its fate arrives as a
+    /// [`SessionEvent::Message`] carrying the sequence and progressive the
+    /// message identified itself with — including when it never left this
+    /// client, which is what happens if nothing is bound at the time
+    /// ([`MessageResult::NotSent`]; messages are deliberately not buffered).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn send_message(&self, message: OutgoingMessage) -> Result<(), SessionError> {
+        self.send(SessionCommand::SendMessage {
+            message: Box::new(message),
+        })
+        .await
     }
 
     /// Asks the server to unbind the session so it is rebound at once.
@@ -942,13 +1193,44 @@ impl Registry {
 }
 
 /// What a control request was for, so its response can be acted on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingKind {
     Subscribe(SubscriptionKey),
     Unsubscribe(SubscriptionKey),
     Reconfigure(SubscriptionKey),
+    /// A `msg`. It carries the message's own identity because a `REQERR`
+    /// correlates by `LS_reqId` while the caller thinks in terms of the
+    /// sequence and progressive that `MSGDONE`/`MSGFAIL` would have used
+    /// [`docs/spec/04-notifications.md` §4.1] — keeping both here is what lets
+    /// a refusal be reported on the same surface as a processing failure.
+    SendMessage {
+        sequence: MessageSequence,
+        prog: Option<u64>,
+    },
     ForceRebind,
     Destroy,
+}
+
+impl PendingKind {
+    /// What this request acts on, for the response event that will report it.
+    #[must_use]
+    fn target(&self) -> ControlTarget {
+        match self {
+            Self::Subscribe(key) => ControlTarget::Subscription {
+                key: *key,
+                operation: SubscriptionOperation::Subscribe,
+            },
+            Self::Unsubscribe(key) => ControlTarget::Subscription {
+                key: *key,
+                operation: SubscriptionOperation::Unsubscribe,
+            },
+            Self::Reconfigure(key) => ControlTarget::Subscription {
+                key: *key,
+                operation: SubscriptionOperation::Reconfigure,
+            },
+            Self::SendMessage { .. } | Self::ForceRebind | Self::Destroy => ControlTarget::Session,
+        }
+    }
 }
 
 /// Which kind of stream-opening request is in flight, and what it means for
@@ -1640,6 +1922,9 @@ impl<T: Transport> SessionDriver<T> {
                 tracing::warn!(code, "server rejected a request it could not correlate");
                 self.emit(SessionEvent::ControlResponse {
                     request_id: None,
+                    // `ERROR` names no request, so there is nothing to route
+                    // it to [`docs/spec/03-requests.md` §13.2].
+                    target: ControlTarget::Session,
                     outcome: ControlOutcome::Rejected {
                         cause: ServerCause { code, message },
                     },
@@ -1908,14 +2193,52 @@ impl<T: Transport> SessionDriver<T> {
             }
         };
 
-        let subscription = self.apply_subscription_effect(&notification);
+        let progressive = self.progressive;
 
-        self.emit(SessionEvent::Data {
-            progressive: self.progressive,
-            subscription,
-            notification,
-        })
-        .await;
+        // `MSGDONE` and `MSGFAIL` were counted above like every other data
+        // notification [`docs/spec/02-session-lifecycle.md` §5.3]; they are
+        // merely delivered on the message surface instead of the raw one,
+        // because they answer a `msg` the caller sent.
+        match notification {
+            Notification::MessageDone {
+                sequence,
+                prog,
+                response,
+            } => {
+                self.emit(SessionEvent::Message {
+                    progressive: Some(progressive),
+                    sequence,
+                    prog: Some(prog),
+                    result: MessageResult::Done { response },
+                })
+                .await;
+            }
+            Notification::MessageFailed {
+                sequence,
+                prog,
+                code,
+                message,
+            } => {
+                self.emit(SessionEvent::Message {
+                    progressive: Some(progressive),
+                    sequence,
+                    prog: Some(prog),
+                    result: MessageResult::Failed {
+                        cause: ServerCause { code, message },
+                    },
+                })
+                .await;
+            }
+            notification => {
+                let subscription = self.apply_subscription_effect(&notification);
+                self.emit(SessionEvent::Data {
+                    progressive,
+                    subscription,
+                    notification,
+                })
+                .await;
+            }
+        }
     }
 
     /// Updates the registry from a subscription-bearing notification and
@@ -1983,20 +2306,28 @@ impl<T: Transport> SessionDriver<T> {
             return;
         };
 
-        match self.pending.remove(&request_id) {
-            Some(kind) => tracing::debug!(request_id, ?kind, "control request accepted"),
+        let target = match self.pending.remove(&request_id) {
+            Some(kind) => {
+                tracing::debug!(request_id, ?kind, "control request accepted");
+                kind.target()
+            }
             // §4.5: "late responses to control requests related with the first
             // session [may] arrive interspersed with notifications for the
             // second session". Request ids are never reused, so an unknown one
-            // is a stale response and is reported, not acted on.
-            None => tracing::debug!(request_id, "response to an unknown or stale request"),
-        }
+            // is a stale response: it is reported, but it names nothing this
+            // driver is still tracking.
+            None => {
+                tracing::debug!(request_id, "response to an unknown or stale request");
+                ControlTarget::Session
+            }
+        };
 
         let outcome = ControlOutcome::Accepted;
         match RequestId::try_new(request_id.clone()) {
             Ok(id) => {
                 self.emit(SessionEvent::ControlResponse {
                     request_id: Some(id),
+                    target,
                     outcome,
                 })
                 .await;
@@ -2005,6 +2336,7 @@ impl<T: Transport> SessionDriver<T> {
                 tracing::warn!(%error, "server echoed a request id this client cannot represent");
                 self.emit(SessionEvent::ControlResponse {
                     request_id: None,
+                    target,
                     outcome,
                 })
                 .await;
@@ -2015,7 +2347,12 @@ impl<T: Transport> SessionDriver<T> {
     /// Correlates a `REQERR` and undoes whatever the request had optimistically
     /// recorded [`docs/spec/03-requests.md` §13.2].
     async fn on_request_error(&mut self, request_id: String, cause: ServerCause) {
-        if let Some(kind) = self.pending.remove(&request_id) {
+        let pending = self.pending.remove(&request_id);
+        let target = pending
+            .as_ref()
+            .map_or(ControlTarget::Session, PendingKind::target);
+
+        if let Some(kind) = pending {
             match kind {
                 // The server refused the subscription. Dropping it from the
                 // desired set is what stops it being re-issued on every future
@@ -2044,6 +2381,21 @@ impl<T: Transport> SessionDriver<T> {
                     }
                 }
                 PendingKind::Reconfigure(_) => {}
+                // The server refused the submission, so no `MSGDONE`/`MSGFAIL`
+                // will follow [`docs/spec/03-requests.md` §13.2]. Reporting it
+                // on the message surface as well is what keeps "every message
+                // gets exactly one outcome" true.
+                PendingKind::SendMessage { sequence, prog } => {
+                    self.emit(SessionEvent::Message {
+                        progressive: None,
+                        sequence,
+                        prog,
+                        result: MessageResult::Refused {
+                            cause: cause.clone(),
+                        },
+                    })
+                    .await;
+                }
                 // No `LOOP` will follow, so the next one must not be
                 // misattributed to T2.
                 PendingKind::ForceRebind => self.force_rebind_outstanding = false,
@@ -2056,6 +2408,7 @@ impl<T: Transport> SessionDriver<T> {
         let id = RequestId::try_new(request_id).ok();
         self.emit(SessionEvent::ControlResponse {
             request_id: id,
+            target,
             outcome,
         })
         .await;
@@ -2090,6 +2443,11 @@ impl<T: Transport> SessionDriver<T> {
 
             SessionCommand::Reconfigure { key, max_frequency } => {
                 self.reconfigure(key, max_frequency).await;
+                Flow::Continue
+            }
+
+            SessionCommand::SendMessage { message } => {
+                self.send_message(*message).await;
                 Flow::Continue
             }
 
@@ -2163,6 +2521,70 @@ impl<T: Transport> SessionDriver<T> {
             destroy_confirmed: false,
             cause: None,
         })
+    }
+
+    /// Sends one message, or reports at once that it could not be sent
+    /// [`docs/spec/03-requests.md` §12].
+    ///
+    /// There is no queue behind this. See [`MessageResult::NotSent`] for why a
+    /// message is not held the way a subscription is.
+    async fn send_message(&mut self, message: OutgoingMessage) {
+        let (sequence, prog) = message.identity();
+
+        // `msg` needs a bound session for the same reason every control
+        // request does, and — unlike a subscription — there is nothing
+        // meaningful to do with it until one exists.
+        let session = match (self.stream_state, self.session.clone()) {
+            (StreamState::Bound, Some(session)) => session,
+            _ => {
+                tracing::debug!(?sequence, ?prog, "message not sent: no session is bound");
+                self.emit(SessionEvent::Message {
+                    progressive: None,
+                    sequence,
+                    prog,
+                    result: MessageResult::NotSent {
+                        reason: "no session is bound to send the message on".to_owned(),
+                    },
+                })
+                .await;
+                return;
+            }
+        };
+
+        let request_id = self.next_request_id();
+        let request = MessageSend {
+            session: Some(session.as_str().to_owned()),
+            request_id: request_id.clone(),
+            message: message.message,
+            sequence: message.sequence,
+            msg_prog: message.msg_prog,
+            max_wait_millis: message.max_wait_millis,
+            // Left at the server's default of `true`: the `REQOK` is what
+            // correlates the submission with this request
+            // [`docs/spec/03-requests.md` §12.1].
+            ack: None,
+            outcome: message.outcome,
+        };
+
+        let kind = PendingKind::SendMessage {
+            sequence: sequence.clone(),
+            prog,
+        };
+        if !self.dispatch(&request, request_id, kind).await {
+            // `dispatch` has already reported the transport or encoding
+            // failure as a `ControlResponse`; it is repeated here on the
+            // message surface so a caller watching only that surface cannot
+            // lose a message silently.
+            self.emit(SessionEvent::Message {
+                progressive: None,
+                sequence,
+                prog,
+                result: MessageResult::NotSent {
+                    reason: "the message request could not be sent".to_owned(),
+                },
+            })
+            .await;
+        }
     }
 
     async fn unsubscribe(&mut self, key: SubscriptionKey) {
@@ -2280,8 +2702,31 @@ impl<T: Transport> SessionDriver<T> {
             // [`docs/spec/03-requests.md` §6.1].
             ack: None,
         };
-        self.dispatch(&request, request_id, PendingKind::Subscribe(key))
-            .await;
+        if !self
+            .dispatch(&request, request_id, PendingKind::Subscribe(key))
+            .await
+        {
+            // The `add` never reached the server, so the binding recorded a
+            // moment ago is a fiction: the subscription would sit in the
+            // registry looking issued, be skipped by every later
+            // `issue_unbound_subscriptions`, and never be established again —
+            // a subscription lost in silence. Releasing the binding puts it
+            // back in the set that is re-issued at the next bind.
+            //
+            // The `LS_subId` itself is **not** returned to the pool: ids
+            // "must not be reused" within a session
+            // [`docs/spec/02-session-lifecycle.md` §4.4], so the next attempt
+            // allocates a fresh one.
+            if let Some(entry) = self.registry.entries.get_mut(&key) {
+                entry.wire = None;
+            }
+            self.registry.by_sub_id.remove(&sub_id.get());
+            tracing::warn!(
+                key = key.get(),
+                "subscription could not be issued; it will be retried on the next bind"
+            );
+            return None;
+        }
 
         Some(ResubscribedEntry {
             key,
@@ -2328,12 +2773,14 @@ impl<T: Transport> SessionDriver<T> {
         request_id: RequestId,
         kind: PendingKind,
     ) -> bool {
+        let target = kind.target();
         let parameters = match request.encode_parameters(self.control_kind()) {
             Ok(parameters) => parameters,
             Err(error) => {
                 tracing::error!(%error, "cannot encode control request");
                 self.emit(SessionEvent::ControlResponse {
                     request_id: Some(request_id),
+                    target,
                     outcome: ControlOutcome::NotSent {
                         reason: error.to_string(),
                     },
@@ -2361,6 +2808,7 @@ impl<T: Transport> SessionDriver<T> {
                 tracing::warn!(%error, "control request could not be sent");
                 self.emit(SessionEvent::ControlResponse {
                     request_id: Some(request_id),
+                    target,
                     outcome: ControlOutcome::NotSent {
                         reason: error.to_string(),
                     },
@@ -2505,6 +2953,9 @@ mod tests {
         properties: TransportProperties,
         scripts: VecDeque<Vec<Step>>,
         current: VecDeque<Step>,
+        /// How many of the next `send_control` calls fail. Models a control
+        /// request that never reaches the server.
+        control_failures: usize,
         log: Arc<Mutex<MockLog>>,
     }
 
@@ -2514,8 +2965,14 @@ mod tests {
                 properties,
                 scripts: scripts.into(),
                 current: VecDeque::new(),
+                control_failures: 0,
                 log: Arc::new(Mutex::new(MockLog::default())),
             }
+        }
+
+        fn failing_controls(mut self, count: usize) -> Self {
+            self.control_failures = count;
+            self
         }
     }
 
@@ -2583,11 +3040,23 @@ mod tests {
         }
 
         async fn send_control(&mut self, request: EncodedRequest) -> Result<(), TransportError> {
+            let name = request.name;
+            // The attempt is logged either way, so an `AwaitControls` gate
+            // still fires for a request that failed to go out.
             self.log
                 .lock()
                 .expect("mock log poisoned")
                 .controls
                 .push(request);
+            if let Some(remaining) = self.control_failures.checked_sub(1) {
+                if self.control_failures > 0 {
+                    self.control_failures = remaining;
+                    return Err(TransportError::Send {
+                        name,
+                        reason: "control connection refused".to_owned(),
+                    });
+                }
+            }
             Ok(())
         }
 
@@ -2730,7 +3199,15 @@ mod tests {
         scripts: Vec<Vec<Step>>,
         commands: Vec<SessionCommand>,
     ) -> Outcome {
-        let transport = MockTransport::new(properties, scripts);
+        drive_transport(MockTransport::new(properties, scripts), options, commands).await
+    }
+
+    /// As [`drive`], but over a transport the test built itself.
+    async fn drive_transport(
+        transport: MockTransport,
+        options: SessionOptions,
+        commands: Vec<SessionCommand>,
+    ) -> Outcome {
         let log = Arc::clone(&transport.log);
         let (driver, handle, mut events) =
             connect(transport, options).expect("options must match the transport");
@@ -3737,6 +4214,7 @@ mod tests {
                 SessionEvent::ControlResponse {
                     request_id: Some(id),
                     outcome: ControlOutcome::Accepted,
+                    ..
                 } => Some(id.as_str().to_owned()),
                 _ => None,
             })
@@ -3874,11 +4352,522 @@ mod tests {
             event,
             SessionEvent::ControlResponse {
                 request_id: None,
+                target: ControlTarget::Session,
                 outcome: ControlOutcome::Rejected {
                     cause: ServerCause { code: 67, .. }
                 },
             }
         )));
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing a control failure back to the subscription it concerns
+    // -----------------------------------------------------------------------
+
+    fn control_targets(outcome: &Outcome) -> Vec<(ControlTarget, ControlOutcome)> {
+        outcome
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ControlResponse {
+                    target, outcome, ..
+                } => Some((target.clone(), outcome.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rejected_subscription_names_the_subscription_it_killed() {
+        // A rejection the caller cannot route is a subscription lost in
+        // silence: the caller's stream simply goes quiet forever. The response
+        // therefore names the key **and** the operation, because "add refused"
+        // means the subscription does not exist while "delete refused" means it
+        // still does.
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQERR,1,23,Bad Field schema name"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(7),
+                spec: Box::new(spec()),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            control_targets(&outcome),
+            vec![(
+                ControlTarget::Subscription {
+                    key: SubscriptionKey(7),
+                    operation: SubscriptionOperation::Subscribe,
+                },
+                ControlOutcome::Rejected {
+                    cause: ServerCause {
+                        code: 23,
+                        message: "Bad Field schema name".to_owned(),
+                    },
+                },
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rejected_unsubscribe_names_the_subscription_that_is_still_alive() {
+        // The delete failed, so the subscription is still there and still
+        // delivering. A caller told only "rejected" would have the state
+        // exactly backwards.
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::AwaitControls(2),
+            line("REQERR,2,19,Specified subscription not found"),
+            line("U,1,1,still|coming|through"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Unsubscribe {
+                    key: SubscriptionKey(1),
+                },
+            ],
+        )
+        .await;
+
+        let rejection = control_targets(&outcome)
+            .into_iter()
+            .find(|(_, outcome)| matches!(outcome, ControlOutcome::Rejected { .. }));
+        assert_eq!(
+            rejection.map(|(target, _)| target),
+            Some(ControlTarget::Subscription {
+                key: SubscriptionKey(1),
+                operation: SubscriptionOperation::Unsubscribe,
+            })
+        );
+        // Still alive, and its updates still route to the same key.
+        assert_eq!(
+            outcome.data().last().map(|(_, _)| ()),
+            Some(()),
+            "an update arrived after the failed delete"
+        );
+        let routed = outcome.events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::Data {
+                    subscription: Some(SubscriptionKey(1)),
+                    notification: Notification::Update { .. },
+                    ..
+                }
+            )
+        });
+        assert!(
+            routed,
+            "the surviving subscription still routes its updates"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rejected_reconfigure_names_the_subscription_and_the_operation() {
+        // Code 13 is "Subscription frequency reconfiguration not allowed
+        // because the subscription is configured for unfiltered dispatching"
+        // [`docs/spec/05-error-codes.md` §2].
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::AwaitControls(2),
+            line("REQERR,2,13,Reconfiguration not allowed"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Reconfigure {
+                    key: SubscriptionKey(1),
+                    max_frequency: MaxFrequencyLimit::Unlimited,
+                },
+            ],
+        )
+        .await;
+
+        let rejection = control_targets(&outcome)
+            .into_iter()
+            .find(|(_, outcome)| matches!(outcome, ControlOutcome::Rejected { .. }));
+        assert_eq!(
+            rejection.map(|(target, _)| target),
+            Some(ControlTarget::Subscription {
+                key: SubscriptionKey(1),
+                operation: SubscriptionOperation::Reconfigure,
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_session_level_control_responses_target_the_session() {
+        // `force_rebind` and `destroy` concern no subscription, so there is
+        // nothing to route them to.
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("END,31,Destroy invoked by client"),
+            Step::End,
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::Destroy { cause: None }],
+        )
+        .await;
+
+        assert_eq!(
+            control_targets(&outcome)
+                .into_iter()
+                .map(|(target, _)| target)
+                .collect::<Vec<_>>(),
+            vec![ControlTarget::Session]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_subscription_whose_add_could_not_be_sent_is_re_issued_on_the_next_bind() {
+        // The other silent-loss path: the `add` never leaves the client, so no
+        // `REQERR` will ever arrive to clean up after it. Without releasing the
+        // wire binding the subscription would look issued forever and be
+        // skipped by every later re-establishment.
+        let first = vec![line(F1_CONOK), Step::AwaitControls(1), Step::Fail("reset")];
+        let second = vec![line(F1_CONOK), Step::AwaitControls(2), line(SERVER_END)];
+
+        let transport = MockTransport::new(websocket(), vec![first, second]).failing_controls(1);
+
+        let outcome = drive_transport(
+            transport,
+            options(),
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(1),
+                spec: Box::new(spec()),
+            }],
+        )
+        .await;
+
+        // The failure is reported, named, and not silent.
+        assert_eq!(
+            control_targets(&outcome)
+                .into_iter()
+                .filter(|(_, outcome)| matches!(outcome, ControlOutcome::NotSent { .. }))
+                .map(|(target, _)| target)
+                .collect::<Vec<_>>(),
+            vec![ControlTarget::Subscription {
+                key: SubscriptionKey(1),
+                operation: SubscriptionOperation::Subscribe,
+            }]
+        );
+        // And it is issued again on the recovered session, with a fresh
+        // `LS_subId` — ids "must not be reused" within a session (§4.4).
+        let adds: Vec<String> = outcome
+            .controls()
+            .into_iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .collect();
+        assert_eq!(adds.len(), 2, "{adds:?}");
+        assert!(
+            adds.last().is_some_and(|last| last.contains("LS_subId=2")),
+            "{adds:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Message send (§12)
+    // -----------------------------------------------------------------------
+
+    fn messages(
+        outcome: &Outcome,
+    ) -> Vec<(Option<u64>, MessageSequence, Option<u64>, MessageResult)> {
+        outcome
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Message {
+                    progressive,
+                    sequence,
+                    prog,
+                    result,
+                } => Some((*progressive, sequence.clone(), *prog, result.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_message_send_is_dispatched_and_its_outcome_reported() {
+        // The spec's own `msg` example orders the parameters LS_sequence,
+        // LS_msg_prog, then LS_message [`docs/spec/03-requests.md` §12.4], and
+        // the outcome arrives as `MSGDONE`
+        // [`docs/spec/04-notifications.md` §4.1].
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("MSGDONE,Orders_Sequence,3,Processed with ID 32652506"),
+            line(SERVER_END),
+        ];
+
+        let sequence = SequenceName::try_new("Orders_Sequence").expect("a valid sequence name");
+        let message = OutgoingMessage::numbered("buy 100", NonZeroU32::new(3).expect("non-zero"))
+            .in_sequence(sequence);
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::SendMessage {
+                message: Box::new(message),
+            }],
+        )
+        .await;
+
+        let controls = outcome.controls();
+        assert_eq!(controls.len(), 1);
+        let sent = controls.first().expect("one control request");
+        assert!(sent.contains("LS_reqId=1"), "{sent}");
+        assert!(sent.contains("LS_sequence=Orders_Sequence"), "{sent}");
+        assert!(sent.contains("LS_msg_prog=3"), "{sent}");
+        assert!(sent.contains("LS_message=buy%20100"), "{sent}");
+
+        assert_eq!(
+            messages(&outcome),
+            vec![(
+                Some(1),
+                MessageSequence::Named("Orders_Sequence".to_owned()),
+                Some(3),
+                MessageResult::Done {
+                    response: "Processed with ID 32652506".to_owned(),
+                },
+            )]
+        );
+        // The submission is still reported on the control surface: `REQOK`
+        // means accepted, `MSGDONE` means processed
+        // [`docs/spec/03-requests.md` §13.1; §4.1].
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ControlResponse {
+                outcome: ControlOutcome::Accepted,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_message_outcomes_are_counted_toward_the_recovery_progressive() {
+        // `MSGDONE` and `MSGFAIL` are data notifications
+        // [`docs/spec/02-session-lifecycle.md` §5.3], so they must advance the
+        // count even though they leave on the message surface.
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            line("MSGDONE,*,1,"),
+            line("U,1,1,a|b|c"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line(F1_CONOK), line("PROG,3"), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script, second],
+            vec![SessionCommand::SendMessage {
+                message: Box::new(OutgoingMessage::numbered(
+                    "hello",
+                    NonZeroU32::new(1).expect("non-zero"),
+                )),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            messages(&outcome)
+                .first()
+                .map(|(progressive, ..)| *progressive),
+            Some(Some(2)),
+            "the MSGDONE sits between the SUBOK and the U"
+        );
+        // SUBOK (1), MSGDONE (2), U (3) — so the recovery asks from 3.
+        assert_eq!(
+            outcome.opens().get(1),
+            Some(&OpenRecord::Bind {
+                session: Some(F1_SESSION.to_owned()),
+                recovery_from: Some(3),
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_message_failure_is_reported_with_the_servers_cause() {
+        // `MSGFAIL` [`docs/spec/04-notifications.md` §4.2]; code 38 is "The
+        // specified progressive number has been skipped by timeout"
+        // [`docs/spec/05-error-codes.md` §2].
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line(
+                "MSGFAIL,Orders_Sequence,4,38,The specified progressive number has been skipped by timeout",
+            ),
+            line(SERVER_END),
+        ];
+
+        let sequence = SequenceName::try_new("Orders_Sequence").expect("a valid sequence name");
+        let message = OutgoingMessage::numbered("sell 50", NonZeroU32::new(4).expect("non-zero"))
+            .in_sequence(sequence);
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::SendMessage {
+                message: Box::new(message),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            messages(&outcome)
+                .first()
+                .map(|(_, _, _, result)| result.clone()),
+            Some(MessageResult::Failed {
+                cause: ServerCause {
+                    code: 38,
+                    message: "The specified progressive number has been skipped by timeout"
+                        .to_owned(),
+                },
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_message_refused_at_submission_gets_exactly_one_outcome() {
+        // A `REQERR` means no `MSGDONE`/`MSGFAIL` will follow
+        // [`docs/spec/03-requests.md` §13.2], so the refusal is the message's
+        // one and only outcome.
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQERR,1,33,A message with this number has already been enqueued"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::SendMessage {
+                message: Box::new(OutgoingMessage::numbered(
+                    "duplicate",
+                    NonZeroU32::new(2).expect("non-zero"),
+                )),
+            }],
+        )
+        .await;
+
+        let reported = messages(&outcome);
+        assert_eq!(reported.len(), 1, "exactly one outcome per message");
+        assert_eq!(
+            reported.first().map(|(_, _, _, result)| result.clone()),
+            Some(MessageResult::Refused {
+                cause: ServerCause {
+                    code: 33,
+                    message: "A message with this number has already been enqueued".to_owned(),
+                },
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_message_sent_while_unbound_fails_fast_and_is_never_buffered() {
+        // A subscription is desired state and is re-issued on the next session;
+        // a message is a one-shot side effect whose numbering the server
+        // deduplicates per session, so it is failed instead of held.
+        let first = vec![line(F1_CONOK), line("LOOP,60000"), Step::End];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first],
+            vec![
+                SessionCommand::SendMessage {
+                    message: Box::new(OutgoingMessage::numbered(
+                        "too late",
+                        NonZeroU32::new(1).expect("non-zero"),
+                    )),
+                },
+                SessionCommand::Shutdown,
+            ],
+        )
+        .await;
+
+        assert!(matches!(
+            messages(&outcome)
+                .first()
+                .map(|(_, _, _, result)| result.clone()),
+            Some(MessageResult::NotSent { .. })
+        ));
+        // Nothing was sent then, and nothing is sent later either.
+        assert!(outcome.controls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_fire_and_forget_message_declines_its_outcome() {
+        // `LS_msg_prog` "is mandatory whenever `LS_sequence` is specified or
+        // `LS_outcome` is set to `true`", and `LS_outcome` defaults to `true`
+        // [`docs/spec/03-requests.md` §12.1] — so a message with no progressive
+        // must decline the outcome explicitly, or the encoder refuses it.
+        let script = vec![line(F1_CONOK), Step::AwaitControls(1), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::SendMessage {
+                message: Box::new(OutgoingMessage::fire_and_forget("ping")),
+            }],
+        )
+        .await;
+
+        let controls = outcome.controls();
+        let sent = controls.first().expect("one control request");
+        assert!(sent.contains("LS_outcome=false"), "{sent}");
+        assert!(!sent.contains("LS_msg_prog"), "{sent}");
+        // No outcome was requested, so none is reported.
+        assert!(messages(&outcome).is_empty());
     }
 
     // -----------------------------------------------------------------------
