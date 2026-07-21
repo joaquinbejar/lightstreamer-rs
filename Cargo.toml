@@ -26,6 +26,12 @@ default = []
 # default because it pulls in a JSON stack; see ADR-0004 -- the algorithm is
 # advertised to the server via `LS_supported_diffs` only when compiled in.
 json-patch = ["dep:serde_json", "dep:json-patch"]
+# A builder that assembles an `ItemUpdate` with no session behind it, so a
+# crate depending on this one can unit-test its own field parsing against
+# captured payloads. Pulls in no dependency and adds nothing but the
+# `test_util` module; enable it under `[dev-dependencies]` so it never reaches
+# a release build.
+test-util = []
 
 [dependencies]
 thiserror = "2.0"

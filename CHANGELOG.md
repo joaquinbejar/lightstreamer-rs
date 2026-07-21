@@ -54,6 +54,11 @@ The most visible differences:
   message sending, and an error taxonomy that preserves the server's codes as
   structured fields — including which of the protocol's two overlapping code
   catalogs a code belongs to.
+- The off-by-default `test-util` feature, exposing
+  `test_util::ItemUpdateBuilder`: it assembles an `ItemUpdate` with no session
+  behind it, so a crate depending on this one can unit-test its own field
+  parsing against captured payloads. It pulls in no dependency and adds
+  nothing else to the public surface; enable it under `[dev-dependencies]`.
 
 ### Known gaps
 

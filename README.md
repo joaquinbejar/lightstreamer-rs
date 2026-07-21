@@ -64,8 +64,9 @@ futures-util = "0.3"   # for StreamExt, to poll the update streams
 | Feature | Default | Pulls in | Gives you |
 |---|---|---|---|
 | `json-patch` | **off** | `serde_json`, `json-patch` | decoding of `^P` JSON Patch diff-encoded field values (RFC 6902) |
+| `test-util` | **off** | nothing | `test_util::ItemUpdateBuilder`, for building an `ItemUpdate` in *your* tests |
 
-The feature is off by default because it adds a JSON stack to a crate others
+`json-patch` is off by default because it adds a JSON stack to a crate others
 depend on. Leaving it off is safe rather than lossy: this client advertises
 to the server exactly the diff formats it has compiled in
 (`LS_supported_diffs`), so a server will never send a `^P` value that cannot
@@ -74,6 +75,31 @@ benefit from patch compression:
 
 ```toml
 lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["json-patch"] }
+```
+
+`test-util` exists because an `ItemUpdate` cannot be constructed from outside
+this crate — forging one that no session produced is not something an
+application should be able to do by accident. Your own parsing layer still
+deserves unit tests, so the feature adds a builder and nothing else: no
+dependency, no behaviour change, no other public item. Enable it under
+`[dev-dependencies]`, where Cargo turns it on for your tests and leaves your
+release build untouched:
+
+```toml
+[dev-dependencies]
+lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["test-util"] }
+```
+
+```rust,ignore
+use lightstreamer_rs::test_util::ItemUpdateBuilder;
+use lightstreamer_rs::FieldValue;
+
+let update = ItemUpdateBuilder::new("CS.D.EURUSD.CFD.IP", ["BID", "OFFER"])
+    .changed("BID", FieldValue::Text("1.0921"))
+    .unchanged("OFFER", FieldValue::Null)
+    .build();
+
+assert_eq!(my_parser(&update).bid, Some("1.0921".to_owned()));
 ```
 
 #### Requirements

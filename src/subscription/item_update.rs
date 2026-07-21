@@ -358,6 +358,45 @@ impl SubscriptionSchema {
         }
     }
 
+    /// Builds a schema from a name per position, [`None`] meaning the caller
+    /// declared none for that position.
+    ///
+    /// [`new`](Self::new) can only take declared names as a *prefix*, which is
+    /// what a subscription's item and field lists actually are. The
+    /// `test-util` builder ([`crate::test_util`]) needs to name one item at an
+    /// arbitrary position, so it supplies the names slot by slot instead.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub(crate) fn from_optional_names(
+        items: Vec<Option<String>>,
+        fields: Vec<Option<String>>,
+        command_fields: Option<(usize, usize)>,
+    ) -> Self {
+        /// Maps each slot to a declared name or to its 1-based position.
+        fn named(slots: Vec<Option<String>>) -> Vec<SchemaName> {
+            slots
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| match name {
+                    Some(text) => SchemaName::declared(text),
+                    // Cannot overflow: `index` is an index into a `Vec`.
+                    None => SchemaName::positional(index + 1),
+                })
+                .collect()
+        }
+
+        let (key_field, command_field) = match command_fields {
+            Some((key, command)) => (Some(key), Some(command)),
+            None => (None, None),
+        };
+        Self {
+            items: named(items),
+            fields: named(fields),
+            key_field,
+            command_field,
+        }
+    }
+
     /// Zips `count` positions against the names the caller declared.
     #[must_use]
     fn name_positions(count: usize, declared: &[String]) -> Vec<SchemaName> {

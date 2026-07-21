@@ -119,6 +119,16 @@
 //! them change without breaking you. What [`lib.rs`](self) re-exports is the
 //! whole public surface and the whole semantic-versioning promise.
 //!
+//! # Testing your own code against this crate
+//!
+//! An [`ItemUpdate`] cannot be constructed from outside, because forging one
+//! that a session never produced is not something an application should be
+//! able to do by accident. Your own parsing layer still deserves unit tests,
+//! so the off-by-default `test-util` feature adds one thing and nothing else:
+//! `test_util::ItemUpdateBuilder`, which assembles an update with no session
+//! behind it. Enable it under `[dev-dependencies]` and it never reaches your
+//! release build.
+//!
 //! # Errors
 //!
 //! Everything fallible returns [`Result`], and [`Error`] has one variant per
@@ -142,6 +152,9 @@
 
 pub mod config;
 pub mod error;
+
+#[cfg(feature = "test-util")]
+pub mod test_util;
 
 mod client;
 mod protocol;
