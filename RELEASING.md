@@ -75,9 +75,15 @@ Once every gate above is green:
 2. Finalize the `CHANGELOG.md` `[Unreleased]` section: give it the release
    version and date, confirm the licence section still accurately describes
    what shipped.
-3. Run `make release-check`, then `make pre-push` again against the bumped
-   version (a version bump touches `Cargo.lock`; re-run the full gate, not
-   just `release-check`).
+3. **`make clean` first**, then `make release-check` and `make pre-push`
+   against the bumped version (a version bump touches `Cargo.lock`; re-run the
+   full gate, not just `release-check`). Verify from a clean build, not an
+   incremental one: an incremental `target/` can hide a real failure behind a
+   stale artifact, or manufacture one — switching toolchains mid-investigation
+   (`cargo +1.85` vs `cargo +1.88` against the same `target/`) produced a
+   false-positive error while building the MSRV gate, and it only went away
+   after `cargo clean`. Do not let that happen at release time, when it is
+   much more expensive to notice.
 4. Commit the version bump and changelog finalization.
 5. Tag the release: `git tag -a v1.x.y -m "v1.x.y"`.
 6. Publish: `cargo login <token>` (never commit or echo the token), then
