@@ -26,9 +26,17 @@
 //! export IG_IDENTIFIER=…       # your IG username
 //! export IG_PASSWORD=…
 //! export IG_ENV=demo           # or `live`; defaults to demo
-//! export IG_EPICS=IX.D.FTSE.DAILY.IP,CS.D.EURUSD.MINI.IP   # optional
+//! export IG_EPICS=CS.D.GBPUSD.CFD.IP,IX.D.FTSE.CFD.IP      # optional
 //!
 //! cargo run --example ig_stream
+//! ```
+//!
+//! If something else already logged in, hand the tokens over directly and the
+//! REST step is skipped:
+//!
+//! ```text
+//! export IG_CST=…  IG_XST=…  IG_ACCOUNT_ID=…
+//! export IG_LS_ENDPOINT=https://demo-apd.marketdatasystems.com   # optional
 //! ```
 //!
 //! # Item and field names
@@ -44,8 +52,23 @@
 //! | `TRADE:<accountId>` | DISTINCT | deal confirmations and position updates, each its own event | no — add it the same way, in `SubscriptionMode::Distinct` |
 //! | `CHART:<epic>:<scale>` | MERGE | OHLC candles as they form | no |
 //!
-//! A refused subscription arrives as `Rejected` with IG's own code, which is
-//! usually enough to tell a wrong field name from a wrong epic.
+//! A refused subscription arrives as `Rejected`. In practice IG answers with
+//! code `-1` and a message worth reading:
+//!
+//! - **"Insufficient permissions"** or **"Invalid account type"** — the epic is
+//!   real but this account cannot stream it. Try another; nothing is wrong with
+//!   the client.
+//! - a complaint about the schema — a field name IG does not publish for that
+//!   item type.
+//!
+//! Note the sign: a code of `-1` is **below the protocol's own range**, which
+//! means IG's Metadata Adapter supplied it rather than the Lightstreamer
+//! kernel [`docs/spec/05-error-codes.md` §2]. `ServerError::is_adapter_defined`
+//! reports exactly that, and it is the difference between "the protocol
+//! refused you" and "your broker refused you".
+//!
+//! Subscribing to several epics at once is all-or-nothing: one unreachable
+//! epic refuses the whole subscription, so isolate before concluding anything.
 
 use std::env;
 use std::process::ExitCode;
@@ -64,8 +87,17 @@ const DEMO_GATEWAY: &str = "https://demo-api.ig.com/gateway/deal";
 /// deliberate about pointing anything at it.
 const LIVE_GATEWAY: &str = "https://api.ig.com/gateway/deal";
 
+/// IG's demo streaming host, used when `IG_LS_ENDPOINT` is not given.
+const DEMO_STREAM_HOST: &str = "https://demo-apd.marketdatasystems.com";
+
+/// IG's live streaming host.
+const LIVE_STREAM_HOST: &str = "https://apd.marketdatasystems.com";
+
 /// Instruments to watch when `IG_EPICS` is not set.
-const DEFAULT_EPICS: &str = "IX.D.FTSE.DAILY.IP";
+///
+/// Verified against a demo account: not every epic is reachable from every
+/// account, so these are two that were.
+const DEFAULT_EPICS: &str = "CS.D.GBPUSD.CFD.IP,IX.D.FTSE.CFD.IP";
 
 /// The price fields asked for on a `MARKET:` item.
 const MARKET_FIELDS: [&str; 5] = [
@@ -79,14 +111,27 @@ const MARKET_FIELDS: [&str; 5] = [
 /// The account fields asked for on an `ACCOUNT:` item.
 const ACCOUNT_FIELDS: [&str; 4] = ["PNL", "AVAILABLE_CASH", "MARGIN", "EQUITY"];
 
-/// What IG's `POST /session` (Version 2) returns in its body.
+/// What `POST /session` (Version 2) returns in its body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct IgSession {
+struct IgSessionBody {
     /// The address of the Lightstreamer server assigned to this account.
     lightstreamer_endpoint: String,
     /// The account the session is bound to; this is the TLCP user.
     current_account_id: String,
+}
+
+/// Everything needed to open a TLCP session against IG.
+#[derive(Debug)]
+struct IgSession {
+    /// The Lightstreamer server assigned to this account.
+    lightstreamer_endpoint: String,
+    /// The account id, which IG expects as the TLCP user.
+    current_account_id: String,
+    /// IG's client security token, from the `CST` response header.
+    cst: String,
+    /// IG's account security token, from the `X-SECURITY-TOKEN` header.
+    security_token: String,
 }
 
 #[tokio::main]
@@ -101,6 +146,43 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let session = match tokens_from_environment() {
+        // Somebody else already logged in — a separate service, or a shell
+        // that ran the REST call. Skip straight to streaming.
+        Some(session) => session,
+        None => log_in().await?,
+    };
+
+    connect_and_stream(session).await
+}
+
+/// Uses tokens supplied directly, when the REST login happened elsewhere.
+///
+/// Requires `IG_CST`, `IG_XST` and `IG_ACCOUNT_ID`; `IG_LS_ENDPOINT` defaults
+/// to IG's demo streaming host, or its live one when `IG_ENV=live`.
+fn tokens_from_environment() -> Option<IgSession> {
+    let cst = env::var("IG_CST").ok()?;
+    let security_token = env::var("IG_XST").ok()?;
+    let current_account_id = env::var("IG_ACCOUNT_ID").ok()?;
+
+    let lightstreamer_endpoint = env::var("IG_LS_ENDPOINT").unwrap_or_else(|_| {
+        match env::var("IG_ENV").as_deref() {
+            Ok("live") => LIVE_STREAM_HOST,
+            _ => DEMO_STREAM_HOST,
+        }
+        .to_owned()
+    });
+
+    Some(IgSession {
+        lightstreamer_endpoint,
+        current_account_id,
+        cst,
+        security_token,
+    })
+}
+
+/// Logs in to IG's REST API and collects the tokens it answers with.
+async fn log_in() -> Result<IgSession, Box<dyn std::error::Error>> {
     let api_key = required("IG_API_KEY")?;
     let identifier = required("IG_IDENTIFIER")?;
     let password = required("IG_PASSWORD")?;
@@ -135,15 +217,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The tokens live in the headers, the endpoint in the body.
     let cst = header(&response, "CST")?;
     let security_token = header(&response, "X-SECURITY-TOKEN")?;
-    let session: IgSession = response.json().await?;
+    let body: IgSessionBody = response.json().await?;
 
-    println!("logged in as {}", session.current_account_id);
+    Ok(IgSession {
+        lightstreamer_endpoint: body.lightstreamer_endpoint,
+        current_account_id: body.current_account_id,
+        cst,
+        security_token,
+    })
+}
+
+/// Opens the TLCP session and prints everything that arrives.
+async fn connect_and_stream(session: IgSession) -> Result<(), Box<dyn std::error::Error>> {
+    println!("account {}", session.current_account_id);
     println!("streaming endpoint: {}", session.lightstreamer_endpoint);
 
     // --- Step 2: connect to Lightstreamer with those tokens ---------------
     // IG's spelling, not TLCP's. To this crate it is just a password, and it
     // is never logged or echoed in an error.
-    let ls_password = format!("CST-{cst}|XST-{security_token}");
+    let ls_password = format!("CST-{}|XST-{}", session.cst, session.security_token);
 
     let config = ClientConfig::builder(ServerAddress::try_new(&session.lightstreamer_endpoint)?)
         .with_credentials(Credentials::new(&session.current_account_id, ls_password))

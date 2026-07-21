@@ -60,6 +60,12 @@ specification's own transcripts use. No credentials, no setup.
 | `cargo run --example demo_chat` | Sending messages upstream and correlating each outcome to the message that caused it |
 | `cargo run --example demo_resilience` | What a reconnection *meant* — break your network while it runs and watch it say so |
 
+One more needs an account of your own:
+
+| | |
+|---|---|
+| `cargo run --example ig_stream` | **IG**: REST login for the CST/XST tokens, then live prices and account P&L over TLCP. Credentials come from the environment; defaults to IG's demo gateway |
+
 ## What this crate gives you
 
 - **Delivery is a `Stream`, not a callback.** Subscribing yields an update
