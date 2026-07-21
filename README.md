@@ -64,7 +64,7 @@ futures-util = "0.3"   # for StreamExt, to poll the update streams
 | Feature | Default | Pulls in | Gives you |
 |---|---|---|---|
 | `json-patch` | **off** | `serde_json`, `json-patch` | decoding of `^P` JSON Patch diff-encoded field values (RFC 6902) |
-| `test-util` | **off** | nothing | `test_util::ItemUpdateBuilder`, for building an `ItemUpdate` in *your* tests |
+| `test-util` | **off** | nothing | the `test_util` module: builders for the event payloads, so *your* tests can construct them |
 
 `json-patch` is off by default because it adds a JSON stack to a crate others
 depend on. Leaving it off is safe rather than lossy: this client advertises
@@ -77,13 +77,15 @@ benefit from patch compression:
 lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["json-patch"] }
 ```
 
-`test-util` exists because an `ItemUpdate` cannot be constructed from outside
-this crate — forging one that no session produced is not something an
-application should be able to do by accident. Your own parsing layer still
-deserves unit tests, so the feature adds a builder and nothing else: no
-dependency, no behaviour change, no other public item. Enable it under
-`[dev-dependencies]`, where Cargo turns it on for your tests and leaves your
-release build untouched:
+`test-util` exists because the payloads this crate delivers cannot be built
+from outside it. An `ItemUpdate` is assembled from private subscription state,
+so that nothing can forge an update a real session never produced; the rest
+are `#[non_exhaustive]`, so that a field can be added without breaking every
+consumer. Both are deliberate, and neither is a reason your own parsing,
+reconnection or message-handling logic should be untestable. The feature adds
+builders for them and nothing else — no dependency, no behaviour change, no
+addition to the default surface. Enable it under `[dev-dependencies]`, where
+Cargo turns it on for your tests and leaves your release build untouched:
 
 ```toml
 [dev-dependencies]
@@ -91,20 +93,26 @@ lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["test-util"] }
 ```
 
 ```rust,ignore
-use lightstreamer_rs::test_util::ItemUpdateBuilder;
-use lightstreamer_rs::FieldValue;
+use lightstreamer_rs::test_util::{ConnectedBuilder, ItemUpdateBuilder};
+use lightstreamer_rs::{Continuity, FieldValue};
 
 let update = ItemUpdateBuilder::new("CS.D.EURUSD.CFD.IP", ["BID", "OFFER"])
     .changed("BID", FieldValue::Text("1.0921"))
     .unchanged("OFFER", FieldValue::Null)
     .build();
-
 assert_eq!(my_parser(&update).bid, Some("1.0921".to_owned()));
+
+// And the reasoning this crate asks you to do about reconnections.
+let replaced = ConnectedBuilder::new("S5678", Continuity::Replaced {
+    previous_session_id: Some("S1234".to_owned()),
+})
+.build();
+assert!(my_state_policy(&replaced).must_rebuild());
 ```
 
 #### Requirements
 
-- Rust 2024 edition, stable toolchain, MSRV **1.85**.
+- Rust 2024 edition, stable toolchain, MSRV **1.88**.
 - A Lightstreamer server (7.4.0 or greater for TLCP 2.5.0), or an account with
   a provider that runs one.
 

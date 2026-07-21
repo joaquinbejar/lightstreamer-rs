@@ -2,7 +2,9 @@
 name = "lightstreamer-rs"
 version = "1.0.0-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+# Let-chains, used in the transport and subscription layers, stabilized in
+# 1.88. The MSRV is exercised by a CI job rather than asserted here.
+rust-version = "1.88"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust client for the Lightstreamer TLCP protocol, for real-time data streaming."
 license = "MIT"
