@@ -21,6 +21,27 @@
 //! itself only ever awaits sends *towards the caller*, which the caller alone
 //! can unblock.
 //!
+//! # Why the two internal queues are unbounded
+//!
+//! Unbounded is a deliberate choice here and not an oversight, because neither
+//! queue is a data path and both are bounded in practice by something the
+//! caller has already paid for:
+//!
+//! - **Router commands.** One `Register` per [`crate::Client::subscribe`] call
+//!   and one `StreamDropped` per [`crate::Updates`] dropped — so at most one
+//!   message per subscription the caller asked for and one per subscription it
+//!   gave up. `subscribe` then awaits the session's *bounded* command channel,
+//!   which is what throttles a caller subscribing in a loop.
+//! - **Unsubscriptions.** One per `StreamDropped`, and therefore bounded by
+//!   the same count.
+//!
+//! Bounding them would make things worse, not better. The router must never
+//! await the session's command channel — that is the deadlock this module is
+//! shaped around — and `Updates::drop` cannot await at all, so a bounded queue
+//! would force `try_send` and a dropped unsubscription, which is precisely the
+//! silent leak the design exists to prevent. Neither queue grows with server
+//! traffic, which is the dimension an untrusted peer controls.
+//!
 //! # Backpressure
 //!
 //! Every send towards a caller's stream is awaited, never dropped and never
@@ -28,10 +49,17 @@
 //! through it the driver and the socket. That is the documented contract of
 //! [`Updates`](crate::Updates) and [`SessionEvents`](crate::SessionEvents),
 //! and the reasoning is on those types.
+//!
+//! The single exception is an ordered stop, which is exempt from backpressure
+//! for the same reason it is in the session layer: a caller that stopped
+//! reading may stall the client, but must not be able to make it unstoppable.
+//! Every awaited send here races the session's stop signal, and whatever had
+//! not been delivered when it fires is discarded along with the streams it was
+//! going to.
 
 use std::collections::HashMap;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::client::events::{
     ClosedReason, Connected, Resubscribed, ServerInfo, SessionEvent, SubscriptionId,
@@ -45,21 +73,14 @@ use crate::session::{
 };
 use crate::subscription::manager::SubscriptionManager;
 
-/// How many notifications the router will hold for a subscription whose stream
-/// has not been registered yet.
-///
-/// The window this covers is the few microseconds between
-/// [`SessionHandle::subscribe`] returning a key and the registration reaching
-/// this task; nothing can arrive from the server in it, since the `add`
-/// request has not even been encoded. The buffer exists so that the ordering
-/// is guaranteed rather than merely overwhelmingly likely, and the cap exists
-/// so that a bug cannot turn it into a leak.
-const EARLY_BUFFER_LIMIT: usize = 64;
-
 /// What the client asks the router to do.
 #[derive(Debug)]
 pub(crate) enum RouterCommand {
     /// A new subscription's stream is ready to receive events.
+    ///
+    /// Always sent **before** the `add` that could produce an event for it is
+    /// queued for the session, so that no notification can outrun its
+    /// registration. See [`crate::Client::subscribe`].
     Register {
         /// Which subscription.
         id: SubscriptionId,
@@ -67,6 +88,15 @@ pub(crate) enum RouterCommand {
         manager: Box<SubscriptionManager>,
         /// Where its events go.
         events: mpsc::Sender<SubscriptionEvent>,
+    },
+
+    /// The registration could not be turned into a request: undo it.
+    ///
+    /// Unlike [`RouterCommand::StreamDropped`] this asks for **no**
+    /// unsubscription — nothing was ever subscribed.
+    Unregister {
+        /// Which subscription.
+        id: SubscriptionId,
     },
 
     /// The caller dropped an [`Updates`](crate::Updates) stream, which means
@@ -117,10 +147,11 @@ pub(crate) struct Router {
     unsubscribe: mpsc::UnboundedSender<SubscriptionKey>,
     /// Fired once, when the session first binds or first fails.
     ready: Option<oneshot::Sender<Result<Box<Connected>, Error>>>,
+    /// Raised when the client is being torn down. The one thing that can
+    /// interrupt a send towards a caller.
+    stop: watch::Receiver<bool>,
 
     subscriptions: HashMap<SubscriptionKey, Registered>,
-    /// Notifications that arrived for a key not yet registered.
-    early: HashMap<SubscriptionKey, Vec<crate::protocol::response::Notification>>,
 }
 
 impl Router {
@@ -131,6 +162,7 @@ impl Router {
         session_out: mpsc::Sender<SessionEvent>,
         unsubscribe: mpsc::UnboundedSender<SubscriptionKey>,
         ready: oneshot::Sender<Result<Box<Connected>, Error>>,
+        stop: watch::Receiver<bool>,
     ) -> Self {
         Self {
             session_events,
@@ -138,13 +170,21 @@ impl Router {
             session_out: Some(session_out),
             unsubscribe,
             ready: Some(ready),
+            stop,
             subscriptions: HashMap::new(),
-            early: HashMap::new(),
         }
     }
 
-    /// Runs until the session ends or every caller-side stream is gone.
+    /// Runs until the session ends.
+    ///
+    /// Not until the *client* ends: when the last [`crate::Client`] and
+    /// [`Updates`](crate::Updates) are dropped this task stops taking commands
+    /// but keeps forwarding, because the session it is fed from is shutting
+    /// down at the same moment and its closing event is the one thing a caller
+    /// holding [`SessionEvents`](crate::SessionEvents) is still owed. It ends
+    /// when the driver's channel does, which is a bounded wait away.
     pub(crate) async fn run(mut self) {
+        let mut taking_commands = true;
         loop {
             // Deliberately biased towards commands. A registration must be in
             // place before the first notification for its subscription is
@@ -152,14 +192,19 @@ impl Router {
             // that could produce one has reached the wire.
             let done = tokio::select! {
                 biased;
-                command = self.commands.recv() => match command {
+                command = self.commands.recv(), if taking_commands => match command {
                     Some(command) => {
                         self.on_command(command);
                         false
                     }
-                    // The client and every stream are gone.
-                    None => true,
+                    // The client and every stream are gone; the session is on
+                    // its way out behind them.
+                    None => {
+                        taking_commands = false;
+                        false
+                    }
                 },
+                () = stopped(&mut self.stop) => true,
                 event = self.session_events.recv() => match event {
                     Some(event) => self.on_session_event(event).await,
                     // The driver stopped without a closing event.
@@ -184,65 +229,35 @@ impl Router {
                 manager,
                 events,
             } => {
-                let key = id.key();
                 self.subscriptions.insert(
-                    key,
+                    id.key(),
                     Registered {
                         manager: *manager,
                         events,
                     },
                 );
-                if let Some(buffered) = self.early.remove(&key) {
-                    tracing::debug!(
-                        id = id.get(),
-                        count = buffered.len(),
-                        "delivering notifications buffered before registration"
-                    );
-                    // Re-queueing rather than delivering inline keeps every
-                    // send in one place; the driver cannot have produced more
-                    // than a handful here.
-                    for notification in buffered {
-                        self.deliver_buffered(key, notification);
-                    }
-                }
             }
 
+            RouterCommand::Unregister { id } => {
+                self.subscriptions.remove(&id.key());
+                tracing::debug!(id = id.get(), "registration rolled back");
+            }
+
+            // Unconditional, and deliberately not predicated on the removal
+            // having found anything. The router also discovers a dropped
+            // receiver when a send to it fails, and if that discovery removed
+            // the registration first, a conditional unsubscribe here would
+            // silently do nothing — leaving the server streaming into a
+            // subscription whose public stream no longer exists. `Updates`
+            // sends this exactly once, from its `Drop`, so it is the only
+            // place the unsubscription is issued and it cannot be issued
+            // twice.
             RouterCommand::StreamDropped { id } => {
-                if self.subscriptions.remove(&id.key()).is_some()
-                    && self.unsubscribe.send(id.key()).is_err()
-                {
+                self.subscriptions.remove(&id.key());
+                if self.unsubscribe.send(id.key()).is_err() {
                     tracing::debug!(id = id.get(), "cannot unsubscribe: the client has stopped");
                 }
             }
-        }
-    }
-
-    /// Applies a notification that arrived before its stream was registered.
-    ///
-    /// Synchronous by construction: it runs while draining the early buffer,
-    /// where awaiting a caller's channel would reorder the delivery. The event
-    /// is dropped only if the caller's buffer is already full, which cannot
-    /// happen for a stream that has just been created.
-    fn deliver_buffered(
-        &mut self,
-        key: SubscriptionKey,
-        notification: crate::protocol::response::Notification,
-    ) {
-        let Some(entry) = self.subscriptions.get_mut(&key) else {
-            return;
-        };
-        let event = match entry.manager.handle(&notification) {
-            Ok(Some(event)) => SubscriptionEvent::from_wire(event),
-            Ok(None) => return,
-            Err(error) => SubscriptionEvent::Undecodable {
-                detail: error.to_string(),
-            },
-        };
-        if entry.events.try_send(event).is_err() {
-            tracing::warn!(
-                key = key.get(),
-                "a buffered notification could not be delivered to a brand-new stream"
-            );
         }
     }
 
@@ -366,7 +381,12 @@ impl Router {
                 tracing::warn!(key = key.get(), code = cause.code(), "subscription refused");
                 match self.subscriptions.remove(&key) {
                     Some(entry) => {
-                        let _ = entry.events.send(SubscriptionEvent::Rejected(cause)).await;
+                        deliver(
+                            &entry.events,
+                            SubscriptionEvent::Rejected(cause),
+                            &mut self.stop,
+                        )
+                        .await;
                     }
                     None => self.emit(SessionEvent::RequestRejected(cause)).await,
                 }
@@ -433,9 +453,8 @@ impl Router {
         let Some(entry) = self.subscriptions.get(&key) else {
             return;
         };
-        if entry.events.send(event).await.is_err() {
-            self.subscriptions.remove(&key);
-        }
+        let sender = entry.events.clone();
+        deliver(&sender, event, &mut self.stop).await;
     }
 
     /// Sends one notification to the subscription it belongs to.
@@ -445,15 +464,14 @@ impl Router {
         notification: crate::protocol::response::Notification,
     ) {
         let Some(entry) = self.subscriptions.get_mut(&key) else {
-            let buffered = self.early.entry(key).or_default();
-            if buffered.len() < EARLY_BUFFER_LIMIT {
-                buffered.push(notification);
-            } else {
-                tracing::warn!(
-                    key = key.get(),
-                    "dropping a notification for an unregistered subscription"
-                );
-            }
+            // Registration precedes the request that could produce this, so an
+            // unknown key means the stream is already gone: either it ended on
+            // a terminal event or the caller dropped it. Nothing to deliver it
+            // to, and nothing to hold it for.
+            tracing::debug!(
+                key = key.get(),
+                "a notification arrived for a subscription with no stream"
+            );
             return;
         };
 
@@ -468,14 +486,14 @@ impl Router {
             }
         };
         let terminal = event.is_terminal();
+        let sender = entry.events.clone();
 
-        // Awaited, never dropped: see the module documentation.
-        if entry.events.send(event).await.is_err() {
-            // The caller dropped the stream between the drop notification and
-            // this event. Its `Drop` has already asked for the unsubscription.
-            self.subscriptions.remove(&key);
-            return;
-        }
+        // Awaited, never dropped: see the module documentation. A failure
+        // means the caller dropped the stream, and its `Drop` has already
+        // queued the `StreamDropped` that both deregisters it and
+        // unsubscribes — so the registration is deliberately left in place
+        // here for that command to find.
+        deliver(&sender, event, &mut self.stop).await;
         if terminal {
             self.subscriptions.remove(&key);
         }
@@ -487,10 +505,10 @@ impl Router {
     /// it does not want them; forwarding then stops for good rather than
     /// blocking the session on a receiver nobody holds.
     async fn emit(&mut self, event: SessionEvent) {
-        let Some(sender) = self.session_out.as_ref() else {
+        let Some(sender) = self.session_out.clone() else {
             return;
         };
-        if sender.send(event).await.is_err() {
+        if deliver(&sender, event, &mut self.stop).await == Delivery::ReceiverGone {
             tracing::debug!("session event stream dropped; no longer forwarding session events");
             self.session_out = None;
         }
@@ -511,6 +529,56 @@ impl Router {
     }
 }
 
+/// What became of one send towards a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// It arrived.
+    Delivered,
+    /// The caller had dropped the receiving stream.
+    ReceiverGone,
+    /// A stop was ordered while waiting for room; the event was discarded.
+    Stopped,
+}
+
+/// Sends one event towards a caller, waiting for room but not for ever.
+///
+/// The wait is the documented backpressure contract. The one thing that ends it
+/// early is an ordered stop, because a client being torn down must not be held
+/// open by a stream nobody is reading.
+async fn deliver<T>(
+    sender: &mpsc::Sender<T>,
+    event: T,
+    stop: &mut watch::Receiver<bool>,
+) -> Delivery {
+    tokio::select! {
+        biased;
+        permit = sender.reserve() => match permit {
+            Ok(permit) => {
+                permit.send(event);
+                Delivery::Delivered
+            }
+            Err(_) => Delivery::ReceiverGone,
+        },
+        () = stopped(stop) => {
+            tracing::debug!("a stop was ordered while a caller's stream was full");
+            Delivery::Stopped
+        }
+    }
+}
+
+/// Resolves as soon as an ordered stop is signalled, or the session that could
+/// signal one is gone.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Issues the unsubscriptions that dropped streams asked for.
 ///
 /// A task of its own for the reason in this module's documentation: it awaits
@@ -522,22 +590,31 @@ pub(crate) async fn issue_unsubscriptions(
     handle: SessionHandle,
     mut keys: mpsc::UnboundedReceiver<SubscriptionKey>,
     mut shutdown: mpsc::Receiver<()>,
+    mut stop: watch::Receiver<bool>,
 ) {
     loop {
-        tokio::select! {
+        let key = tokio::select! {
             key = keys.recv() => match key {
-                Some(key) => {
-                    if handle.unsubscribe(key).await.is_err() {
-                        tracing::debug!(key = key.get(), "the session stopped before unsubscribing");
-                        break;
-                    }
-                }
+                Some(key) => key,
                 None => break,
             },
             // Every sender is a live `Client`; when the last one is dropped
             // this resolves to `None` and the handle held here goes with it,
             // which is what lets the driver notice it has no owner left.
             _ = shutdown.recv() => break,
+            () = stopped(&mut stop) => break,
+        };
+        // The session's command channel is bounded, so this can wait — but not
+        // past a stop, or a driver that is itself blocked would keep this task
+        // alive for good.
+        let sent = tokio::select! {
+            biased;
+            result = handle.unsubscribe(key) => result.is_ok(),
+            () = stopped(&mut stop) => break,
+        };
+        if !sent {
+            tracing::debug!(key = key.get(), "the session stopped before unsubscribing");
+            break;
         }
     }
     drop(handle);

@@ -39,11 +39,12 @@ use std::collections::VecDeque;
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
         Error as WsError, Message,
         client::IntoClientRequest as _,
         http::{HeaderValue, header::SEC_WEBSOCKET_PROTOCOL},
+        protocol::WebSocketConfig,
     },
 };
 
@@ -72,6 +73,26 @@ const CONTROL_LINK_SAME: &str = "*";
 /// The scheme prefix separator of an absolute URL.
 const SCHEME_SEPARATOR: &str = "://";
 
+/// The largest WebSocket message this transport will accept, in bytes.
+///
+/// The specification sets no limit on a notification's length, and a server
+/// that never sends a line terminator would otherwise be able to make this
+/// client allocate until the process dies. The ceiling is deliberately far
+/// above anything TLCP produces — `LS_content_length` bounds a whole stream
+/// connection, not one message, and a single update line carries one item's
+/// fields [`docs/spec/04-notifications.md` §3.2] — so it is a defence against
+/// a hostile or broken peer rather than a protocol limit.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The largest run of bytes this transport will hold waiting for a line
+/// terminator, in bytes.
+///
+/// Distinct from [`MAX_MESSAGE_BYTES`] because a fragment may legitimately
+/// straddle messages: it is the total held across them, not within one. Every
+/// line is CR-LF terminated [`docs/spec/01-foundations.md` §7.1], so a
+/// fragment this long is not one this client will ever be able to complete.
+const MAX_PARTIAL_LINE_BYTES: usize = MAX_MESSAGE_BYTES;
+
 // ---------------------------------------------------------------------------
 // Line reassembly
 // ---------------------------------------------------------------------------
@@ -89,8 +110,18 @@ const SCHEME_SEPARATOR: &str = "://";
 ///   boundary, so a line may in principle straddle two messages.
 ///
 /// A trailing fragment with no terminator is therefore held back until the
-/// rest of it arrives, and released only when the connection closes cleanly
-/// (see [`LineBuffer::take_partial`]).
+/// rest of it arrives, and discarded if the connection ends before it does
+/// (see [`LineBuffer::discard_partial`]).
+///
+/// # Bounded by construction
+///
+/// Everything a peer controls here is capped. The fragment held across
+/// messages cannot exceed [`MAX_PARTIAL_LINE_BYTES`], so a server that sends
+/// bytes and never a terminator is refused rather than allowed to allocate
+/// until the process dies. Scanning is linear in the bytes received, not
+/// quadratic: each message is scanned once from where the previous scan
+/// stopped, and the buffer is compacted once per message rather than once per
+/// line.
 //
 // SPEC-AMBIGUITY: `docs/spec/01-foundations.md` §6.2.5 states that a
 // creation/binding response may span a sequence of text messages but does not
@@ -102,6 +133,9 @@ const SCHEME_SEPARATOR: &str = "://";
 struct LineBuffer {
     /// Bytes received after the last line terminator.
     partial: String,
+    /// How much of `partial` has already been searched for a terminator.
+    /// Prevents rescanning a long fragment once per message.
+    scanned: usize,
     /// Complete lines, terminator already stripped, in arrival order.
     ready: VecDeque<String>,
 }
@@ -113,6 +147,12 @@ impl LineBuffer {
     /// CR-LF [`docs/spec/01-foundations.md` §7.1], but that section flags that
     /// the spec never says whether a receiver must reject a bare LF; tolerating
     /// one costs nothing and cannot corrupt a well-formed line.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Capacity`] if the peer has sent more than
+    /// [`MAX_PARTIAL_LINE_BYTES`] with no terminator between them. The buffer
+    /// is left cleared: there is nothing recoverable in a line that long.
     //
     // SPEC-AMBIGUITY: `docs/spec/01-foundations.md` §7.1 mandates CR-LF but
     // leaves "reject or tolerate a bare LF/CR" open. This accepts bare LF.
@@ -122,16 +162,39 @@ impl LineBuffer {
     // [`docs/spec/01-foundations.md` §7.1], so an empty line cannot be one;
     // yielding it would push a guaranteed parse failure up to the session
     // layer. Dropping is framing, not interpretation.
-    fn push_message(&mut self, text: &str) {
+    fn push_message(&mut self, text: &str) -> Result<(), TransportError> {
         self.partial.push_str(text);
-        while let Some(index) = self.partial.find('\n') {
-            let raw: String = self.partial.drain(..=index).collect();
-            let without_lf = raw.strip_suffix('\n').unwrap_or(raw.as_str());
-            let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+
+        // One pass over the bytes that have not been looked at yet, and one
+        // compaction at the end. Draining the front per line would rewrite the
+        // whole buffer once per line, which is quadratic in a message carrying
+        // many of them.
+        let mut consumed = 0;
+        let mut cursor = self.scanned;
+        while let Some(offset) = self.partial.get(cursor..).and_then(|rest| rest.find('\n')) {
+            let end = cursor.saturating_add(offset);
+            let raw = self.partial.get(consumed..end).unwrap_or_default();
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
             if !line.is_empty() {
                 self.ready.push_back(line.to_owned());
             }
+            consumed = end.saturating_add(1);
+            cursor = consumed;
         }
+        if consumed > 0 {
+            self.partial.drain(..consumed);
+        }
+        self.scanned = self.partial.len();
+
+        if self.partial.len() > MAX_PARTIAL_LINE_BYTES {
+            let held = self.partial.len();
+            self.clear();
+            return Err(TransportError::Capacity {
+                limit_bytes: MAX_PARTIAL_LINE_BYTES,
+                reason: format!("{held} bytes were received with no line terminator"),
+            });
+        }
+        Ok(())
     }
 
     /// Removes and returns the oldest complete line, if any.
@@ -139,25 +202,28 @@ impl LineBuffer {
         self.ready.pop_front()
     }
 
-    /// Releases a held-back unterminated fragment as a final line.
+    /// Discards a held-back unterminated fragment, reporting whether there was
+    /// one.
     ///
-    /// Called only on a **clean** close: a server that ends the connection
-    /// after a line whose CR-LF never arrived has still told us something, and
-    /// dropping it would lose a `LOOP` or `END`. After an abrupt failure the
-    /// fragment is discarded instead, because it may be truncated mid-line.
-    fn take_partial(&mut self) -> Option<String> {
-        let raw = std::mem::take(&mut self.partial);
-        let line = raw.strip_suffix('\r').unwrap_or(raw.as_str());
-        if line.is_empty() {
-            None
-        } else {
-            Some(line.to_owned())
-        }
+    /// Every line "is terminated by CR-LF" [`docs/spec/01-foundations.md`
+    /// §7.1], and the specification states no exception for the last line
+    /// before a close — not for a clean close and not for an abrupt one. A
+    /// fragment left over when the connection ends is therefore a truncated
+    /// line, and promoting it to a notification would mean parsing something
+    /// the wire contract says cannot occur. It is reported instead, so the
+    /// session layer treats the connection as failed and recovers from the
+    /// progressive it has, rather than acting on half a line.
+    fn discard_partial(&mut self) -> Option<usize> {
+        let held = self.partial.len();
+        self.partial.clear();
+        self.scanned = 0;
+        (held > 0).then_some(held)
     }
 
     /// Discards everything buffered.
     fn clear(&mut self) {
         self.partial.clear();
+        self.scanned = 0;
         self.ready.clear();
     }
 }
@@ -193,7 +259,7 @@ enum Reception {
 fn receive(buffer: &mut LineBuffer, message: Message) -> Result<Reception, TransportError> {
     match message {
         Message::Text(text) => {
-            buffer.push_message(text.as_str());
+            buffer.push_message(text.as_str())?;
             Ok(Reception::Buffered)
         }
         // Ping and pong are transport plumbing, not TLCP. `tungstenite` has
@@ -378,6 +444,9 @@ pub(crate) struct WsTransport {
     socket: Option<Socket>,
     /// Lines received but not yet yielded.
     buffer: LineBuffer,
+    /// A complaint about a line the peer left unterminated, held until every
+    /// line that *was* complete has been yielded.
+    truncated: Option<TransportError>,
 }
 
 impl WsTransport {
@@ -401,6 +470,7 @@ impl WsTransport {
             control_link: None,
             socket: None,
             buffer: LineBuffer::default(),
+            truncated: None,
         })
     }
 
@@ -431,20 +501,33 @@ impl WsTransport {
         );
 
         tracing::debug!(target = %target, subprotocol = SUBPROTOCOL, "opening TLCP websocket");
-        let (socket, response) =
-            connect_async(request)
-                .await
-                .map_err(|error| TransportError::Connect {
-                    target: target.clone(),
-                    source: Box::new(error),
-                })?;
+        // The frame and message ceilings are the peer-controlled dimensions
+        // this transport refuses to let a server choose for it; see
+        // [`MAX_MESSAGE_BYTES`].
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_MESSAGE_BYTES));
+        let (socket, response) = connect_async_with_config(request, Some(config), false)
+            .await
+            .map_err(|error| TransportError::Connect {
+                target: target.clone(),
+                source: Box::new(error),
+            })?;
 
-        // RFC 6455 lets the server answer with one of the offered subprotocols
-        // or with none. A *different* one is a broken intermediary and exactly
-        // the interference `wsok` exists to detect, so refuse it outright; a
-        // missing one is only warned about, because refusing would break an
-        // otherwise working deployment and `wsok`/`CONERR` will catch a server
-        // that is not speaking TLCP.
+        // The subprotocol is not decoration: it "embeds the protocol version",
+        // which is why the WS request form carries no `LS_protocol` parameter
+        // of its own [`docs/spec/01-foundations.md` §6.2.1;
+        // `docs/spec/03-requests.md` §1.2]. A handshake that did not negotiate
+        // it agreed to no version of TLCP, so there is nothing this client can
+        // safely assume about what comes back on it.
+        //
+        // Both refusals are the same refusal. RFC 6455 §4.1 lets a server
+        // answer with one of the offered subprotocols or with none, and
+        // requires a client that needs one to fail the connection when it does
+        // not get it — which is this client, since the specification states the
+        // header as part of the WS request and gives no alternative way to
+        // agree a version. Continuing without it would be a compatibility
+        // behaviour with no source behind it.
         match response.headers().get(SEC_WEBSOCKET_PROTOCOL) {
             Some(value) if value.as_bytes() == SUBPROTOCOL.as_bytes() => {}
             Some(other) => {
@@ -457,10 +540,10 @@ impl WsTransport {
                 ));
             }
             None => {
-                tracing::warn!(
-                    target = %target,
-                    "server did not echo the TLCP subprotocol; continuing"
-                );
+                return Err(connect_error(
+                    &target,
+                    format!("server negotiated no subprotocol, expected `{SUBPROTOCOL}`"),
+                ));
             }
         }
 
@@ -511,6 +594,7 @@ impl WsTransport {
         // A trailing fragment cannot be trusted after an abrupt end: it may be
         // a line the server was still writing.
         self.buffer.clear();
+        self.truncated = None;
     }
 
     /// Completes the closing handshake the peer started, then forgets the
@@ -519,16 +603,28 @@ impl WsTransport {
     /// `close` on the sink flushes the close frame `tungstenite` queued when it
     /// read the peer's; it does not read, so it cannot block waiting for a
     /// peer that has already said everything it is going to say.
-    async fn acknowledge_peer_close(&mut self) {
+    ///
+    /// Returns the malformed-fragment error, if the peer left a line
+    /// unterminated. See [`LineBuffer::discard_partial`].
+    async fn acknowledge_peer_close(&mut self) -> Option<TransportError> {
         if let Some(mut socket) = self.socket.take()
             && let Err(error) = socket.close(None).await
         {
             tracing::debug!(%error, "closing handshake did not complete");
         }
-        // A clean close releases whatever the last message left unterminated.
-        if let Some(line) = self.buffer.take_partial() {
-            self.buffer.ready.push_back(line);
-        }
+        self.truncated_line()
+    }
+
+    /// Reports a line the peer left unterminated when the connection ended.
+    fn truncated_line(&mut self) -> Option<TransportError> {
+        let held = self.buffer.discard_partial()?;
+        tracing::warn!(
+            bytes = held,
+            "the connection ended on a line with no CR-LF; discarding it"
+        );
+        Some(TransportError::MalformedFrame {
+            reason: format!("the connection ended mid-line, after {held} bytes with no CR-LF"),
+        })
     }
 }
 
@@ -645,6 +741,7 @@ impl Transport for WsTransport {
             // Lines belonging to the previous connection must not be read as
             // the new session's.
             self.buffer.clear();
+            self.truncated = None;
             self.connect().await?;
         } else {
             tracing::debug!("rebinding on the live websocket");
@@ -674,6 +771,11 @@ impl Transport for WsTransport {
             if let Some(line) = self.buffer.pop_line() {
                 return Some(Ok(line));
             }
+            // Complete lines first, then the complaint about the incomplete
+            // one, then the end of the stream.
+            if let Some(error) = self.truncated.take() {
+                return Some(Err(error));
+            }
             // No socket and no buffered line: the stream has ended.
             let socket = self.socket.as_mut()?;
 
@@ -685,7 +787,12 @@ impl Transport for WsTransport {
                             close = description.as_deref().unwrap_or("<no close frame>"),
                             "peer closed the websocket"
                         );
-                        self.acknowledge_peer_close().await;
+                        // Lines already complete when the peer closed are
+                        // still delivered, ahead of any complaint about a
+                        // fragment that never was.
+                        if let Some(error) = self.acknowledge_peer_close().await {
+                            self.truncated = Some(error);
+                        }
                     }
                     Err(error) => {
                         self.abandon_socket();
@@ -702,8 +809,8 @@ impl Transport for WsTransport {
                 // above.
                 None => {
                     self.socket = None;
-                    if let Some(line) = self.buffer.take_partial() {
-                        self.buffer.ready.push_back(line);
+                    if let Some(error) = self.truncated_line() {
+                        self.truncated = Some(error);
                     }
                 }
             }
@@ -740,6 +847,7 @@ impl Transport for WsTransport {
     /// and leaves nothing behind.
     async fn close(&mut self) -> Result<(), TransportError> {
         self.buffer.clear();
+        self.truncated = None;
         let Some(mut socket) = self.socket.take() else {
             return Ok(());
         };
@@ -777,10 +885,18 @@ mod tests {
 
     // -- line reassembly ----------------------------------------------------
 
+    /// Absorbs a message that is expected to stay within every limit.
+    fn push(buffer: &mut LineBuffer, text: &str) {
+        assert!(
+            buffer.push_message(text).is_ok(),
+            "the message is well within the configured limits"
+        );
+    }
+
     #[test]
     fn test_line_buffer_single_line_yields_that_line() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("WSOK\r\n");
+        push(&mut buffer, "WSOK\r\n");
         assert_eq!(buffer.pop_line().as_deref(), Some("WSOK"));
         assert_eq!(buffer.pop_line(), None);
     }
@@ -791,7 +907,8 @@ mod tests {
     #[test]
     fn test_line_buffer_multi_line_message_yields_every_line_in_order() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message(
+        push(
+            &mut buffer,
             "CONOK,S1aa6c792585db57aT1726545,50000,5000,*\r\n\
              SERVNAME,Lightstreamer HTTP Server\r\n\
              CLIENTIP,127.0.0.1\r\n\
@@ -813,19 +930,19 @@ mod tests {
     #[test]
     fn test_line_buffer_line_split_across_messages_is_reassembled() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("U,1,1,20.4");
+        push(&mut buffer, "U,1,1,20.4");
         assert_eq!(buffer.pop_line(), None, "no terminator yet");
-        buffer.push_message("2|EUR\r\nU,1,2,");
+        push(&mut buffer, "2|EUR\r\nU,1,2,");
         assert_eq!(buffer.pop_line().as_deref(), Some("U,1,1,20.42|EUR"));
         assert_eq!(buffer.pop_line(), None);
-        buffer.push_message("3\r\n");
+        push(&mut buffer, "3\r\n");
         assert_eq!(buffer.pop_line().as_deref(), Some("U,1,2,3"));
     }
 
     #[test]
     fn test_line_buffer_bare_lf_is_tolerated() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("PROBE\nLOOP,0\r\n");
+        push(&mut buffer, "PROBE\nLOOP,0\r\n");
         assert_eq!(buffer.pop_line().as_deref(), Some("PROBE"));
         assert_eq!(buffer.pop_line().as_deref(), Some("LOOP,0"));
     }
@@ -833,7 +950,7 @@ mod tests {
     #[test]
     fn test_line_buffer_empty_lines_are_dropped() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("\r\n\r\nEND,31,bye\r\n\r\n");
+        push(&mut buffer, "\r\n\r\nEND,31,bye\r\n\r\n");
         assert_eq!(buffer.pop_line().as_deref(), Some("END,31,bye"));
         assert_eq!(buffer.pop_line(), None);
     }
@@ -841,25 +958,68 @@ mod tests {
     #[test]
     fn test_line_buffer_terminated_message_leaves_no_partial() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("SYNC,12\r\n");
+        push(&mut buffer, "SYNC,12\r\n");
         assert_eq!(buffer.pop_line().as_deref(), Some("SYNC,12"));
-        assert_eq!(buffer.take_partial(), None);
+        assert_eq!(buffer.discard_partial(), None);
     }
 
+    /// C-15. Every line "is terminated by CR-LF"
+    /// [`docs/spec/01-foundations.md` §7.1] and the specification states no
+    /// exception for the last one before a close. An unterminated tail is
+    /// therefore a truncated line, not a notification.
     #[test]
-    fn test_line_buffer_take_partial_releases_unterminated_tail() {
+    fn test_line_buffer_unterminated_tail_is_discarded_not_promoted() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("LOOP,0");
+        push(&mut buffer, "LOOP,0");
         assert_eq!(buffer.pop_line(), None);
-        assert_eq!(buffer.take_partial().as_deref(), Some("LOOP,0"));
-        assert_eq!(buffer.take_partial(), None);
+        assert_eq!(buffer.discard_partial(), Some("LOOP,0".len()));
+        assert_eq!(buffer.discard_partial(), None);
+        assert_eq!(
+            buffer.pop_line(),
+            None,
+            "the fragment must not become a line"
+        );
     }
 
+    /// C-14. A peer that sends bytes and never a terminator is refused rather
+    /// than allowed to make this client allocate without limit.
     #[test]
-    fn test_line_buffer_take_partial_strips_dangling_cr() {
+    fn test_line_buffer_refuses_an_unterminated_fragment_past_its_limit() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("END,32,closed\r");
-        assert_eq!(buffer.take_partial().as_deref(), Some("END,32,closed"));
+        let chunk = "x".repeat(1024 * 1024);
+        let mut outcome = Ok(());
+        // Comfortably past the ceiling, in messages that are each acceptable.
+        for _ in 0..=(MAX_PARTIAL_LINE_BYTES / chunk.len()) {
+            outcome = buffer.push_message(&chunk);
+            if outcome.is_err() {
+                break;
+            }
+        }
+        match outcome {
+            Err(TransportError::Capacity { limit_bytes, .. }) => {
+                assert_eq!(limit_bytes, MAX_PARTIAL_LINE_BYTES);
+            }
+            other => panic!("expected a capacity refusal, got {other:?}"),
+        }
+        // Nothing is retained: there is no usable line in what was refused.
+        assert_eq!(buffer.pop_line(), None);
+        assert_eq!(buffer.discard_partial(), None);
+    }
+
+    /// C-14. Many small fragments must stay linear: the buffer is compacted
+    /// once per message, not once per line.
+    #[test]
+    fn test_line_buffer_handles_many_lines_in_one_message() {
+        let mut buffer = LineBuffer::default();
+        let message: String = (0..10_000)
+            .map(|index| format!("PROBE,{index}\r\n"))
+            .collect();
+        push(&mut buffer, &message);
+        for index in 0..10_000 {
+            assert_eq!(buffer.pop_line(), Some(format!("PROBE,{index}")));
+        }
+        assert_eq!(buffer.pop_line(), None);
+        assert_eq!(buffer.discard_partial(), None);
     }
 
     /// A line's payload is not touched: commas and percent escapes are the
@@ -867,17 +1027,17 @@ mod tests {
     #[test]
     fn test_line_buffer_preserves_line_payload_verbatim() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("U,3,1,a%2Cb|#|^Pxyz\r\n");
+        push(&mut buffer, "U,3,1,a%2Cb|#|^Pxyz\r\n");
         assert_eq!(buffer.pop_line().as_deref(), Some("U,3,1,a%2Cb|#|^Pxyz"));
     }
 
     #[test]
     fn test_line_buffer_clear_discards_everything() {
         let mut buffer = LineBuffer::default();
-        buffer.push_message("CONOK,S1,50000,5000,*\r\nSERVNAME");
+        push(&mut buffer, "CONOK,S1,50000,5000,*\r\nSERVNAME");
         buffer.clear();
         assert_eq!(buffer.pop_line(), None);
-        assert_eq!(buffer.take_partial(), None);
+        assert_eq!(buffer.discard_partial(), None);
     }
 
     // -- message classification --------------------------------------------
@@ -1308,6 +1468,70 @@ mod tests {
             "expected Connect, got {error:?}"
         );
         drop(server);
+    }
+
+    /// C-16. The subprotocol "embeds the protocol version"
+    /// [`docs/spec/01-foundations.md` §6.2.1], so a handshake that negotiated
+    /// none agreed to no version of TLCP. Continuing anyway would be a
+    /// compatibility behaviour with no source behind it.
+    #[tokio::test]
+    async fn test_absent_negotiated_subprotocol_is_refused() {
+        let (listener, address) = bind_loopback().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // A handshake that simply does not answer with a subprotocol.
+            let _ = accept_hdr_async(stream, |_: &ServerRequest, response: ServerResponse| {
+                Ok(response)
+            })
+            .await;
+        });
+
+        let mut transport = WsTransport::try_new(format!("ws://{address}")).unwrap();
+        let error = transport
+            .open_stream(StreamOpen::Create(Box::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TransportError::Connect { .. }),
+            "expected Connect, got {error:?}"
+        );
+        drop(server);
+    }
+
+    /// C-15. Every line "is terminated by CR-LF"
+    /// [`docs/spec/01-foundations.md` §7.1], with no exception for the last one
+    /// before a close. A truncated tail is reported, not parsed — and the lines
+    /// that *were* complete are still delivered first.
+    #[tokio::test]
+    async fn test_a_clean_close_after_an_unterminated_line_is_malformed() {
+        let (listener, address) = bind_loopback().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(stream, echo_subprotocol).await.unwrap();
+            let _wsok = socket.next().await.unwrap().unwrap();
+            let _create = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::text("WSOK\r\nEND,31,session destro"))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+            while socket.next().await.is_some() {}
+        });
+
+        let mut transport = WsTransport::try_new(format!("ws://{address}")).unwrap();
+        transport
+            .open_stream(StreamOpen::Create(Box::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(transport.next_line().await.unwrap().unwrap(), "WSOK");
+        let error = transport.next_line().await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, TransportError::MalformedFrame { .. }),
+            "expected a malformed line, got {error:?}"
+        );
+        assert!(transport.next_line().await.is_none());
+        server.await.unwrap();
     }
 
     /// A control request is framed as `<request-name>` CR-LF

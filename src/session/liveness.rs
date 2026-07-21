@@ -192,15 +192,15 @@ impl Liveness {
     /// nothing left to keep alive.
     #[must_use]
     pub(crate) fn due(&self, now: Instant) -> LivenessAction {
-        if let Some(budget) = self.inbound_budget {
-            if now >= deadline(self.last_inbound, budget) {
-                return LivenessAction::InboundStalled { budget };
-            }
+        if let Some(budget) = self.inbound_budget
+            && now >= deadline(self.last_inbound, budget)
+        {
+            return LivenessAction::InboundStalled { budget };
         }
-        if let Some(every) = self.heartbeat_every {
-            if now >= deadline(self.last_outbound, every) {
-                return LivenessAction::SendHeartbeat;
-            }
+        if let Some(every) = self.heartbeat_every
+            && now >= deadline(self.last_outbound, every)
+        {
+            return LivenessAction::SendHeartbeat;
         }
         LivenessAction::Idle
     }

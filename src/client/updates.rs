@@ -60,6 +60,19 @@ pub enum UpdateFrequency {
         /// server-supplied number on the caller's behalf.
         updates_per_second: String,
     },
+    /// **The rate could not be read**, so do not treat it as a limit.
+    ///
+    /// The server sent something that is neither `unlimited` nor a decimal
+    /// number [`docs/spec/04-notifications.md` §3.8]. It is reported rather
+    /// than dropped, and reported apart from
+    /// [`Limited`](UpdateFrequency::Limited) rather than inside it, because a
+    /// caller that reads `Limited { updates_per_second: "" }` and divides by it
+    /// is acting on a number nobody sent. Log it, or treat the subscription's
+    /// rate as unknown — but do not compute with it.
+    Unrecognized {
+        /// The value as it arrived.
+        literal: String,
+    },
 }
 
 impl From<WireFrequency> for UpdateFrequency {
@@ -67,6 +80,7 @@ impl From<WireFrequency> for UpdateFrequency {
         match frequency {
             WireFrequency::Unlimited => Self::Unlimited,
             WireFrequency::Limited { updates_per_second } => Self::Limited { updates_per_second },
+            WireFrequency::Unrecognized { literal } => Self::Unrecognized { literal },
         }
     }
 }
@@ -357,6 +371,22 @@ impl SubscriptionEvent {
 /// [`Subscription::with_buffer_size`](crate::Subscription::with_buffer_size).
 /// The server will then merge or drop on its side, and tell you it did with a
 /// [`SubscriptionEvent::Overflow`].
+///
+/// # The one exception: shutdown
+///
+/// "Nothing is dropped" holds **while the client is running**. It does not
+/// survive an ordered shutdown, and it deliberately does not:
+/// [`Client::disconnect`](crate::Client::disconnect) and dropping the
+/// [`Client`](crate::Client) are signalled out of band, every blocked delivery
+/// gives way to them, and whatever had not yet been delivered is discarded
+/// along with this stream.
+///
+/// Without that exception a consumer that walked away could make the client
+/// impossible to stop — no disconnect, no drop, and a task and a socket alive
+/// until the process ended. Nothing observable is lost by it: a caller still
+/// reading frees room and the delivery completes, and a caller that has asked
+/// to disconnect has said it wants no more. See
+/// `docs/adr/0003-typed-event-stream-as-delivery-surface.md`.
 #[derive(Debug)]
 pub struct Updates {
     id: SubscriptionId,
@@ -488,6 +518,26 @@ mod tests {
                 max_frequency: UpdateFrequency::Limited { updates_per_second },
                 filtering: Filtering::Unrecognized { literal },
             } if updates_per_second == "3.0" && literal == "novel"
+        ));
+    }
+
+    #[test]
+    fn test_an_unreadable_frequency_is_not_delivered_as_a_limit() {
+        // A `CONF` whose max-frequency argument is neither `unlimited` nor a
+        // decimal number [`docs/spec/04-notifications.md` §3.8] must not reach
+        // the caller inside `Limited`, where it would look like a rate.
+        let event = SubscriptionEvent::from_wire(Wire::Reconfigured {
+            max_frequency: WireFrequency::Unrecognized {
+                literal: "banana".to_owned(),
+            },
+            filtering: FilteringMode::Filtered,
+        });
+        assert!(matches!(
+            event,
+            SubscriptionEvent::Reconfigured {
+                max_frequency: UpdateFrequency::Unrecognized { literal },
+                filtering: Filtering::Filtered,
+            } if literal == "banana"
         ));
     }
 }

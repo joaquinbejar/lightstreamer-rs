@@ -477,6 +477,20 @@ pub enum ServerInfo {
         managed: bool,
     },
 
+    /// **The bandwidth constraint could not be read**, so do not treat it as a
+    /// limit [`docs/spec/04-notifications.md` §5.1].
+    ///
+    /// The server sent something that is neither `unlimited`, nor `unmanaged`,
+    /// nor a decimal number. It is reported apart from
+    /// [`BandwidthLimit`](ServerInfo::BandwidthLimit) rather than as a limit of
+    /// `Some("")`, because a caller acting on a fabricated number is worse off
+    /// than one told the value was unreadable. What the session's real limit is
+    /// remains whatever the last readable `CONS` said.
+    UnreadableBandwidthLimit {
+        /// The value as it arrived.
+        literal: String,
+    },
+
     /// How long the server thinks the session has been bound
     /// [`docs/spec/04-notifications.md` §5.2].
     ///
@@ -512,6 +526,7 @@ impl ServerInfo {
                     kbps: None,
                     managed: false,
                 },
+                Bandwidth::Unrecognized { literal } => Self::UnreadableBandwidthLimit { literal },
             }),
             _ => None,
         }
@@ -678,6 +693,20 @@ pub enum SessionEvent {
 /// [`Updates`](crate::Updates#what-a-long-stall-actually-does). Holding this
 /// stream and not reading it is the one shape to avoid.
 ///
+/// As with [`Updates`](crate::Updates#the-one-exception-shutdown), losslessness
+/// holds while the client is running and yields to an ordered shutdown: a
+/// stream nobody is reading cannot keep a client that has been asked to stop
+/// alive. Anything not yet delivered when that happens goes with the stream.
+///
+/// # Events from before this stream existed
+///
+/// [`Client::connect`](crate::Client::connect) hands this over once the session
+/// is bound, so nobody can hold it while the connection attempts that preceded
+/// the bind are happening. Those events are not lost: they are replayed here
+/// first, in the order they occurred. Past the configured capacity they are
+/// discarded with a warning instead — there is no consumer for them yet, and
+/// waiting for one would deadlock the very bind that produces this stream.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -691,13 +720,24 @@ pub enum SessionEvent {
 /// ```
 #[derive(Debug)]
 pub struct SessionEvents {
+    /// Events produced before [`Client::connect`](crate::Client::connect)
+    /// returned, in arrival order. Nobody could hold this stream while they
+    /// happened, so `connect` drained them out of the channel — otherwise a
+    /// retried connection could fill it and block the very task that has to
+    /// deliver the bind — and they are replayed here, ahead of the channel, so
+    /// the order the caller sees is the order they happened in.
+    staged: std::collections::VecDeque<SessionEvent>,
     events: tokio::sync::mpsc::Receiver<SessionEvent>,
 }
 
 impl SessionEvents {
-    /// Wraps the receiving half the router publishes to.
-    pub(crate) const fn new(events: tokio::sync::mpsc::Receiver<SessionEvent>) -> Self {
-        Self { events }
+    /// Wraps the receiving half the router publishes to, together with the
+    /// events that arrived before the caller could hold the stream.
+    pub(crate) const fn with_staged(
+        staged: std::collections::VecDeque<SessionEvent>,
+        events: tokio::sync::mpsc::Receiver<SessionEvent>,
+    ) -> Self {
+        Self { staged, events }
     }
 }
 
@@ -708,6 +748,9 @@ impl futures_util::Stream for SessionEvents {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        if let Some(event) = self.staged.pop_front() {
+            return std::task::Poll::Ready(Some(event));
+        }
         self.events.poll_recv(cx)
     }
 }
@@ -849,6 +892,16 @@ mod tests {
                 kbps: None,
                 managed: false
             })
+        ));
+        // A bandwidth the parser could not read is reported as unreadable, not
+        // as a limit of `Some("")` [`docs/spec/04-notifications.md` §5.1].
+        assert!(matches!(
+            ServerInfo::from_notification(Notification::ConstraintsChanged {
+                bandwidth: Bandwidth::Unrecognized {
+                    literal: String::new(),
+                },
+            }),
+            Some(ServerInfo::UnreadableBandwidthLimit { literal }) if literal.is_empty()
         ));
         // Anything that is not diagnostic is not mislabelled as diagnostic.
         assert!(

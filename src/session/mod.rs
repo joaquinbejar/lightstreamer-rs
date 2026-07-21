@@ -52,6 +52,18 @@
 //! than dropping, because a dropped data notification would desynchronise the
 //! recovery progressive that makes recovery correct
 //! [`docs/spec/02-session-lifecycle.md` §5.2].
+//!
+//! # The stop lane
+//!
+//! Backpressure has one exception, and it is deliberate: **an ordered stop is
+//! never subject to it**. A caller that stops reading its event stream blocks
+//! the driver, which is the documented contract — but it must not thereby make
+//! the client unstoppable, because that would leak a task and a socket for the
+//! life of the process. [`SessionHandle::stop`] therefore raises a signal that
+//! every blocking wait in this module races against: a full event channel, a
+//! reconnection delay, and the establishment of a stream connection all give it
+//! up at once. Any event that had not yet been delivered when a stop is ordered
+//! is discarded, since the stream it was going to is about to end anyway.
 
 // The client façade that will consume this module does not exist yet
 // (see `docs/SPEC.md`, implementation order step 5).
@@ -67,7 +79,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::protocol::ProtocolError;
@@ -109,6 +121,16 @@ pub(crate) enum SessionError {
     /// The driver has stopped, so no further command can be delivered.
     #[error("the session driver has stopped")]
     Stopped,
+
+    /// A monotonic identifier space ran out. Identifiers are never reused
+    /// while a response to the old one could still arrive, so exhaustion is
+    /// reported rather than wrapped around
+    /// [`docs/spec/02-session-lifecycle.md` §4.4].
+    #[error("the {what} identifier space is exhausted")]
+    Exhausted {
+        /// Which space ran out.
+        what: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -917,9 +939,53 @@ pub(crate) enum SessionCommand {
 pub(crate) struct SessionHandle {
     commands: mpsc::Sender<SessionCommand>,
     next_key: Arc<AtomicU64>,
+    /// Raised to order an immediate stop. See the module documentation's *stop
+    /// lane*: it is the one signal that is never subject to backpressure.
+    stop: Arc<watch::Sender<bool>>,
 }
 
 impl SessionHandle {
+    /// Allocates a subscription key without asking for anything yet.
+    ///
+    /// Separate from [`SessionHandle::subscribe`] so that the layer above can
+    /// register everything that key names — a stream, a decoder — *before* the
+    /// request that could produce a notification for it is queued. Registering
+    /// afterwards leaves a window in which an immediate `SUBOK` or `REQERR`
+    /// has nowhere to go [`docs/spec/03-requests.md` §13].
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Exhausted`] if the 64-bit key space ran out. Keys are
+    /// never reused, so this is reported rather than wrapped.
+    pub(crate) fn allocate_key(&self) -> Result<SubscriptionKey, SessionError> {
+        self.next_key
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |key| {
+                key.checked_add(1)
+            })
+            .map(SubscriptionKey)
+            .map_err(|_| SessionError::Exhausted {
+                what: "subscription key",
+            })
+    }
+
+    /// Requests a subscription under a key already allocated by
+    /// [`SessionHandle::allocate_key`].
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn subscribe_with_key(
+        &self,
+        key: SubscriptionKey,
+        spec: SubscriptionSpec,
+    ) -> Result<(), SessionError> {
+        self.send(SessionCommand::Subscribe {
+            key,
+            spec: Box::new(spec),
+        })
+        .await
+    }
+
     /// Requests a subscription and returns its key immediately.
     ///
     /// The key is allocated here rather than by the driver so that the caller
@@ -929,18 +995,31 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// [`SessionError::Stopped`] if the driver has already stopped.
+    /// [`SessionError::Stopped`] if the driver has already stopped, or
+    /// [`SessionError::Exhausted`] if the key space ran out.
     pub(crate) async fn subscribe(
         &self,
         spec: SubscriptionSpec,
     ) -> Result<SubscriptionKey, SessionError> {
-        let key = SubscriptionKey(self.next_key.fetch_add(1, Ordering::Relaxed));
-        self.send(SessionCommand::Subscribe {
-            key,
-            spec: Box::new(spec),
-        })
-        .await?;
+        let key = self.allocate_key()?;
+        self.subscribe_with_key(key, spec).await?;
         Ok(key)
+    }
+
+    /// Orders the driver to stop at once, whatever it is waiting for.
+    ///
+    /// Unlike [`SessionHandle::shutdown`] this does not queue a command, so it
+    /// cannot be held up by a full command channel or by a driver blocked
+    /// emitting into an event stream nobody is reading. It is how "dropping the
+    /// client shuts the session down" stays true under backpressure. The
+    /// server is *not* told: use [`SessionHandle::destroy`] for that.
+    pub(crate) fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    /// A receiver for the stop lane, for the other tasks a client owns.
+    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
     }
 
     /// Removes a subscription.
@@ -1206,7 +1285,13 @@ impl Registry {
 enum PendingKind {
     Subscribe(SubscriptionKey),
     Unsubscribe(SubscriptionKey),
-    Reconfigure(SubscriptionKey),
+    /// A `reconf`, carrying the value it asked for so that an accepted change
+    /// can be committed to the desired state and survive a session that has to
+    /// be recreated [`docs/spec/03-requests.md` §8].
+    Reconfigure {
+        key: SubscriptionKey,
+        max_frequency: MaxFrequencyLimit,
+    },
     /// A `msg`. It carries the message's own identity because a `REQERR`
     /// correlates by `LS_reqId` while the caller thinks in terms of the
     /// sequence and progressive that `MSGDONE`/`MSGFAIL` would have used
@@ -1233,12 +1318,44 @@ impl PendingKind {
                 key: *key,
                 operation: SubscriptionOperation::Unsubscribe,
             },
-            Self::Reconfigure(key) => ControlTarget::Subscription {
+            Self::Reconfigure { key, .. } => ControlTarget::Subscription {
                 key: *key,
                 operation: SubscriptionOperation::Reconfigure,
             },
             Self::SendMessage { .. } | Self::ForceRebind | Self::Destroy => ControlTarget::Session,
         }
+    }
+}
+
+/// One control request awaiting its `REQOK` or `REQERR`, tagged with the
+/// session it belongs to.
+///
+/// The tag exists because §4.5 promises the awkward case outright: "after
+/// binding the second session, it is possible that late responses to control
+/// requests related with the first session arrive interspersed with
+/// notifications for the second session"
+/// [`docs/spec/02-session-lifecycle.md` §4.5]. Without a generation, a late
+/// `REQERR` naming a subscription that has since been re-established on a new
+/// session would drop it from the desired set — a subscription lost to a
+/// message about a session that no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pending {
+    kind: PendingKind,
+    /// Which session generation issued it. See
+    /// [`SessionDriver::generation`].
+    generation: u64,
+}
+
+/// The desired-state form of a value accepted by a `reconf`.
+///
+/// `reconf` cannot ask for `unfiltered`, so every value it can carry has a
+/// counterpart among the subscription request's own
+/// [`docs/spec/03-requests.md` §6.1, §8.1].
+#[must_use]
+fn as_requested_frequency(limit: MaxFrequencyLimit) -> RequestedMaxFrequency {
+    match limit {
+        MaxFrequencyLimit::Unlimited => RequestedMaxFrequency::Unlimited,
+        MaxFrequencyLimit::Limited(number) => RequestedMaxFrequency::Limited(number),
     }
 }
 
@@ -1294,6 +1411,22 @@ enum Woke {
     Line(Option<Result<String, TransportError>>),
     Command(Option<SessionCommand>),
     Timer,
+    /// The stop lane fired. See the module documentation.
+    Stop,
+}
+
+/// How an attempt to establish a stream connection ended.
+enum Opened {
+    /// The transport accepted the request; `CONOK` or `CONERR` will follow on
+    /// the line stream.
+    Established,
+    /// It could not be established, or not within the configured budget.
+    Failed {
+        /// What went wrong. Never contains a credential.
+        detail: String,
+    },
+    /// A stop was ordered while the connection was being established.
+    Stopped,
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,14 +1469,55 @@ pub(crate) fn connect<T: Transport>(
 
     let (command_tx, command_rx) = mpsc::channel(options.command_capacity.get());
     let (event_tx, event_rx) = mpsc::channel(options.event_capacity.get());
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     let handle = SessionHandle {
         commands: command_tx,
         next_key: Arc::new(AtomicU64::new(1)),
+        stop: Arc::new(stop_tx),
     };
-    let driver = SessionDriver::new(transport, properties, options, command_rx, event_tx);
+    let driver = SessionDriver::new(
+        transport, properties, options, command_rx, event_tx, stop_rx,
+    );
     Ok((driver, handle, event_rx))
 }
+
+/// Resolves as soon as an immediate stop has been ordered, or every handle
+/// that could order one has been dropped.
+///
+/// Cancel-safe: [`watch::Receiver::changed`] is, and the flag is re-read on
+/// every turn, so dropping this future in a `select!` loses nothing.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            // Every `SessionHandle` is gone, which is the other way the layer
+            // above says it is finished.
+            return;
+        }
+    }
+}
+
+/// How many consecutive input lines the pump processes before it must poll the
+/// command channel and the liveness clocks, whatever the socket still holds.
+///
+/// The pump is biased towards the server so that the state machine cannot act
+/// on a command against a session a line already ended. Bias without a bound is
+/// starvation: a connection that always has a line ready would postpone a
+/// heartbeat, a `destroy` and a shutdown indefinitely. This is the ceiling on
+/// that latency — a control action waits at most this many notifications.
+const MAX_LINES_PER_TURN: u32 = 32;
+
+/// How many consecutive failures to send the outbound heartbeat are tolerated
+/// before the stream connection is treated as lost.
+///
+/// A failed heartbeat leaves the outbound commitment unmet
+/// [`docs/spec/02-session-lifecycle.md` §8.4], and a client that cannot write
+/// to a socket has nothing to gain by holding it: after this many attempts the
+/// connection is reopened, which is what the retry budget is there to bound.
+const MAX_HEARTBEAT_FAILURES: u32 = 3;
 
 /// The session state machine. One future, no spawned tasks.
 #[derive(Debug)]
@@ -1353,6 +1527,11 @@ pub(crate) struct SessionDriver<T: Transport> {
     options: SessionOptions,
     commands: mpsc::Receiver<SessionCommand>,
     events: mpsc::Sender<SessionEvent>,
+    /// The stop lane. See the module documentation.
+    stop: watch::Receiver<bool>,
+    /// Set when a stop was ordered while the driver was blocked, so that the
+    /// current turn unwinds instead of carrying on.
+    stopping: bool,
 
     /// The current stream state, meaningful only while a stream connection is
     /// open.
@@ -1377,8 +1556,21 @@ pub(crate) struct SessionDriver<T: Transport> {
     /// [`docs/spec/02-session-lifecycle.md` §5.2, precondition 4].
     skip_remaining: u64,
 
+    /// Whether a `PROG` has already been honoured on the current stream
+    /// connection. `PROG` is one of the notifications sent immediately after
+    /// `CONOK` and only in answer to `LS_recovery_from`
+    /// [`docs/spec/02-session-lifecycle.md` §5.4], so a second one — or one on
+    /// a connection that asked for no recovery — correlates with nothing this
+    /// client requested and must not move the recovery baseline.
+    prog_honoured: bool,
+
     registry: Registry,
-    pending: HashMap<String, PendingKind>,
+    pending: HashMap<String, Pending>,
+    /// Which session this driver is on: incremented every time a session is
+    /// created or recreated, never reset. Pending control requests carry it so
+    /// that a late response from a replaced session cannot mutate the
+    /// replacement's state [`docs/spec/02-session-lifecycle.md` §4.5].
+    generation: u64,
     /// `LS_reqId` is "unique within the connection", where "connection" is
     /// never defined [`docs/spec/02-session-lifecycle.md` §4.4, ambiguity A5].
     ///
@@ -1400,6 +1592,12 @@ pub(crate) struct SessionDriver<T: Transport> {
     /// the client [`docs/spec/02-session-lifecycle.md` §2.2, T7].
     destroy_requested: bool,
 
+    /// Consecutive session refreshes (server code 48) with no productive
+    /// session in between. See [`SessionDriver::plan_after`].
+    refresh_streak: u32,
+    /// Consecutive failures to send the outbound heartbeat.
+    heartbeat_failures: u32,
+
     liveness: Liveness,
     backoff: Backoff,
 }
@@ -1411,6 +1609,7 @@ impl<T: Transport> SessionDriver<T> {
         options: SessionOptions,
         commands: mpsc::Receiver<SessionCommand>,
         events: mpsc::Sender<SessionEvent>,
+        stop: watch::Receiver<bool>,
     ) -> Self {
         let liveness = Liveness::new(
             options.keepalive_slack,
@@ -1424,17 +1623,23 @@ impl<T: Transport> SessionDriver<T> {
             options,
             commands,
             events,
+            stop,
+            stopping: false,
             stream_state: StreamState::Establishing,
             intent: OpenIntent::Create,
             session: None,
             previous_session: None,
             progressive: 0,
             skip_remaining: 0,
+            prog_honoured: false,
             registry: Registry::new(),
             pending: HashMap::new(),
+            generation: 1,
             next_request_id: 1,
             force_rebind_outstanding: false,
             destroy_requested: false,
+            refresh_streak: 0,
+            heartbeat_failures: 0,
             liveness,
             backoff,
         }
@@ -1464,8 +1669,10 @@ impl<T: Transport> SessionDriver<T> {
         if let Err(error) = self.transport.close().await {
             tracing::warn!(%error, "transport did not close cleanly");
         }
-        // Best effort: a caller that dropped the receiver is not an error.
-        let _ = self.events.send(SessionEvent::Closed(closed.clone())).await;
+        // Best effort: a caller that dropped the receiver is not an error, and
+        // a caller that stopped reading must not be able to keep this task
+        // alive — `emit` gives the terminal event up when a stop is ordered.
+        self.emit(SessionEvent::Closed(closed.clone())).await;
         tracing::info!(?closed, "session ended");
         closed
     }
@@ -1494,16 +1701,23 @@ impl<T: Transport> SessionDriver<T> {
             self.intent = next.intent.clone();
             self.stream_state = StreamState::Establishing;
             self.skip_remaining = 0;
+            self.prog_honoured = false;
 
-            let flow = match self.transport.open_stream(request).await {
-                Ok(()) => {
+            let flow = match self.open_stream(request).await {
+                Opened::Established => {
                     self.liveness
                         .on_stream_opened(self.options.open_timeout, Instant::now());
                     self.pump().await
                 }
-                Err(error) => Flow::Unbind(UnbindReason::ConnectionFailed {
-                    detail: error.to_string(),
-                }),
+                Opened::Failed { detail } => {
+                    Flow::Unbind(UnbindReason::ConnectionFailed { detail })
+                }
+                Opened::Stopped => {
+                    return SessionClosed::ByClient {
+                        destroy_confirmed: false,
+                        cause: None,
+                    };
+                }
             };
 
             match flow {
@@ -1537,10 +1751,10 @@ impl<T: Transport> SessionDriver<T> {
             // later received on the original connection" [ibid. §5.1] — so the
             // wedged socket is torn down here rather than left to be collected
             // whenever the transport happens to replace it.
-            if !reason.is_clean_loop() {
-                if let Err(error) = self.transport.close().await {
-                    tracing::debug!(%error, "closing the failed stream connection");
-                }
+            if !reason.is_clean_loop()
+                && let Err(error) = self.transport.close().await
+            {
+                tracing::debug!(%error, "closing the failed stream connection");
             }
 
             match self.plan_after(&reason) {
@@ -1550,6 +1764,12 @@ impl<T: Transport> SessionDriver<T> {
                         retry_in: Some(reopen.delay),
                     })
                     .await;
+                    if self.stopping {
+                        return SessionClosed::ByClient {
+                            destroy_confirmed: false,
+                            cause: None,
+                        };
+                    }
                     tracing::debug!(?reason, delay = ?reopen.delay, intent = ?reopen.intent, "reopening");
                     next = reopen;
                 }
@@ -1568,6 +1788,36 @@ impl<T: Transport> SessionDriver<T> {
         }
     }
 
+    /// Opens the next stream connection under the configured budget.
+    ///
+    /// The budget covers the **whole** establishment — name resolution, the
+    /// TCP and TLS handshakes, the protocol handshake, and the first write —
+    /// not merely the wait for `CONOK` that follows it. The specification
+    /// defines no such limit; this is the client-side one of
+    /// [`SessionOptions::open_timeout`], and without it a connect that hangs
+    /// below the port hangs the session for as long as the operating system
+    /// allows. The stop lane is honoured throughout, so a client being torn
+    /// down does not wait out a dial to an unreachable host.
+    async fn open_stream(&mut self, request: StreamOpen) -> Opened {
+        let budget = self.options.open_timeout;
+        let transport = &mut self.transport;
+        let stop = &mut self.stop;
+        tokio::select! {
+            biased;
+            result = tokio::time::timeout(budget, transport.open_stream(request)) => match result {
+                Ok(Ok(())) => Opened::Established,
+                Ok(Err(error)) => Opened::Failed { detail: error.to_string() },
+                Err(_elapsed) => {
+                    tracing::warn!(?budget, "the stream connection could not be established in time");
+                    Opened::Failed {
+                        detail: format!("the stream connection was not established within {budget:?}"),
+                    }
+                }
+            },
+            () = stopped(stop) => Opened::Stopped,
+        }
+    }
+
     /// Waits out a reconnection delay while still serving commands, so a
     /// shutdown or a destroy is not stuck behind a backoff.
     async fn wait_before_reopen(&mut self, delay: Duration) -> Option<SessionClosed> {
@@ -1581,10 +1831,17 @@ impl<T: Transport> SessionDriver<T> {
             let woke = tokio::select! {
                 biased;
                 command = self.commands.recv() => Woke::Command(command),
+                () = stopped(&mut self.stop) => Woke::Stop,
                 () = tokio::time::sleep_until(deadline) => Woke::Timer,
             };
             match woke {
                 Woke::Timer => return None,
+                Woke::Stop => {
+                    return Some(SessionClosed::ByClient {
+                        destroy_confirmed: false,
+                        cause: None,
+                    });
+                }
                 Woke::Command(None) => {
                     return Some(SessionClosed::ByClient {
                         destroy_confirmed: false,
@@ -1593,7 +1850,14 @@ impl<T: Transport> SessionDriver<T> {
                 }
                 Woke::Command(Some(command)) => match self.on_command(command).await {
                     Flow::Closed(closed) => return Some(closed),
-                    Flow::Continue | Flow::Unbind(_) => {}
+                    Flow::Continue | Flow::Unbind(_) => {
+                        if self.stopping {
+                            return Some(SessionClosed::ByClient {
+                                destroy_confirmed: false,
+                                cause: None,
+                            });
+                        }
+                    }
                 },
                 Woke::Line(_) => {}
             }
@@ -1663,10 +1927,15 @@ impl<T: Transport> SessionDriver<T> {
         // [`docs/spec/02-session-lifecycle.md` §4.2, §4.4].
         if reason.is_clean_loop() {
             self.backoff.reset();
+            self.refresh_streak = 0;
             return Some(Reopen {
                 intent: OpenIntent::Rebind,
                 delay: reason.expected_delay().unwrap_or(Duration::ZERO),
             });
+        }
+
+        if !matches!(reason, UnbindReason::ServerRefresh { .. }) {
+            self.refresh_streak = 0;
         }
 
         match reason {
@@ -1701,11 +1970,45 @@ impl<T: Transport> SessionDriver<T> {
             // immediately" [`docs/spec/05-error-codes.md` §5.4]. Immediately
             // means no backoff, and the schedule is reset because nothing
             // failed.
+            //
+            // Only the first one, though. A server that answers every fresh
+            // session with another refresh would otherwise get an unthrottled
+            // reconnect loop that never exhausts, because the `CONOK` it sends
+            // first resets the retry budget every time. Consecutive refreshes
+            // with no session productive enough to deliver a single data
+            // notification in between are therefore delayed like any other
+            // failed attempt, and counted towards a definitive loss. The
+            // streak is cleared by the first data notification
+            // ([`SessionDriver::on_data`]) and by any other unbind reason, so
+            // a deployment that legitimately refreshes sessions periodically
+            // never accumulates one.
             UnbindReason::ServerRefresh { .. } => {
-                self.backoff.reset();
+                self.refresh_streak = self.refresh_streak.saturating_add(1);
+                if self.refresh_streak <= 1 {
+                    self.backoff.reset();
+                    return Some(Reopen {
+                        intent: OpenIntent::Create,
+                        delay: Duration::ZERO,
+                    });
+                }
+                if let Some(max) = self.options.backoff.max_attempts
+                    && self.refresh_streak > max.get()
+                {
+                    tracing::warn!(
+                        streak = self.refresh_streak,
+                        "the server kept asking for a fresh session; giving up"
+                    );
+                    return None;
+                }
+                let delay = self.backoff.next_delay()?;
+                tracing::warn!(
+                    streak = self.refresh_streak,
+                    ?delay,
+                    "repeated session refresh; delaying the next attempt"
+                );
                 Some(Reopen {
                     intent: OpenIntent::Create,
-                    delay: Duration::ZERO,
+                    delay,
                 })
             }
 
@@ -1722,6 +2025,7 @@ impl<T: Transport> SessionDriver<T> {
 
     /// Reads lines until the stream connection ends or the session does.
     async fn pump(&mut self) -> Flow {
+        let mut consecutive_lines: u32 = 0;
         loop {
             let deadline = self.liveness.next_deadline();
             // Deliberately biased, server first. The state machine must stay in
@@ -1733,14 +2037,38 @@ impl<T: Transport> SessionDriver<T> {
             // can only fire when neither of the other two has anything, which
             // is exactly the condition it exists to detect.
             //
+            // Every `MAX_LINES_PER_TURN` lines the bias is inverted for one
+            // turn. Without that, a connection that always has a line ready —
+            // a busy server, or a hostile one — would postpone every command
+            // and every liveness deadline for as long as it kept talking. The
+            // inversion costs one reordering per 32 notifications and bounds
+            // the latency of a `destroy`, a shutdown and a heartbeat.
+            //
             // This requires `next_line` to be cancel-safe: the future is
             // dropped whenever another branch wins, and a line must not be lost
             // with it.
-            let woke = tokio::select! {
-                biased;
-                line = self.transport.next_line() => Woke::Line(line),
-                command = self.commands.recv() => Woke::Command(command),
-                () = sleep_until_option(deadline) => Woke::Timer,
+            let woke = if consecutive_lines >= MAX_LINES_PER_TURN {
+                consecutive_lines = 0;
+                tokio::select! {
+                    biased;
+                    command = self.commands.recv() => Woke::Command(command),
+                    () = stopped(&mut self.stop) => Woke::Stop,
+                    () = sleep_until_option(deadline) => Woke::Timer,
+                    line = self.transport.next_line() => Woke::Line(line),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    line = self.transport.next_line() => Woke::Line(line),
+                    command = self.commands.recv() => Woke::Command(command),
+                    () = stopped(&mut self.stop) => Woke::Stop,
+                    () = sleep_until_option(deadline) => Woke::Timer,
+                }
+            };
+            consecutive_lines = if matches!(woke, Woke::Line(_)) {
+                consecutive_lines.saturating_add(1)
+            } else {
+                0
             };
 
             let flow = match woke {
@@ -1752,12 +2080,21 @@ impl<T: Transport> SessionDriver<T> {
                 Woke::Command(Some(command)) => self.on_command(command).await,
                 // Every handle was dropped: nobody can command the session and
                 // nobody is left to care about its events.
-                Woke::Command(None) => Flow::Closed(SessionClosed::ByClient {
+                Woke::Command(None) | Woke::Stop => Flow::Closed(SessionClosed::ByClient {
                     destroy_confirmed: false,
                     cause: None,
                 }),
                 Woke::Timer => self.on_timer().await,
             };
+
+            // A stop ordered while an event was waiting for room unwinds here:
+            // the event is gone, and so is any reason to keep pumping.
+            if self.stopping {
+                return Flow::Closed(SessionClosed::ByClient {
+                    destroy_confirmed: false,
+                    cause: None,
+                });
+            }
 
             match flow {
                 Flow::Continue => {}
@@ -1802,10 +2139,7 @@ impl<T: Transport> SessionDriver<T> {
     async fn on_timer(&mut self) -> Flow {
         match self.liveness.due(Instant::now()) {
             LivenessAction::Idle => Flow::Continue,
-            LivenessAction::SendHeartbeat => {
-                self.send_heartbeat().await;
-                Flow::Continue
-            }
+            LivenessAction::SendHeartbeat => self.send_heartbeat().await,
             LivenessAction::InboundStalled { budget } => match self.stream_state {
                 // Nothing answered the handshake within the client's own limit.
                 // The spec sets no such limit; see `SessionOptions::open_timeout`.
@@ -2040,6 +2374,8 @@ impl<T: Transport> SessionDriver<T> {
             self.progressive = 0;
             self.skip_remaining = 0;
             self.registry.reset_for_new_session();
+            self.generation = self.generation.saturating_add(1);
+            self.retire_stale_pending().await;
         }
 
         tracing::info!(session = %session_id, ?kind, ?keep_alive, "session bound");
@@ -2058,6 +2394,65 @@ impl<T: Transport> SessionDriver<T> {
         // subscriptions with no binding in the current session are issued —
         // which, after a replacement, is all of them.
         self.issue_unbound_subscriptions().await;
+    }
+
+    /// Retires every control request issued by a session that has been
+    /// replaced.
+    ///
+    /// §4.5 promises the case outright: "after binding the second session, it
+    /// is possible that late responses to control requests related with the
+    /// first session arrive interspersed with notifications for the second
+    /// session" [`docs/spec/02-session-lifecycle.md` §4.5]. Once the session
+    /// they named is gone, their responses can say nothing true about the
+    /// replacement — an `add` refused on the old session says nothing about the
+    /// `add` just re-issued on the new one — so they are closed out here, at
+    /// the boundary, and anything that arrives for them afterwards is reported
+    /// but acts on nothing.
+    ///
+    /// Every retired request produces exactly one outcome, which is what keeps
+    /// "every message gets exactly one report" true across a session
+    /// replacement.
+    async fn retire_stale_pending(&mut self) {
+        let generation = self.generation;
+        let stale: Vec<(String, PendingKind)> = self
+            .pending
+            .extract_if(|_, pending| pending.generation != generation)
+            .map(|(id, pending)| (id, pending.kind))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            count = stale.len(),
+            "retiring control requests issued by a session that was replaced"
+        );
+        for (request_id, kind) in stale {
+            let target = kind.target();
+            // No `LOOP` can now be attributed to a `force_rebind` the previous
+            // session never answered.
+            if matches!(kind, PendingKind::ForceRebind) {
+                self.force_rebind_outstanding = false;
+            }
+            if let PendingKind::SendMessage { sequence, prog } = kind {
+                self.emit(SessionEvent::Message {
+                    progressive: None,
+                    sequence,
+                    prog,
+                    result: MessageResult::NotSent {
+                        reason: "the session the message was sent on was replaced".to_owned(),
+                    },
+                })
+                .await;
+            }
+            self.emit(SessionEvent::ControlResponse {
+                request_id: RequestId::try_new(request_id).ok(),
+                target,
+                outcome: ControlOutcome::NotSent {
+                    reason: "the session the request was issued on was replaced".to_owned(),
+                },
+            })
+            .await;
+        }
     }
 
     /// Handles `END` [`docs/spec/02-session-lifecycle.md` §6.2].
@@ -2124,19 +2519,34 @@ impl<T: Transport> SessionDriver<T> {
     }
 
     /// Handles `PROG` [`docs/spec/02-session-lifecycle.md` §5.4].
+    ///
+    /// Only a `PROG` that answers a recovery this client asked for is obeyed.
+    /// The notification is "sent only when requested via `LS_recovery_from` on
+    /// `bind_session` requests", and it is one of the notifications "sent
+    /// immediately after `CONOK`" [ibid. §5.4] — so exactly one is expected per
+    /// recovery bind and none at all otherwise. Obeying an unsolicited one
+    /// would let a single line move the recovery baseline to any value at all,
+    /// and every later decision about continuity and duplicates rests on that
+    /// number. An unexpected one is reported and ignored.
     async fn on_prog(&mut self, resumed_at: u64) {
         let requested = match self.intent {
-            OpenIntent::Recover { requested } => requested,
-            // "sent only when requested via `LS_recovery_from`"
-            // [`docs/spec/02-session-lifecycle.md` §5.4]; an unsolicited one is
-            // still obeyed, since the server is telling us where the flow
-            // starts, but it is worth a warning.
+            OpenIntent::Recover { requested } if !self.prog_honoured => requested,
+            OpenIntent::Recover { .. } => {
+                tracing::warn!(
+                    resumed_at,
+                    "ignoring a second PROG on one stream connection"
+                );
+                return;
+            }
             _ => {
-                tracing::warn!(resumed_at, "PROG arrived without a recovery request");
-                self.progressive = resumed_at;
+                tracing::warn!(
+                    resumed_at,
+                    "ignoring a PROG that answers no recovery request"
+                );
                 return;
             }
         };
+        self.prog_honoured = true;
 
         let kind = match resumed_at.cmp(&requested) {
             std::cmp::Ordering::Equal => RecoveryKind::Exact,
@@ -2180,6 +2590,10 @@ impl<T: Transport> SessionDriver<T> {
     /// Counts, annotates and forwards a data notification
     /// [`docs/spec/02-session-lifecycle.md` §5.3].
     async fn on_data(&mut self, notification: Notification) {
+        // A session that delivered data was productive, whatever it does next:
+        // it is not part of a refresh loop. See [`SessionDriver::plan_after`].
+        self.refresh_streak = 0;
+
         if self.skip_remaining > 0 {
             // Guarded by the branch above, so the subtraction cannot wrap.
             if let Some(remaining) = self.skip_remaining.checked_sub(1) {
@@ -2305,6 +2719,29 @@ impl<T: Transport> SessionDriver<T> {
         Some(key)
     }
 
+    /// Takes the pending request a response names, if it still belongs to the
+    /// session this driver is on.
+    ///
+    /// A request issued by a session that has since been replaced is retired at
+    /// the boundary ([`SessionDriver::retire_stale_pending`]), so finding one
+    /// here with an older generation means the response outran the retirement.
+    /// It is dropped rather than acted on: §4.5 warns that these arrive, and
+    /// letting one mutate the replacement session's registry is how a live
+    /// subscription disappears.
+    fn take_pending(&mut self, request_id: &str) -> Option<PendingKind> {
+        let pending = self.pending.remove(request_id)?;
+        if pending.generation == self.generation {
+            return Some(pending.kind);
+        }
+        tracing::debug!(
+            request_id,
+            issued_on = pending.generation,
+            current = self.generation,
+            "ignoring a late response from a session that was replaced"
+        );
+        None
+    }
+
     /// Correlates a `REQOK` with the request that caused it
     /// [`docs/spec/03-requests.md` §13.1].
     async fn on_request_ok(&mut self, request_id: Option<String>) {
@@ -2315,10 +2752,29 @@ impl<T: Transport> SessionDriver<T> {
             return;
         };
 
-        let target = match self.pending.remove(&request_id) {
+        let target = match self.take_pending(&request_id) {
             Some(kind) => {
                 tracing::debug!(request_id, ?kind, "control request accepted");
-                kind.target()
+                let target = kind.target();
+                // The one acceptance that changes desired state. Everything
+                // else the server accepts is reported by the notification that
+                // follows it — `SUBOK` for an `add`, `UNSUB` for a `delete` —
+                // but `reconf` has no such notification of its own, and the
+                // value it granted has to survive a session that is recreated
+                // and re-issues every `add` [ibid. §6.1]. Committing it here,
+                // and only here, is what stops a reconnection silently putting
+                // the caller's frequency ceiling back where it started.
+                if let PendingKind::Reconfigure { key, max_frequency } = kind
+                    && let Some(entry) = self.registry.entries.get_mut(&key)
+                {
+                    entry.spec.requested_max_frequency =
+                        Some(as_requested_frequency(max_frequency));
+                    tracing::debug!(
+                        key = key.get(),
+                        "frequency reconfiguration accepted and committed to the desired state"
+                    );
+                }
+                target
             }
             // §4.5: "late responses to control requests related with the first
             // session [may] arrive interspersed with notifications for the
@@ -2356,7 +2812,7 @@ impl<T: Transport> SessionDriver<T> {
     /// Correlates a `REQERR` and undoes whatever the request had optimistically
     /// recorded [`docs/spec/03-requests.md` §13.2].
     async fn on_request_error(&mut self, request_id: String, cause: ServerCause) {
-        let pending = self.pending.remove(&request_id);
+        let pending = self.take_pending(&request_id);
         let target = pending
             .as_ref()
             .map_or(ControlTarget::Session, PendingKind::target);
@@ -2368,10 +2824,10 @@ impl<T: Transport> SessionDriver<T> {
                 // session — and the caller is told, so nothing is lost
                 // silently.
                 PendingKind::Subscribe(key) => {
-                    if let Some(entry) = self.registry.entries.remove(&key) {
-                        if let Some(sub_id) = entry.wire {
-                            self.registry.by_sub_id.remove(&sub_id.get());
-                        }
+                    if let Some(entry) = self.registry.entries.remove(&key)
+                        && let Some(sub_id) = entry.wire
+                    {
+                        self.registry.by_sub_id.remove(&sub_id.get());
                     }
                     tracing::warn!(
                         key = key.get(),
@@ -2389,7 +2845,9 @@ impl<T: Transport> SessionDriver<T> {
                         };
                     }
                 }
-                PendingKind::Reconfigure(_) => {}
+                // The subscription keeps the ceiling it already had: the new
+                // one is only committed on `REQOK`.
+                PendingKind::Reconfigure { .. } => {}
                 // The server refused the submission, so no `MSGDONE`/`MSGFAIL`
                 // will follow [`docs/spec/03-requests.md` §13.2]. Reporting it
                 // on the message surface as well is what keeps "every message
@@ -2468,7 +2926,10 @@ impl<T: Transport> SessionDriver<T> {
                 let Some(session) = self.session.clone() else {
                     return Flow::Continue;
                 };
-                let request_id = self.next_request_id();
+                let Some(request_id) = self.next_request_id() else {
+                    self.report_id_exhaustion(ControlTarget::Session).await;
+                    return Flow::Continue;
+                };
                 // Set before sending: the `LOOP` may well arrive before the
                 // `REQOK` [`docs/spec/02-session-lifecycle.md` §4.5].
                 self.force_rebind_outstanding = true;
@@ -2501,7 +2962,12 @@ impl<T: Transport> SessionDriver<T> {
                 cause: None,
             });
         };
-        let request_id = self.next_request_id();
+        let Some(request_id) = self.next_request_id() else {
+            self.report_id_exhaustion(ControlTarget::Session).await;
+            return Flow::Closed(SessionClosed::Internal {
+                reason: "the request-id space is exhausted".to_owned(),
+            });
+        };
         self.destroy_requested = true;
         let request = DestroySession {
             session: Some(session.as_str().to_owned()),
@@ -2560,7 +3026,19 @@ impl<T: Transport> SessionDriver<T> {
             }
         };
 
-        let request_id = self.next_request_id();
+        let Some(request_id) = self.next_request_id() else {
+            self.report_id_exhaustion(ControlTarget::Session).await;
+            self.emit(SessionEvent::Message {
+                progressive: None,
+                sequence,
+                prog,
+                result: MessageResult::NotSent {
+                    reason: "the request-id space is exhausted".to_owned(),
+                },
+            })
+            .await;
+            return;
+        };
         let request = MessageSend {
             session: Some(session.as_str().to_owned()),
             request_id: request_id.clone(),
@@ -2612,7 +3090,14 @@ impl<T: Transport> SessionDriver<T> {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let request_id = self.next_request_id();
+        let Some(request_id) = self.next_request_id() else {
+            self.report_id_exhaustion(ControlTarget::Subscription {
+                key,
+                operation: SubscriptionOperation::Unsubscribe,
+            })
+            .await;
+            return;
+        };
         let request = Unsubscribe {
             session: Some(session.as_str().to_owned()),
             request_id: request_id.clone(),
@@ -2626,6 +3111,15 @@ impl<T: Transport> SessionDriver<T> {
             .await;
     }
 
+    /// Asks the server to change a subscription's frequency ceiling
+    /// [`docs/spec/03-requests.md` §8].
+    ///
+    /// The new value is **not** written into the desired state here. Until the
+    /// server has accepted the `reconf` the subscription still has its old
+    /// ceiling, and a session recreated in between must re-issue what the
+    /// server actually granted, not what it was last asked for. The commit
+    /// happens on `REQOK` [`docs/spec/03-requests.md` §13.1], in
+    /// [`SessionDriver::on_request_ok`].
     async fn reconfigure(&mut self, key: SubscriptionKey, max_frequency: MaxFrequencyLimit) {
         let Some(entry) = self.registry.entries.get(&key) else {
             return;
@@ -2636,15 +3130,26 @@ impl<T: Transport> SessionDriver<T> {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let request_id = self.next_request_id();
+        let Some(request_id) = self.next_request_id() else {
+            self.report_id_exhaustion(ControlTarget::Subscription {
+                key,
+                operation: SubscriptionOperation::Reconfigure,
+            })
+            .await;
+            return;
+        };
         let request = ReconfigureSubscription {
             session: Some(session.as_str().to_owned()),
             request_id: request_id.clone(),
             subscription_id: sub_id,
-            requested_max_frequency: Some(max_frequency),
+            requested_max_frequency: Some(max_frequency.clone()),
         };
-        self.dispatch(&request, request_id, PendingKind::Reconfigure(key))
-            .await;
+        self.dispatch(
+            &request,
+            request_id,
+            PendingKind::Reconfigure { key, max_frequency },
+        )
+        .await;
     }
 
     // -----------------------------------------------------------------------
@@ -2693,7 +3198,18 @@ impl<T: Transport> SessionDriver<T> {
         let previously_active = entry.was_active;
         self.registry.by_sub_id.insert(sub_id.get(), key);
 
-        let request_id = self.next_request_id();
+        let Some(request_id) = self.next_request_id() else {
+            if let Some(entry) = self.registry.entries.get_mut(&key) {
+                entry.wire = None;
+            }
+            self.registry.by_sub_id.remove(&sub_id.get());
+            self.report_id_exhaustion(ControlTarget::Subscription {
+                key,
+                operation: SubscriptionOperation::Subscribe,
+            })
+            .await;
+            return None;
+        };
         let request = Subscribe {
             session: Some(session.as_str().to_owned()),
             request_id: request_id.clone(),
@@ -2749,12 +3265,36 @@ impl<T: Transport> SessionDriver<T> {
     // Sending
     // -----------------------------------------------------------------------
 
-    /// The next `LS_reqId`. See the note on
-    /// [`SessionDriver::next_request_id`] for why it never resets.
-    fn next_request_id(&mut self) -> RequestId {
+    /// The next `LS_reqId`, or `None` once the space is exhausted.
+    ///
+    /// See the note on the [`SessionDriver::next_request_id`] field for why it
+    /// never resets. It also never wraps: an id that came back round would
+    /// collide with a request whose late response §4.5 says may still be in
+    /// flight, and correlating a response to the wrong request is worse than
+    /// refusing to send a new one. Exhausting a 64-bit space takes longer than
+    /// any session lives, so the refusal is a proof obligation rather than an
+    /// operating condition.
+    fn next_request_id(&mut self) -> Option<RequestId> {
+        let next = self.next_request_id.checked_add(1)?;
         let id = RequestId::from_progressive(self.next_request_id);
-        self.next_request_id = self.next_request_id.checked_add(1).unwrap_or(1);
-        id
+        self.next_request_id = next;
+        Some(id)
+    }
+
+    /// Reports that a request could not be given an id, on the surface that
+    /// request would have been answered on.
+    async fn report_id_exhaustion(&mut self, target: ControlTarget) {
+        tracing::error!(
+            "the request-id space is exhausted; no further control request can be sent"
+        );
+        self.emit(SessionEvent::ControlResponse {
+            request_id: None,
+            target,
+            outcome: ControlOutcome::NotSent {
+                reason: "the request-id space is exhausted".to_owned(),
+            },
+        })
+        .await;
     }
 
     /// Which encoding rules apply to a control request on this transport.
@@ -2799,7 +3339,13 @@ impl<T: Transport> SessionDriver<T> {
             }
         };
 
-        self.pending.insert(request_id.as_str().to_owned(), kind);
+        self.pending.insert(
+            request_id.as_str().to_owned(),
+            Pending {
+                kind,
+                generation: self.generation,
+            },
+        );
         let encoded = EncodedRequest {
             name: R::NAME,
             path: R::PATH,
@@ -2831,38 +3377,103 @@ impl<T: Transport> SessionDriver<T> {
     /// Sends the `heartbeat` pseudo-request that keeps the client's
     /// `LS_inactivity_millis` commitment
     /// [`docs/spec/02-session-lifecycle.md` §8.4].
-    async fn send_heartbeat(&mut self) {
+    /// Sends the `heartbeat` pseudo-request, or gives the connection up.
+    ///
+    /// A failure here is not merely logged. The outbound deadline is already
+    /// past when this runs, so leaving it where it is would make the timer fire
+    /// again on the very next turn of the pump — a spin that burns a core and
+    /// floods the log without ever satisfying the commitment. The deadline is
+    /// therefore advanced whatever happens, which spaces the retries one
+    /// interval apart, and after [`MAX_HEARTBEAT_FAILURES`] consecutive
+    /// failures the connection is treated as lost: a client that cannot write
+    /// to a socket cannot keep the `LS_inactivity_millis` commitment on it
+    /// [`docs/spec/02-session-lifecycle.md` §8.4], and the server will drop it
+    /// regardless.
+    async fn send_heartbeat(&mut self) -> Flow {
         let session = self.session.as_ref().map(|s| s.as_str().to_owned());
         // `LS_session` "is only needed for the purpose 3 above, whereby the
         // client declares that it is still listening to the stream connection
         // for the specified session" — which is the purpose of every heartbeat
         // this driver sends [`docs/spec/02-session-lifecycle.md` §8.4].
         let request = Heartbeat { session };
-        let parameters = match request.encode_parameters(self.control_kind()) {
-            Ok(parameters) => parameters,
-            Err(error) => {
-                tracing::warn!(%error, "cannot encode heartbeat");
-                return;
+        let failure = match request.encode_parameters(self.control_kind()) {
+            Ok(parameters) => {
+                let encoded = EncodedRequest {
+                    name: Heartbeat::NAME,
+                    path: Heartbeat::PATH,
+                    parameters,
+                };
+                match self.transport.send_control(encoded).await {
+                    Ok(()) => None,
+                    Err(error) => Some(error.to_string()),
+                }
             }
+            Err(error) => Some(error.to_string()),
         };
-        let encoded = EncodedRequest {
-            name: Heartbeat::NAME,
-            path: Heartbeat::PATH,
-            parameters,
+
+        // Either way the clock moves: a heartbeat that failed is not retried
+        // sooner than one that succeeded.
+        self.liveness.on_outbound(Instant::now());
+
+        let Some(detail) = failure else {
+            self.heartbeat_failures = 0;
+            return Flow::Continue;
         };
-        match self.transport.send_control(encoded).await {
-            Ok(()) => self.liveness.on_outbound(Instant::now()),
-            Err(error) => tracing::warn!(%error, "heartbeat could not be sent"),
+        self.heartbeat_failures = self.heartbeat_failures.saturating_add(1);
+        tracing::warn!(
+            detail,
+            attempts = self.heartbeat_failures,
+            "heartbeat could not be sent"
+        );
+        if self.heartbeat_failures >= MAX_HEARTBEAT_FAILURES {
+            self.heartbeat_failures = 0;
+            return Flow::Unbind(UnbindReason::ConnectionFailed {
+                detail: format!(
+                    "the outbound heartbeat failed {MAX_HEARTBEAT_FAILURES} times in a row: {detail}"
+                ),
+            });
         }
+        Flow::Continue
     }
 
     /// Publishes an event, applying backpressure when the caller is slow.
     ///
-    /// A closed receiver is not an error: the caller may legitimately stop
-    /// listening, and the driver still has a session to shut down in order.
-    async fn emit(&self, event: SessionEvent) {
-        if self.events.send(event).await.is_err() {
-            tracing::debug!("event receiver dropped; events are no longer delivered");
+    /// Nothing is dropped and nothing is reordered: the driver waits for room
+    /// rather than discarding, because a discarded data notification would
+    /// desynchronise the recovery progressive that makes recovery correct
+    /// [`docs/spec/02-session-lifecycle.md` §5.2].
+    ///
+    /// The one thing that can end the wait early is the stop lane. A caller
+    /// that has stopped reading is entitled to stall the session — that is the
+    /// documented contract — but not to make it unstoppable, so an ordered stop
+    /// abandons the undelivered event and marks the driver as unwinding. The
+    /// stream it was going to is about to end anyway.
+    ///
+    /// A closed receiver is not an error either: the caller may legitimately
+    /// stop listening, and the driver still has a session to shut down in
+    /// order.
+    async fn emit(&mut self, event: SessionEvent) {
+        let events = &self.events;
+        let stop = &mut self.stop;
+        let interrupted = tokio::select! {
+            biased;
+            permit = events.reserve() => match permit {
+                Ok(permit) => {
+                    permit.send(event);
+                    false
+                }
+                Err(_) => {
+                    tracing::debug!("event receiver dropped; events are no longer delivered");
+                    false
+                }
+            },
+            () = stopped(stop) => true,
+        };
+        if interrupted {
+            tracing::debug!(
+                "a stop was ordered while the event stream was full; the event was not delivered"
+            );
+            self.stopping = true;
         }
     }
 }
@@ -2916,6 +3527,11 @@ mod tests {
         /// Yield nothing until at least this many control requests have been
         /// sent. Lets a script react to what the driver does.
         AwaitControls(usize),
+        /// Yield this line, always immediately ready, until at least this many
+        /// control requests have been sent. Models the busy server the pump's
+        /// fairness bound exists for: the line stream is never *not* ready, so
+        /// a purely biased pump would never look at anything else.
+        FloodUntilControls(&'static str, usize),
     }
 
     fn line(text: &str) -> Step {
@@ -2965,6 +3581,9 @@ mod tests {
         /// How many of the next `send_control` calls fail. Models a control
         /// request that never reaches the server.
         control_failures: usize,
+        /// Whether `open_stream` never completes. Models a dial that hangs
+        /// below the port — in DNS, in TCP, in TLS, or in the handshake.
+        hangs_on_open: bool,
         log: Arc<Mutex<MockLog>>,
     }
 
@@ -2975,12 +3594,18 @@ mod tests {
                 scripts: scripts.into(),
                 current: VecDeque::new(),
                 control_failures: 0,
+                hangs_on_open: false,
                 log: Arc::new(Mutex::new(MockLog::default())),
             }
         }
 
         fn failing_controls(mut self, count: usize) -> Self {
             self.control_failures = count;
+            self
+        }
+
+        const fn hanging_open(mut self) -> Self {
+            self.hangs_on_open = true;
             self
         }
     }
@@ -3011,6 +3636,9 @@ mod tests {
                 .expect("mock log poisoned")
                 .opens
                 .push(record);
+            if self.hangs_on_open {
+                return std::future::pending().await;
+            }
             self.current = self.scripts.pop_front().unwrap_or_default().into();
             Ok(())
         }
@@ -3036,6 +3664,14 @@ mod tests {
                         return None;
                     }
                     Step::Silence => return std::future::pending().await,
+                    Step::FloodUntilControls(text, wanted) => {
+                        let sent = self.log.lock().expect("mock log poisoned").controls.len();
+                        if sent >= wanted {
+                            self.current.pop_front();
+                            continue;
+                        }
+                        return Some(Ok(text.to_owned()));
+                    }
                     Step::AwaitControls(wanted) => {
                         let sent = self.log.lock().expect("mock log poisoned").controls.len();
                         if sent >= wanted {
@@ -3057,14 +3693,14 @@ mod tests {
                 .expect("mock log poisoned")
                 .controls
                 .push(request);
-            if let Some(remaining) = self.control_failures.checked_sub(1) {
-                if self.control_failures > 0 {
-                    self.control_failures = remaining;
-                    return Err(TransportError::Send {
-                        name,
-                        reason: "control connection refused".to_owned(),
-                    });
-                }
+            if self.control_failures > 0
+                && let Some(remaining) = self.control_failures.checked_sub(1)
+            {
+                self.control_failures = remaining;
+                return Err(TransportError::Send {
+                    name,
+                    reason: "control connection refused".to_owned(),
+                });
             }
             Ok(())
         }
@@ -5184,5 +5820,503 @@ mod tests {
             .count();
         assert_eq!(adds, 1, "an unsubscribed item is not re-established");
         assert!(outcome.resubscribes().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency, liveness and shutdown
+    // -----------------------------------------------------------------------
+
+    /// How many `LS_op=add` requests a run produced.
+    fn adds(outcome: &Outcome) -> usize {
+        outcome
+            .controls()
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .count()
+    }
+
+    /// C-03. The pump is biased towards the server, and a server that always
+    /// has a line ready would otherwise postpone every command for ever.
+    ///
+    /// Deliberately **not** on a paused clock: the condition this guards
+    /// against is a driver that never yields, under which a paused clock never
+    /// advances. Note that a regression here shows up as a hung test rather
+    /// than a failing one, and unavoidably so — a future that never yields
+    /// cannot be interrupted from inside the runtime it is starving. That is
+    /// the defect, stated exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_flooding_server_cannot_starve_a_destroy() {
+        // `PROBE` is chosen deliberately: it produces no event, so nothing here
+        // depends on the event channel having room. What is being measured is
+        // the scheduling, not the backpressure.
+        let script = vec![
+            line(F1_CONOK),
+            Step::FloodUntilControls("PROBE", 1),
+            line("END,31,session destroyed"),
+        ];
+
+        let transport = MockTransport::new(websocket(), vec![script]);
+        let log = Arc::clone(&transport.log);
+        let (driver, handle, events) = connect(transport, options()).expect("valid options");
+        handle
+            .destroy(None)
+            .await
+            .expect("the driver has not started yet");
+
+        let running = tokio::spawn(driver.run());
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("an unbounded line stream must not postpone a command for ever")
+            .expect("the driver task did not panic");
+
+        let controls = log.lock().expect("mock log poisoned").control_parameters();
+        assert!(
+            controls
+                .iter()
+                .any(|parameters| parameters.contains("LS_op=destroy")),
+            "the destroy reached the wire: {controls:?}"
+        );
+        drop((handle, events));
+    }
+
+    /// C-02. A caller that stops reading its event stream stalls the session —
+    /// that is the documented contract — but must not be able to make it
+    /// unstoppable.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_stop_is_honoured_while_the_event_stream_is_full() {
+        // One event of capacity and nobody reading it: the driver blocks on the
+        // second one, inside `emit`, where it is polling neither the socket nor
+        // the command channel.
+        let mut options = options();
+        options.event_capacity = std::num::NonZeroUsize::MIN;
+        // A flood that never stops: no control request is ever sent here, so
+        // the gate never opens and the line stream stays permanently ready.
+        let script = vec![
+            line(F1_CONOK),
+            Step::FloodUntilControls("U,1,1,20.4", usize::MAX),
+        ];
+
+        let transport = MockTransport::new(websocket(), vec![script]);
+        let log = Arc::clone(&transport.log);
+        let (driver, handle, events) = connect(transport, options).expect("valid options");
+
+        let running = tokio::spawn(driver.run());
+        // Let the driver bind, fill the single slot, and block on the next one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        handle.stop();
+        let closed = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("a stop must not be subject to backpressure")
+            .expect("the driver task did not panic");
+
+        assert!(matches!(closed, SessionClosed::ByClient { .. }));
+        assert!(
+            log.lock().expect("mock log poisoned").closes >= 1,
+            "the transport is closed on every exit path"
+        );
+        drop(events);
+    }
+
+    /// C-10. The budget covers the whole establishment, not just the wait for
+    /// `CONOK` that follows it.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_establishment_that_hangs_is_abandoned_within_the_budget() {
+        let mut options = options();
+        options.open_timeout = Duration::from_secs(3);
+        let transport = MockTransport::new(websocket(), Vec::new()).hanging_open();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            drive_transport(transport, options, Vec::new()),
+        )
+        .await
+        .expect("a hanging dial must not hang the session");
+
+        assert!(matches!(
+            outcome.closed,
+            SessionClosed::RetriesExhausted { .. }
+        ));
+        assert!(
+            outcome
+                .unbinds()
+                .iter()
+                .all(|reason| matches!(reason, UnbindReason::ConnectionFailed { .. })),
+            "every attempt timed out: {:?}",
+            outcome.unbinds()
+        );
+    }
+
+    /// C-10. A stop is honoured while a dial is still hanging.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_stop_is_honoured_while_a_dial_is_hanging() {
+        let mut options = options();
+        // Long enough that the timeout cannot be what ends this.
+        options.open_timeout = Duration::from_secs(3600);
+        let transport = MockTransport::new(websocket(), Vec::new()).hanging_open();
+        let (driver, handle, events) = connect(transport, options).expect("valid options");
+
+        let running = tokio::spawn(driver.run());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.stop();
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("a stop must interrupt an establishment")
+            .expect("the driver task did not panic");
+        assert!(matches!(closed, SessionClosed::ByClient { .. }));
+        drop(events);
+    }
+
+    /// C-11. A heartbeat that cannot be written leaves an already-expired
+    /// deadline in place; retrying it immediately is a spin.
+    #[tokio::test(start_paused = true)]
+    async fn test_repeated_heartbeat_failures_give_the_connection_up() {
+        let options = options().with_connection(ConnectionMode::Streaming {
+            inactivity_millis: Some(2000),
+            keepalive_millis: None,
+            send_sync: None,
+        });
+        // Silence after the bind: nothing but the heartbeat clock can fire.
+        let first = vec![line(F1_CONOK), Step::Silence];
+        let second = vec![line("CONERR,1,User/password check failed")];
+        let transport = MockTransport::new(websocket(), vec![first, second])
+            // Every heartbeat, and every retry of it, fails.
+            .failing_controls(usize::MAX);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            drive_transport(transport, options, Vec::new()),
+        )
+        .await
+        .expect("a failing heartbeat must not spin for ever");
+
+        // Bounded: the connection was given up rather than retried without end.
+        assert!(
+            outcome
+                .unbinds()
+                .iter()
+                .any(|reason| matches!(reason, UnbindReason::ConnectionFailed { .. })),
+            "{:?}",
+            outcome.unbinds()
+        );
+        let heartbeats = outcome
+            .controls()
+            .iter()
+            .filter(|parameters| parameters.contains("LS_session"))
+            .count();
+        assert!(
+            heartbeats <= usize::try_from(MAX_HEARTBEAT_FAILURES).unwrap_or(usize::MAX),
+            "at most {MAX_HEARTBEAT_FAILURES} attempts before giving up, got {heartbeats}"
+        );
+    }
+
+    /// C-12. An identifier is never handed out twice, and exhaustion is
+    /// reported rather than wrapped.
+    #[tokio::test]
+    async fn test_identifier_spaces_are_exhausted_rather_than_reused() {
+        let (mut driver, handle, events) =
+            connect(MockTransport::new(websocket(), Vec::new()), options()).expect("valid options");
+
+        driver.next_request_id = u64::MAX;
+        assert!(
+            driver.next_request_id().is_none(),
+            "the last id is never handed out, because it cannot be advanced past"
+        );
+
+        handle.next_key.store(u64::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            handle.allocate_key(),
+            Err(SessionError::Exhausted { .. })
+        ));
+        drop((driver, events));
+    }
+
+    /// C-17. `PROG` is "sent only when requested via `LS_recovery_from`"
+    /// [`docs/spec/02-session-lifecycle.md` §5.4]. One that answers no request
+    /// of ours must not move the baseline every recovery decision rests on.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_unsolicited_prog_cannot_move_the_recovery_baseline() {
+        // A plain creation, one data notification, and a `PROG` claiming the
+        // flow is a thousand notifications further on than it is.
+        let first = vec![
+            line(F1_CONOK),
+            line("U,1,1,20.4"),
+            line("PROG,1000"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.opens().get(1),
+            Some(&OpenRecord::Bind {
+                session: Some(F1_SESSION.to_owned()),
+                recovery_from: Some(1),
+            }),
+            "the recovery asks to resume from what was actually counted"
+        );
+        assert!(
+            outcome.recoveries().is_empty(),
+            "an unsolicited PROG reports no recovery outcome"
+        );
+    }
+
+    /// C-18. Code 48 asks for a new session "immediately"
+    /// [`docs/spec/05-error-codes.md` §5.4]. A server that answers every new
+    /// session the same way must not get an unthrottled loop.
+    #[tokio::test(start_paused = true)]
+    async fn test_repeated_session_refreshes_are_delayed_and_eventually_given_up() {
+        let refresh = || vec![line(F1_CONOK), line("END,48,please reconnect")];
+        let scripts = (0..12).map(|_| refresh()).collect();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            drive(websocket(), options(), scripts, Vec::new()),
+        )
+        .await
+        .expect("a refresh loop must terminate");
+
+        let delays: Vec<Option<Duration>> = outcome
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Unbound { retry_in, .. } => Some(*retry_in),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delays.first(),
+            Some(&Some(Duration::ZERO)),
+            "the first refresh is immediate, as the spec prescribes"
+        );
+        assert!(
+            delays
+                .iter()
+                .skip(1)
+                .any(|delay| matches!(delay, Some(delay) if !delay.is_zero())),
+            "later refreshes are delayed: {delays:?}"
+        );
+        assert!(
+            matches!(outcome.closed, SessionClosed::RetriesExhausted { .. }),
+            "a server that only ever refreshes is a definitive loss, got {:?}",
+            outcome.closed
+        );
+    }
+
+    /// C-18. A session that delivered data is not part of a refresh loop, so a
+    /// deployment that legitimately refreshes never accumulates a streak.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_productive_session_clears_the_refresh_streak() {
+        let productive = || {
+            vec![
+                line(F1_CONOK),
+                line("U,1,1,20.4"),
+                line("END,48,please reconnect"),
+            ]
+        };
+        let scripts = vec![
+            productive(),
+            productive(),
+            productive(),
+            vec![line(F1_CONOK), line(SERVER_END)],
+        ];
+
+        let outcome = drive(websocket(), options(), scripts, Vec::new()).await;
+
+        let delays: Vec<Option<Duration>> = outcome
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Unbound { retry_in, .. } => Some(*retry_in),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            delays.iter().all(|delay| *delay == Some(Duration::ZERO)),
+            "every refresh follows a productive session: {delays:?}"
+        );
+        assert!(matches!(outcome.closed, SessionClosed::ByServer { .. }));
+    }
+
+    /// C-07. §4.5 promises that "late responses to control requests related
+    /// with the first session [may] arrive interspersed with notifications for
+    /// the second session". One of them must not take a live subscription with
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_late_rejection_from_a_replaced_session_changes_nothing() {
+        // Session A issues the `add` as request 1 and is then refreshed.
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("END,48,please reconnect"),
+        ];
+        // Session B re-issues it as request 2 — and only then does session A's
+        // refusal of request 1 arrive.
+        let second = vec![
+            line(F6_CONOK),
+            Step::AwaitControls(2),
+            line("REQERR,1,19,Specified subscription not found"),
+            line("U,1,1,20.4"),
+            line("END,48,please reconnect"),
+        ];
+        // If the late refusal had been obeyed, there would be no third `add`.
+        let third = vec![line(F8_CONOK), Step::AwaitControls(3), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second, third],
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(1),
+                spec: Box::new(spec()),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            adds(&outcome),
+            3,
+            "the subscription survived a refusal aimed at a session that no longer exists"
+        );
+        // The request that never got its answer is closed out at the boundary,
+        // rather than left pending for ever.
+        assert!(
+            control_targets(&outcome).iter().any(|(target, outcome)| {
+                matches!(
+                    target,
+                    ControlTarget::Subscription {
+                        operation: SubscriptionOperation::Subscribe,
+                        ..
+                    }
+                ) && matches!(outcome, ControlOutcome::NotSent { .. })
+            }),
+            "a retired request reports exactly one outcome: {:?}",
+            control_targets(&outcome)
+        );
+    }
+
+    /// C-07. The same guarantee for a message: one report per message, even
+    /// when the session it was sent on is replaced before the answer arrives.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_message_pending_across_a_replacement_still_gets_one_outcome() {
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("END,48,please reconnect"),
+        ];
+        let second = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![SessionCommand::SendMessage {
+                message: Box::new(OutgoingMessage::numbered("BUY 100", NonZeroU32::MIN)),
+            }],
+        )
+        .await;
+
+        let reported = messages(&outcome);
+        assert_eq!(reported.len(), 1, "exactly one report: {reported:?}");
+        assert!(matches!(
+            reported.first().map(|(_, _, _, result)| result),
+            Some(MessageResult::NotSent { .. })
+        ));
+    }
+
+    /// C-08. An accepted `reconf` changes what the subscription *is*, so a
+    /// session that has to be recreated must re-issue the new value.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_accepted_reconfiguration_survives_a_recreated_session() {
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::AwaitControls(2),
+            line("REQOK,2"),
+            line("END,48,please reconnect"),
+        ];
+        let second = vec![line(F6_CONOK), Step::AwaitControls(3), line(SERVER_END)];
+
+        let limit = MaxFrequencyLimit::Limited(
+            crate::protocol::request::DecimalNumber::try_new("2.5").expect("a decimal number"),
+        );
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Reconfigure {
+                    key: SubscriptionKey(1),
+                    max_frequency: limit,
+                },
+            ],
+        )
+        .await;
+
+        let controls = outcome.controls();
+        let reissued = controls
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .nth(1)
+            .expect("the subscription was re-issued on the new session");
+        assert!(
+            reissued.contains("LS_requested_max_frequency=2.5"),
+            "the recreated subscription keeps the frequency the server granted: {reissued}"
+        );
+    }
+
+    /// C-08, the other half: a `reconf` the server refused must **not** change
+    /// the desired state.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_refused_reconfiguration_leaves_the_desired_state_alone() {
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::AwaitControls(2),
+            line("REQERR,2,25,Subscription is not unfiltered"),
+            line("END,48,please reconnect"),
+        ];
+        let second = vec![line(F6_CONOK), Step::AwaitControls(3), line(SERVER_END)];
+
+        let limit = MaxFrequencyLimit::Limited(
+            crate::protocol::request::DecimalNumber::try_new("2.5").expect("a decimal number"),
+        );
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Reconfigure {
+                    key: SubscriptionKey(1),
+                    max_frequency: limit,
+                },
+            ],
+        )
+        .await;
+
+        let controls = outcome.controls();
+        let reissued = controls
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .nth(1)
+            .expect("the subscription was re-issued on the new session");
+        assert!(
+            !reissued.contains("LS_requested_max_frequency"),
+            "a refused change is not desired state: {reissued}"
+        );
     }
 }

@@ -66,6 +66,36 @@ use crate::transport::ws::WsTransport;
 use self::events::SessionEvents as SessionEventStream;
 use self::router::{Router, RouterCommand};
 
+/// The channel sizes and budgets a client is built with.
+#[derive(Debug, Clone, Copy)]
+struct Capacities {
+    /// Events buffered per subscription stream.
+    update: std::num::NonZeroUsize,
+    /// Events buffered on the session stream.
+    session_event: std::num::NonZeroUsize,
+    /// How long [`Client::disconnect`] waits before forcing a stop.
+    shutdown_timeout: std::time::Duration,
+}
+
+/// Holds one session event produced before the caller could hold the stream.
+///
+/// The buffer is capped at the capacity the caller configured, which is the
+/// budget it already said it wanted for session events. Past that, further
+/// pre-connection events are **discarded with a warning**: they are session
+/// events for a session that has not bound yet, whose outcome
+/// [`Client::connect`] reports as its own return value, and blocking instead
+/// would deadlock the bind against a stream nobody can yet read.
+fn stage(staged: &mut std::collections::VecDeque<SessionEvent>, event: SessionEvent, limit: usize) {
+    if staged.len() < limit {
+        staged.push_back(event);
+        return;
+    }
+    tracing::warn!(
+        limit,
+        "discarding a session event produced before connect() returned"
+    );
+}
+
 /// A live Lightstreamer session.
 ///
 /// Get one from [`Client::connect`]. It is a handle, not the session itself:
@@ -97,10 +127,41 @@ pub struct Client {
     handle: SessionHandle,
     router: mpsc::UnboundedSender<RouterCommand>,
     update_capacity: std::num::NonZeroUsize,
+    /// How long [`Client::disconnect`] waits for the ordered shutdown before
+    /// forcing one. Taken from
+    /// [`ConnectionOptions::with_open_timeout`](crate::ConnectionOptions::with_open_timeout),
+    /// which is already this crate's answer to "how long may one server round
+    /// trip take"; a destroy is exactly one.
+    shutdown_timeout: std::time::Duration,
+    /// The background tasks, so that [`Client::disconnect`] can wait for them
+    /// instead of merely asking them to stop.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Whether dropping this client should order an immediate stop.
+    ///
+    /// Always true except while [`Client::disconnect`] is running its ordered
+    /// shutdown, which needs the session to survive long enough to tell the
+    /// server.
+    stop_on_drop: bool,
     /// Held only to be dropped. Closing it is how the background tasks learn
     /// the client is gone, which is what makes "dropping the client shuts the
     /// session down" true.
     _alive: mpsc::Sender<()>,
+}
+
+impl Drop for Client {
+    /// Shuts the session down.
+    ///
+    /// Closing the channels the background tasks watch is not enough on its
+    /// own: a task blocked delivering into a stream the caller stopped reading
+    /// is not watching anything. The explicit stop is what makes "dropping the
+    /// client shuts the session down" true even then — it is exempt from
+    /// backpressure by construction, and whatever was still undelivered goes
+    /// with the streams it was going to.
+    fn drop(&mut self) {
+        if self.stop_on_drop {
+            self.handle.stop();
+        }
+    }
 }
 
 impl Client {
@@ -147,14 +208,38 @@ impl Client {
     /// ```
     #[tracing::instrument(skip(config), fields(address = %config.address(), transport = config.transport().as_str()))]
     pub async fn connect(config: ClientConfig) -> Result<(Self, SessionEvents)> {
-        let update_capacity = config.options().update_capacity();
-        let session_capacity = config.options().session_event_capacity();
+        let capacities = Capacities {
+            update: config.options().update_capacity(),
+            session_event: config.options().session_event_capacity(),
+            shutdown_timeout: config.options().open_timeout(),
+        };
 
         let transport = match config.transport() {
             Transport::WebSocket => WsTransport::try_new(config.address().as_str())?,
         };
 
-        let options = config.into_session_options();
+        Self::assemble(transport, config.into_session_options(), capacities).await
+    }
+
+    /// Wires the driver, the router and the unsubscriber together and waits
+    /// for the first bind.
+    ///
+    /// Generic over the transport so that the whole client — not merely the
+    /// session layer — can be exercised over a scripted one, with no socket and
+    /// no real timer [`docs/adr/0007-transport-port-shape.md`].
+    async fn assemble<T>(
+        transport: T,
+        options: crate::session::options::SessionOptions,
+        capacities: Capacities,
+    ) -> Result<(Self, SessionEvents)>
+    where
+        T: crate::transport::Transport + Send + 'static,
+    {
+        let Capacities {
+            update: update_capacity,
+            session_event: session_capacity,
+            shutdown_timeout,
+        } = capacities;
         let (driver, handle, session_events) =
             session::connect(transport, options).map_err(|error| Error::Internal {
                 reason: error.to_string(),
@@ -162,7 +247,7 @@ impl Client {
 
         let (router_tx, router_rx) = mpsc::unbounded_channel();
         let (unsubscribe_tx, unsubscribe_rx) = mpsc::unbounded_channel();
-        let (session_out_tx, session_out_rx) = mpsc::channel(session_capacity.get());
+        let (session_out_tx, mut session_out_rx) = mpsc::channel(session_capacity.get());
         let (alive_tx, alive_rx) = mpsc::channel(1);
         let (ready_tx, ready_rx) = oneshot::channel();
 
@@ -172,23 +257,44 @@ impl Client {
             session_out_tx,
             unsubscribe_tx,
             ready_tx,
+            handle.stop_signal(),
         );
 
-        tokio::spawn(async move {
-            let closed = driver.run().await;
-            tracing::debug!(?closed, "session driver stopped");
-        });
-        tokio::spawn(router.run());
-        tokio::spawn(router::issue_unsubscriptions(
-            handle.clone(),
-            unsubscribe_rx,
-            alive_rx,
-        ));
+        let tasks = vec![
+            tokio::spawn(async move {
+                let closed = driver.run().await;
+                tracing::debug!(?closed, "session driver stopped");
+            }),
+            tokio::spawn(router.run()),
+            tokio::spawn(router::issue_unsubscriptions(
+                handle.clone(),
+                unsubscribe_rx,
+                alive_rx,
+                handle.stop_signal(),
+            )),
+        ];
 
-        // The router fires this once, on the first bind or the first terminal
-        // failure. A cancelled receiver means the router stopped without
-        // either, which can only happen if everything was torn down first.
-        let connected = match ready_rx.await {
+        // The router fires readiness once, on the first bind or the first
+        // terminal failure. Waiting for it *while draining* the event channel
+        // is not an optimisation: nobody holds the event stream yet, so a
+        // startup that retries can fill the channel, and a router blocked on a
+        // full channel never processes the bind that readiness is waiting for.
+        // Draining here is what stops `connect` waiting on itself.
+        let mut staged = std::collections::VecDeque::new();
+        tokio::pin!(ready_rx);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                result = &mut ready_rx => break result,
+                event = session_out_rx.recv() => match event {
+                    Some(event) => stage(&mut staged, event, session_capacity.get()),
+                    // The router stopped without saying anything, which can
+                    // only happen if everything was torn down first.
+                    None => break Ok(Err(Error::Disconnected)),
+                },
+            }
+        };
+        let connected = match outcome {
             Ok(Ok(connected)) => connected,
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(Error::Disconnected),
@@ -204,9 +310,12 @@ impl Client {
                 handle,
                 router: router_tx,
                 update_capacity,
+                shutdown_timeout,
+                tasks,
+                stop_on_drop: true,
                 _alive: alive_tx,
             },
-            SessionEventStream::new(session_out_rx),
+            SessionEventStream::with_staged(staged, session_out_rx),
         ))
     }
 
@@ -223,9 +332,13 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Disconnected`] if the session has already stopped. Everything
-    /// the *server* has to say about the subscription arrives on the returned
-    /// stream instead, where it can be interleaved correctly with the data.
+    /// [`Error::Disconnected`] if the session has already stopped, or
+    /// [`Error::Internal`] if this client has run out of the identifiers it
+    /// names subscriptions by — which takes 2⁶⁴ of them, and is reported
+    /// rather than wrapped around because a reused identifier would silently
+    /// conflate two subscriptions. Everything the *server* has to say about
+    /// the subscription arrives on the returned stream instead, where it can
+    /// be interleaved correctly with the data.
     ///
     /// # Examples
     ///
@@ -273,16 +386,24 @@ impl Client {
         );
 
         let (events_tx, events_rx) = mpsc::channel(self.update_capacity.get());
+        // The key is allocated, and everything it names registered, *before*
+        // the request that could produce a notification for it is queued. The
+        // other order leaves a window in which an immediate `SUBOK`, an early
+        // update, or a `REQERR` refusing the subscription outright arrives with
+        // nowhere to go [`docs/spec/03-requests.md` §13] — and a refusal that
+        // lands in that window would leave the caller holding a stream that
+        // never receives its own terminal event.
+        //
+        // The router's channel is unbounded, so this cannot block and cannot
+        // fail while the router lives, and the router takes its commands ahead
+        // of session events.
         let key = self
             .handle
-            .subscribe(subscription.into_spec())
-            .await
-            .map_err(|_| Error::Disconnected)?;
+            .allocate_key()
+            .map_err(|error| Error::Internal {
+                reason: error.to_string(),
+            })?;
         let id = SubscriptionId::new(key);
-
-        // Unbounded, so this cannot block and cannot fail while the router
-        // lives; the router takes commands ahead of session events, so the
-        // registration is in place before anything can be routed to it.
         self.router
             .send(RouterCommand::Register {
                 id,
@@ -290,6 +411,18 @@ impl Client {
                 events: events_tx,
             })
             .map_err(|_| Error::Disconnected)?;
+
+        if let Err(error) = self
+            .handle
+            .subscribe_with_key(key, subscription.into_spec())
+            .await
+        {
+            // Nothing was subscribed, so nothing is unsubscribed: the
+            // registration is simply undone.
+            tracing::debug!(id = id.get(), %error, "the subscription could not be queued");
+            let _ = self.router.send(RouterCommand::Unregister { id });
+            return Err(Error::Disconnected);
+        }
 
         tracing::debug!(id = id.get(), "subscribed");
         Ok(Updates::new(id, events_rx, self.router.clone()))
@@ -376,21 +509,35 @@ impl Client {
             .map_err(|_| Error::Disconnected)
     }
 
-    /// Ends the session, telling the server so.
+    /// Ends the session, telling the server so, and waits until it is over.
     ///
     /// The server closes the session at once instead of holding it open until
-    /// its own timeout [`docs/spec/02-session-lifecycle.md` §6.3]. Every
-    /// stream this client handed out ends shortly afterwards, and the last
-    /// session event is a [`SessionEvent::Closed`].
+    /// its own timeout [`docs/spec/02-session-lifecycle.md` §6.3]. When this
+    /// returns, the `destroy` has been written, the socket has been closed, and
+    /// every background task this client owns has finished — so a caller may
+    /// shut its runtime down immediately afterwards without cutting the
+    /// shutdown short. Every stream this client handed out has ended, the last
+    /// session event being a [`SessionEvent::Closed`].
     ///
-    /// Dropping the client does the same thing *without* telling the server.
-    /// Prefer this when the session limit per user matters, or when you want a
-    /// clean line in the server's log.
+    /// Dropping the client instead ends the session *without* telling the
+    /// server, and without waiting. Prefer this call when the session limit per
+    /// user matters, or when you want a clean line in the server's log.
+    ///
+    /// # The wait is bounded
+    ///
+    /// A server that never answers, or a stream the caller stopped reading,
+    /// cannot make this hang: after
+    /// [`ConnectionOptions::with_open_timeout`](crate::ConnectionOptions::with_open_timeout)
+    /// — the same budget one server round trip is given anywhere else — the
+    /// shutdown stops being polite and the tasks are stopped regardless. The
+    /// socket is closed on that path too.
     ///
     /// # Errors
     ///
     /// [`Error::Disconnected`] if the session had already stopped — which is
     /// the outcome you asked for, so it is usually safe to ignore.
+    /// [`Error::Internal`] if the session did not finish within the budget
+    /// above; it has been stopped anyway, and nothing is left running.
     ///
     /// # Examples
     ///
@@ -401,16 +548,82 @@ impl Client {
     /// # }
     /// ```
     #[tracing::instrument(skip(self))]
-    pub async fn disconnect(self) -> Result<()> {
-        self.handle
-            .destroy(None)
+    pub async fn disconnect(mut self) -> Result<()> {
+        // From here on, dropping this value must not cut the session short:
+        // the point of the call is to let it finish saying goodbye.
+        self.stop_on_drop = false;
+        let budget = self.shutdown_timeout;
+        let mut tasks = std::mem::take(&mut self.tasks);
+        let handle = self.handle.clone();
+
+        // Asking is itself bounded. The command channel is bounded, and a
+        // driver blocked delivering into a stream nobody is reading must not
+        // be able to swallow the request to end it.
+        let asked = match tokio::time::timeout(budget, self.handle.destroy(None)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(Error::Disconnected),
+            Err(_) => Err(Error::Internal {
+                reason: "the session did not accept the destroy request in time".to_owned(),
+            }),
+        };
+
+        // Everything that keeps the background tasks alive goes now: the
+        // router's command channel, the liveness token, and this client's own
+        // session handle. What is left is the ordered shutdown itself.
+        drop(self);
+
+        let mut outcome = asked;
+        if tokio::time::timeout(budget, join_all(&mut tasks))
             .await
-            .map_err(|_| Error::Disconnected)
+            .is_err()
+        {
+            tracing::warn!(
+                ?budget,
+                "the session did not shut down in time; stopping it"
+            );
+            // Exempt from backpressure by construction: this is what a stream
+            // the caller stopped reading cannot hold up.
+            handle.stop();
+            if tokio::time::timeout(budget, join_all(&mut tasks))
+                .await
+                .is_err()
+            {
+                for task in &tasks {
+                    task.abort();
+                }
+                join_all(&mut tasks).await;
+            }
+            if outcome.is_ok() {
+                outcome = Err(Error::Internal {
+                    reason: "the session did not shut down within the configured budget".to_owned(),
+                });
+            }
+        }
+        drop(handle);
+        outcome
+    }
+}
+
+/// Waits for every task, keeping the ones not yet finished.
+///
+/// Written to be cancel-safe: a handle is removed only once it has resolved,
+/// so a caller that times this out still owns whatever is still running and can
+/// escalate rather than detach it.
+async fn join_all(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    while let Some(task) = tasks.last_mut() {
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(%error, "a client task did not finish cleanly");
+        }
+        tasks.pop();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use futures_util::{FutureExt, StreamExt};
     use tokio::sync::{mpsc, oneshot};
 
@@ -432,6 +645,8 @@ mod tests {
         session_events: SessionEvents,
         ready: oneshot::Receiver<Result<Box<Connected>>>,
         unsubscribed: mpsc::UnboundedReceiver<crate::session::SubscriptionKey>,
+        /// Raises the stop lane, as a client being torn down would.
+        stop: tokio::sync::watch::Sender<bool>,
     }
 
     fn harness(session_capacity: usize) -> Harness {
@@ -440,16 +655,18 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(session_capacity);
         let (unsub_tx, unsub_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
-        let router = Router::new(session_rx, commands_rx, out_tx, unsub_tx, ready_tx);
+        let router = Router::new(session_rx, commands_rx, out_tx, unsub_tx, ready_tx, stop_rx);
         tokio::spawn(router.run());
 
         Harness {
             session_tx,
             commands: commands_tx,
-            session_events: SessionEvents::new(out_rx),
+            session_events: SessionEvents::with_staged(std::collections::VecDeque::new(), out_rx),
             ready: ready_rx,
             unsubscribed: unsub_rx,
+            stop: stop_tx,
         }
     }
 
@@ -1099,6 +1316,501 @@ mod tests {
         match mint_keys(1).await.into_iter().next() {
             Some(key) => key,
             None => panic!("one key was requested"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup, shutdown and registration ordering
+    // -----------------------------------------------------------------------
+
+    /// A transport that replays lines and records what it was asked to do.
+    ///
+    /// The whole client is exercised over this: driver, router and
+    /// unsubscriber, with no socket and no real timer
+    /// [`docs/adr/0007-transport-port-shape.md`].
+    #[derive(Debug, Clone, Default)]
+    struct ScriptLog {
+        controls: Vec<String>,
+        closes: usize,
+    }
+
+    /// One thing a scripted connection does when asked for a line.
+    #[derive(Debug, Clone, Copy)]
+    enum Say {
+        /// Yield this line.
+        Line(&'static str),
+        /// Yield nothing until this many control requests have been sent, so a
+        /// script can answer what the client actually did.
+        AwaitControls(usize),
+    }
+
+    #[derive(Debug)]
+    struct ScriptedTransport {
+        /// One script per stream connection; `None` for a connection that
+        /// cannot be opened at all.
+        scripts: std::collections::VecDeque<Option<Vec<Say>>>,
+        current: std::collections::VecDeque<Say>,
+        log: std::sync::Arc<std::sync::Mutex<ScriptLog>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(scripts: Vec<Option<Vec<Say>>>) -> Self {
+            Self {
+                scripts: scripts.into(),
+                current: std::collections::VecDeque::new(),
+                log: std::sync::Arc::new(std::sync::Mutex::new(ScriptLog::default())),
+            }
+        }
+
+        fn log(&self) -> std::sync::Arc<std::sync::Mutex<ScriptLog>> {
+            std::sync::Arc::clone(&self.log)
+        }
+    }
+
+    impl crate::transport::Transport for ScriptedTransport {
+        fn properties(&self) -> crate::transport::TransportProperties {
+            crate::transport::TransportProperties {
+                control_shares_stream: true,
+                ends_on_content_length: false,
+                is_polling: false,
+            }
+        }
+
+        fn set_control_link(&mut self, _host: Option<&str>) {}
+
+        async fn open_stream(
+            &mut self,
+            _request: crate::transport::StreamOpen,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
+            match self.scripts.pop_front() {
+                Some(Some(script)) => {
+                    self.current = script.into();
+                    Ok(())
+                }
+                Some(None) => Err(crate::transport::TransportError::ConnectionLost {
+                    reason: "scripted failure".to_owned(),
+                }),
+                None => {
+                    self.current.clear();
+                    Ok(())
+                }
+            }
+        }
+
+        async fn next_line(
+            &mut self,
+        ) -> Option<std::result::Result<String, crate::transport::TransportError>> {
+            loop {
+                match self.current.front().copied() {
+                    Some(Say::Line(line)) => {
+                        self.current.pop_front();
+                        return Some(Ok(line.to_owned()));
+                    }
+                    Some(Say::AwaitControls(wanted)) => {
+                        let sent = self.log.lock().map_or(0, |log| log.controls.len());
+                        if sent >= wanted {
+                            self.current.pop_front();
+                            continue;
+                        }
+                        return std::future::pending().await;
+                    }
+                    None => return std::future::pending().await,
+                }
+            }
+        }
+
+        async fn send_control(
+            &mut self,
+            request: crate::transport::EncodedRequest,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
+            if let Ok(mut log) = self.log.lock() {
+                log.controls.push(request.parameters);
+            }
+            Ok(())
+        }
+
+        async fn close(&mut self) -> std::result::Result<(), crate::transport::TransportError> {
+            if let Ok(mut log) = self.log.lock() {
+                log.closes = log.closes.saturating_add(1);
+            }
+            Ok(())
+        }
+    }
+
+    const CONOK: &str = "CONOK,S1,50000,5000,*";
+
+    fn capacities(session_event: usize) -> Capacities {
+        Capacities {
+            update: std::num::NonZeroUsize::new(8).unwrap_or(std::num::NonZeroUsize::MIN),
+            session_event: std::num::NonZeroUsize::new(session_event)
+                .unwrap_or(std::num::NonZeroUsize::MIN),
+            shutdown_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn session_options() -> crate::session::options::SessionOptions {
+        crate::session::options::SessionOptions::default().with_backoff(
+            crate::session::backoff::BackoffPolicy {
+                initial: Duration::from_millis(10),
+                max: Duration::from_millis(40),
+                max_attempts: std::num::NonZeroU32::new(6),
+            },
+        )
+    }
+
+    /// C-01. Readiness must never depend on the caller consuming a stream it
+    /// cannot hold yet.
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_completes_when_retries_fill_a_capacity_one_event_stream() {
+        // Three failed attempts before the bind, with a single slot for the
+        // session events they produce. Nobody can read that slot until
+        // `connect` returns, so a router that blocked on it would never
+        // deliver the bind that resolves this call.
+        let transport = ScriptedTransport::new(vec![
+            None,
+            None,
+            None,
+            Some(vec![Say::Line(CONOK), Say::AwaitControls(usize::MAX)]),
+        ]);
+
+        let (client, mut events) = tokio::time::timeout(
+            Duration::from_secs(30),
+            Client::assemble(transport, session_options(), capacities(1)),
+        )
+        .await
+        .expect("connect must not wait on a stream the caller cannot hold yet")
+        .expect("the fourth attempt bound");
+
+        // One slot was configured, so one pre-connection event is retained —
+        // the first, in the order it happened — and the rest are discarded by
+        // the documented policy rather than blocking the bind.
+        assert!(
+            matches!(events.next().await, Some(SessionEvent::Disconnected { .. })),
+            "the retained startup event comes first"
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(SessionEvent::Connected(_))
+        ));
+        drop(client);
+    }
+
+    /// C-01, the retention half: with room for them, every startup event is
+    /// kept, in the order it happened.
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_retains_startup_events_in_order() {
+        let transport = ScriptedTransport::new(vec![
+            None,
+            None,
+            None,
+            Some(vec![Say::Line(CONOK), Say::AwaitControls(usize::MAX)]),
+        ]);
+
+        let (client, events) = tokio::time::timeout(
+            Duration::from_secs(30),
+            Client::assemble(transport, session_options(), capacities(16)),
+        )
+        .await
+        .expect("connect must not wait on a stream the caller cannot hold yet")
+        .expect("the fourth attempt bound");
+
+        let seen: Vec<SessionEvent> = events.take(4).collect().await;
+        assert!(
+            seen.iter()
+                .take(3)
+                .all(|event| matches!(event, SessionEvent::Disconnected { .. })),
+            "the three failed attempts come first, in order: {seen:?}"
+        );
+        assert!(
+            matches!(seen.get(3), Some(SessionEvent::Connected(_))),
+            "then the bind: {seen:?}"
+        );
+        drop(client);
+    }
+
+    /// C-01. The same, when the attempts run out instead of succeeding: the
+    /// failure has to reach the caller rather than deadlock behind it.
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_reports_exhaustion_with_a_capacity_one_event_stream() {
+        let transport = ScriptedTransport::new(vec![None, None, None, None, None, None, None]);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            Client::assemble(transport, session_options(), capacities(1)),
+        )
+        .await
+        .expect("connect must not hang once the retries are spent");
+
+        assert!(
+            matches!(outcome, Err(Error::ReconnectExhausted { .. })),
+            "expected exhaustion, got {:?}",
+            outcome.map(|(_, _)| ())
+        );
+    }
+
+    /// C-09. `disconnect()` must mean the session is over, not that a request
+    /// to end it was queued.
+    #[tokio::test(start_paused = true)]
+    async fn test_disconnect_waits_for_the_destroy_the_socket_and_the_tasks() {
+        // The server answers the destroy — and only the destroy — with the
+        // `END` that T7 promises
+        // [`docs/spec/02-session-lifecycle.md` §2.2, T7].
+        let transport = ScriptedTransport::new(vec![Some(vec![
+            Say::Line(CONOK),
+            Say::AwaitControls(1),
+            Say::Line("END,31,session destroyed"),
+        ])]);
+        let log = transport.log();
+
+        let (client, mut events) = Client::assemble(transport, session_options(), capacities(16))
+            .await
+            .expect("the session bound");
+
+        tokio::time::timeout(Duration::from_secs(10), client.disconnect())
+            .await
+            .expect("disconnect must not hang")
+            .expect("the session was destroyed cleanly");
+
+        let recorded = log.lock().expect("the log is not poisoned").clone();
+        assert!(
+            recorded
+                .controls
+                .iter()
+                .any(|parameters| parameters.contains("LS_op=destroy")),
+            "the destroy reached the wire: {:?}",
+            recorded.controls
+        );
+        assert!(recorded.closes >= 1, "the transport was closed");
+        // Every task has finished, so the streams they feed have ended.
+        let remaining: Vec<SessionEvent> = std::iter::from_fn(|| events.next().now_or_never())
+            .flatten()
+            .collect();
+        assert!(
+            matches!(remaining.last(), Some(SessionEvent::Closed(_))),
+            "the last event is terminal: {remaining:?}"
+        );
+    }
+
+    /// C-02 and C-09 together: a caller that stopped reading must not be able
+    /// to make `disconnect` hang.
+    #[tokio::test(start_paused = true)]
+    async fn test_disconnect_completes_even_with_an_unread_event_stream() {
+        // Three session-level notifications and one slot to put them in. The
+        // stream is held and never read, so the router wedges on the second and
+        // stops taking anything from the driver — which is exactly the state in
+        // which a shutdown used to be impossible.
+        let transport = ScriptedTransport::new(vec![Some(vec![
+            Say::Line(CONOK),
+            Say::Line("SERVNAME,Lightstreamer HTTP Server"),
+            Say::Line("CLIENTIP,127.0.0.1"),
+            Say::Line("CONS,unlimited"),
+        ])]);
+        let log = transport.log();
+
+        let (client, events) = Client::assemble(transport, session_options(), capacities(1))
+            .await
+            .expect("the session bound");
+        // Let the router reach the wedge before asking it to stop.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let disconnected = tokio::time::timeout(Duration::from_secs(60), client.disconnect()).await;
+        assert!(
+            disconnected.is_ok(),
+            "a stream nobody reads must not hold the shutdown open"
+        );
+        assert!(
+            log.lock().expect("the log is not poisoned").closes >= 1,
+            "the socket is closed on the forced path too"
+        );
+        drop(events);
+    }
+
+    /// C-04. A subscription's stream must be registered *before* the request
+    /// that could produce an event for it is queued, and the registration must
+    /// be undone if that request cannot be queued at all.
+    ///
+    /// The window is made observable by giving the session a single command
+    /// slot, filling it, and never running the driver: the submission is then
+    /// stuck, and the registration either already happened or never will.
+    #[tokio::test(start_paused = true)]
+    async fn test_subscribe_registers_the_stream_before_it_submits_the_request() {
+        let options = crate::session::options::SessionOptions {
+            command_capacity: std::num::NonZeroUsize::MIN,
+            ..Default::default()
+        };
+        let Ok((driver, handle, session_events)) = crate::session::connect(NullTransport, options)
+        else {
+            panic!("a default session configuration is valid");
+        };
+
+        // Occupy the one command slot. The driver is deliberately never run,
+        // so nothing will ever free it.
+        let filler = handle
+            .allocate_key()
+            .expect("the key space is not exhausted");
+        assert!(handle.unsubscribe(filler).await.is_ok());
+
+        let (router_tx, mut router_rx) = mpsc::unbounded_channel();
+        let (alive_tx, _alive_rx) = mpsc::channel(1);
+        let client = Client {
+            handle: handle.clone(),
+            router: router_tx,
+            update_capacity: std::num::NonZeroUsize::new(8).unwrap_or(std::num::NonZeroUsize::MIN),
+            shutdown_timeout: Duration::from_secs(5),
+            tasks: Vec::new(),
+            stop_on_drop: false,
+            _alive: alive_tx,
+        };
+
+        let subscribing = tokio::spawn(async move {
+            client
+                .subscribe(Subscription::new(
+                    SubscriptionMode::Merge,
+                    ItemGroup::from_items(["item1"]).expect("a valid group"),
+                    FieldSchema::from_fields(["price"]).expect("a valid schema"),
+                ))
+                .await
+                .is_ok()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            !subscribing.is_finished(),
+            "the submission is blocked, which is the window under test"
+        );
+        assert!(
+            matches!(router_rx.try_recv(), Ok(RouterCommand::Register { .. })),
+            "the stream is registered before the request is submitted"
+        );
+
+        // Now make the submission fail outright: the registration must be
+        // rolled back, and no unsubscription asked for, because nothing was
+        // ever subscribed.
+        drop((driver, session_events, handle));
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), subscribing)
+                .await
+                .expect("the submission fails once the driver is gone")
+                .expect("the task did not panic"),
+            "a subscription that could not be submitted is an error"
+        );
+        assert!(
+            matches!(router_rx.try_recv(), Ok(RouterCommand::Unregister { .. })),
+            "the registration is rolled back, not left behind"
+        );
+    }
+
+    /// C-05. A blocked delivery that discovers a dropped receiver must not
+    /// swallow the unsubscription the drop itself asked for.
+    #[tokio::test]
+    async fn test_a_stream_dropped_while_the_router_is_blocked_still_unsubscribes() {
+        let mut harness = harness(8);
+        let id = SubscriptionId::new(a_key().await);
+        // One slot: the second event has nowhere to go, so the router blocks
+        // inside the send — the state in which the receiver then disappears.
+        let (events_tx, events_rx) = mpsc::channel(1);
+        assert!(
+            harness
+                .commands
+                .send(RouterCommand::Register {
+                    id,
+                    manager: Box::new(SubscriptionManager::new(
+                        crate::protocol::request::SubscriptionMode::Merge,
+                        false,
+                        vec!["item1".to_owned()],
+                        vec!["price".to_owned()],
+                    )),
+                    events: events_tx,
+                })
+                .is_ok()
+        );
+        let updates = Updates::new(id, events_rx, harness.commands.clone());
+
+        assert!(
+            harness
+                .session_tx
+                .send(data(
+                    id,
+                    Notification::SubscriptionOk {
+                        subscription_id: 1,
+                        item_count: 1,
+                        field_count: 1,
+                    }
+                ))
+                .await
+                .is_ok()
+        );
+        for value in ["1.0", "2.0"] {
+            assert!(
+                harness
+                    .session_tx
+                    .send(data(
+                        id,
+                        Notification::Update {
+                            subscription_id: 1,
+                            item_index: 1,
+                            raw_values: value.to_owned(),
+                        }
+                    ))
+                    .await
+                    .is_ok()
+            );
+        }
+        // The router is now blocked on a full stream. Dropping it is what the
+        // caller does when it walks away.
+        tokio::task::yield_now().await;
+        drop(updates);
+
+        match tokio::time::timeout(Duration::from_secs(5), harness.unsubscribed.recv()).await {
+            Ok(Some(key)) => assert_eq!(key.get(), id.get()),
+            other => panic!("the server was left subscribed: {other:?}"),
+        }
+        // Exactly one: cleanup is not duplicated either.
+        assert!(harness.unsubscribed.recv().now_or_never().is_none());
+    }
+
+    /// C-02. The router honours a stop while a caller's stream is full, so a
+    /// client being torn down is not held open by a consumer that walked away.
+    #[tokio::test]
+    async fn test_the_router_stops_while_a_callers_stream_is_full() {
+        let harness = harness(1);
+        let id = SubscriptionId::new(a_key().await);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        assert!(
+            harness
+                .commands
+                .send(RouterCommand::Register {
+                    id,
+                    manager: Box::new(SubscriptionManager::new(
+                        crate::protocol::request::SubscriptionMode::Merge,
+                        false,
+                        vec!["item1".to_owned()],
+                        vec!["price".to_owned()],
+                    )),
+                    events: events_tx,
+                })
+                .is_ok()
+        );
+        for _ in 0..4 {
+            let _ = harness
+                .session_tx
+                .send(data(
+                    id,
+                    Notification::Update {
+                        subscription_id: 1,
+                        item_index: 1,
+                        raw_values: "1.0".to_owned(),
+                    },
+                ))
+                .await;
+        }
+
+        assert!(harness.stop.send(true).is_ok());
+        // The router drops every sender as it stops, which is what ends the
+        // caller's streams.
+        match tokio::time::timeout(Duration::from_secs(5), harness.session_tx.closed()).await {
+            Ok(()) => {}
+            Err(_) => panic!("the router did not stop while a stream was full"),
         }
     }
 }

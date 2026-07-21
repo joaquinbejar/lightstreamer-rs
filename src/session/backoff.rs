@@ -70,6 +70,29 @@ impl Default for BackoffPolicy {
 /// It exists so that jitter costs no dependency. It is seeded from the
 /// standard library's randomized hasher state in production and from a fixed
 /// value in tests, which keeps every test in this crate deterministic.
+///
+/// # Provenance
+///
+/// This is written from the published academic description of the algorithm,
+/// not from any implementation:
+///
+/// - the xorshift recurrence and the shift triple `(12, 25, 27)` are
+///   Marsaglia's, *Xorshift RNGs*, Journal of Statistical Software 8(14), 2003,
+///   <https://doi.org/10.18637/jss.v008.i14>;
+/// - the `*` variant — multiplying the state by the constant
+///   `0x2545F4914F6CDD1D` on output — is Vigna's, *An experimental exploration
+///   of Marsaglia's xorshift generators, scrambled*, ACM Transactions on
+///   Mathematical Software 42(4), 2016, <https://doi.org/10.1145/2845077>, and
+///   its preprint <https://arxiv.org/abs/1402.6246>.
+///
+/// Both are papers describing a recurrence, published in venues that place no
+/// licence on reimplementing what they describe, and neither is a source this
+/// crate is forbidden to consult (`docs/adr/0001-mit-relicensing-clean-room.md`
+/// governs the *Lightstreamer* implementation, not general numerical
+/// literature). The five lines below are the recurrence transcribed from those
+/// descriptions; there is no third-party code in them, and the value they
+/// produce is used for nothing but choosing a delay inside an interval this
+/// module has already decided on.
 #[derive(Debug, Clone, Copy)]
 struct Jitter(u64);
 
@@ -95,7 +118,8 @@ impl Jitter {
 
     /// Draws the next 64-bit value.
     ///
-    /// The shifts and the multiply are the published xorshift64\* recurrence.
+    /// The shifts and the multiply are the published xorshift64\* recurrence;
+    /// see the provenance note on [`Jitter`] for where each is published.
     /// `wrapping_mul` is deliberate here and is not the "wrapping arithmetic"
     /// the coding rules forbid: this is a bit mixer whose modular arithmetic is
     /// the algorithm, not a numeric calculation whose overflow would be a bug.
@@ -171,10 +195,10 @@ impl Backoff {
     #[must_use]
     pub(crate) fn next_delay(&mut self) -> Option<Duration> {
         self.attempts = self.attempts.checked_add(1)?;
-        if let Some(max) = self.policy.max_attempts {
-            if self.attempts > max.get() {
-                return None;
-            }
+        if let Some(max) = self.policy.max_attempts
+            && self.attempts > max.get()
+        {
+            return None;
         }
         let delay = self.jitter.below(self.base);
         // Double the base for next time, stopping at the ceiling. `checked_mul`

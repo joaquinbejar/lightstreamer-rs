@@ -124,6 +124,21 @@ pub enum TransportError {
         /// What was wrong with it.
         reason: String,
     },
+
+    /// The peer sent more than this client is willing to buffer for it.
+    ///
+    /// Every dimension a server controls is capped, because a client that
+    /// allocates whatever it is told to is one malformed stream away from
+    /// taking its process with it. The connection is not usable afterwards:
+    /// what was buffered has been discarded, so the line stream has a hole in
+    /// it and the session must be recovered rather than resumed.
+    #[error("{reason}, exceeding this client's limit of {limit_bytes} bytes")]
+    Capacity {
+        /// The ceiling that was exceeded.
+        limit_bytes: usize,
+        /// What exceeded it. Never contains a credential.
+        reason: String,
+    },
 }
 
 /// Moves TLCP lines between this client and a server.
