@@ -171,6 +171,15 @@ impl SubscriptionKey {
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
+
+    /// A key with a chosen value, for [`crate::test_util`] to hand a consumer
+    /// a `SubscriptionId` its tests can name. No session ever allocates one
+    /// this way.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub(crate) const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 /// What the caller asked to subscribe to.

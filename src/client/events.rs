@@ -58,6 +58,13 @@ impl SubscriptionId {
     pub(crate) const fn key(self) -> SubscriptionKey {
         self.0
     }
+
+    /// An id with a chosen value, for [`crate::test_util`].
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub(crate) const fn from_raw(id: u64) -> Self {
+        Self(SubscriptionKey::from_raw(id))
+    }
 }
 
 impl std::fmt::Display for SubscriptionId {
@@ -163,6 +170,25 @@ pub struct Connected {
     pub request_limit_bytes: u64,
 }
 
+#[cfg(feature = "test-util")]
+impl Connected {
+    /// Assembles one field by field, for [`crate::test_util`].
+    #[must_use]
+    pub(crate) const fn from_parts(
+        session_id: String,
+        continuity: Continuity,
+        keepalive: Duration,
+        request_limit_bytes: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            continuity,
+            keepalive,
+            request_limit_bytes,
+        }
+    }
+}
+
 impl From<BoundInfo> for Connected {
     fn from(info: BoundInfo) -> Self {
         Self {
@@ -223,6 +249,21 @@ impl Recovery {
     pub const fn is_lossless(&self) -> bool {
         !matches!(self.outcome, RecoveryOutcome::Gap { .. })
     }
+
+    /// Assembles one field by field, for [`crate::test_util`].
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub(crate) const fn from_parts(
+        requested_from: u64,
+        resumed_at: u64,
+        outcome: RecoveryOutcome,
+    ) -> Self {
+        Self {
+            requested_from,
+            resumed_at,
+            outcome,
+        }
+    }
 }
 
 impl From<WireRecovery> for Recovery {
@@ -258,6 +299,23 @@ pub struct Resubscribed {
     /// for every field to tick again. That is a property of the subscription,
     /// not a failure.
     pub snapshot_restarting: bool,
+}
+
+#[cfg(feature = "test-util")]
+impl Resubscribed {
+    /// Assembles one field by field, for [`crate::test_util`].
+    #[must_use]
+    pub(crate) const fn from_parts(
+        id: SubscriptionId,
+        was_active: bool,
+        snapshot_restarting: bool,
+    ) -> Self {
+        Self {
+            id,
+            was_active,
+            snapshot_restarting,
+        }
+    }
 }
 
 impl From<ResubscribedEntry> for Resubscribed {

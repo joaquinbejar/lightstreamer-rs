@@ -28,6 +28,15 @@ pub struct CommandFields {
     pub command: usize,
 }
 
+#[cfg(feature = "test-util")]
+impl CommandFields {
+    /// Assembles one field by field, for [`crate::test_util`].
+    #[must_use]
+    pub(crate) const fn from_parts(key: usize, command: usize) -> Self {
+        Self { key, command }
+    }
+}
+
 impl From<WireCommandFields> for CommandFields {
     fn from(fields: WireCommandFields) -> Self {
         Self {

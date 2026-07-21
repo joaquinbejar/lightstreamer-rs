@@ -272,6 +272,21 @@ impl MessageOutcome {
     pub const fn is_delivered(&self) -> bool {
         matches!(self.result, MessageResult::Delivered { .. })
     }
+
+    /// Assembles one field by field, for [`crate::test_util`].
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub(crate) const fn from_parts(
+        sequence: Option<String>,
+        progressive: Option<u64>,
+        result: MessageResult,
+    ) -> Self {
+        Self {
+            sequence,
+            progressive,
+            result,
+        }
+    }
 }
 
 #[cfg(test)]

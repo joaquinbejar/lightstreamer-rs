@@ -54,11 +54,17 @@ The most visible differences:
   message sending, and an error taxonomy that preserves the server's codes as
   structured fields — including which of the protocol's two overlapping code
   catalogs a code belongs to.
-- The off-by-default `test-util` feature, exposing
-  `test_util::ItemUpdateBuilder`: it assembles an `ItemUpdate` with no session
-  behind it, so a crate depending on this one can unit-test its own field
-  parsing against captured payloads. It pulls in no dependency and adds
-  nothing else to the public surface; enable it under `[dev-dependencies]`.
+- The off-by-default `test-util` feature: a `test_util` module that builds the
+  event payloads a crate depending on this one receives, with no session
+  behind them, so its own parsing, reconnection and message-handling logic is
+  unit-testable. `ItemUpdateBuilder`, `ConnectedBuilder`,
+  `MessageOutcomeBuilder`, `ResubscribedBuilder`, and the `recovery`,
+  `subscription_id` and `command_fields` functions. It exists because those
+  payloads are otherwise unconstructible from outside — `ItemUpdate` is
+  assembled from private state and the others are `#[non_exhaustive]` — and
+  keeping them that way costs a consumer nothing once a test-only feature
+  supplies the builders. It pulls in no dependency and adds nothing to the
+  default public surface; enable it under `[dev-dependencies]`.
 
 ### Known gaps
 
