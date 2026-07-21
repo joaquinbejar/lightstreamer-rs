@@ -7,11 +7,18 @@
 //!
 //! # No dependency's error type is exposed
 //!
-//! Every error this crate produces is one of its own. The single exception is
-//! [`TransportError::Connect`], which boxes the underlying failure behind
-//! `dyn std::error::Error` — a box, not a named type, so no third-party crate's
-//! semantic version becomes part of this crate's. That was a deliberate
-//! decision recorded on the type itself.
+//! Every error this crate produces is one of its own, and every one of them is
+//! defined **here** — including [`TransportError`], which the private transport
+//! port produces but does not own. A type that is part of the semver promise
+//! belongs to the module that makes it; leaving it in the port would have made
+//! an adapter's internal decision a public commitment, and would have
+//! contradicted the promise that adding a transport is not a semver event
+//! (`docs/adr/0007-transport-port-shape.md`).
+//!
+//! The single boxed cause is [`TransportError::Connect`]'s, which hides the
+//! underlying failure behind `dyn std::error::Error` — a box, not a named type,
+//! so no third-party crate's semantic version becomes part of this crate's. It
+//! is for reading, not for downcasting; see the type.
 //!
 //! # No unreachable variant, either
 //!
@@ -47,10 +54,88 @@ use std::fmt;
 use crate::client::DisconnectReason;
 use crate::config::ConfigError;
 use crate::session::{ServerCause, SessionClosed};
-use crate::transport::TransportError;
 
 /// The result type returned throughout this crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Something went wrong moving bytes. Carries no protocol meaning.
+///
+/// **This type belongs to the public taxonomy, not to a transport.** It is
+/// defined here, beside [`Error`], because the distinction it draws is one a
+/// caller can act on — failing to *connect* and losing an *established* stream
+/// call for different responses — and because a type in this crate's semver
+/// promise must be owned by the module that makes that promise. The transports
+/// themselves stay private and merely produce these; adding one is not a semver
+/// event (`docs/adr/0007-transport-port-shape.md`), and it must not become one
+/// by an adapter widening this enum on its own account.
+///
+/// # On the cause of [`TransportError::Connect`]
+///
+/// It is a `Box<dyn Error>` rather than a named type so that no dependency's
+/// semantic version becomes part of this crate's. Read it, log it, print its
+/// chain — but do not downcast it: which concrete error arrives there depends
+/// on which transport ran and on the version of the crate underneath it, and
+/// neither is part of the promise made here. Everything worth branching on is
+/// the variant.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TransportError {
+    /// The connection could not be established.
+    #[error("cannot connect to {target}: {source}")]
+    Connect {
+        /// What was being connected to. Never carries userinfo: an address with
+        /// a `user:password@` prefix is refused at configuration time, and what
+        /// reaches here is redacted regardless.
+        target: String,
+        /// The underlying failure. Opaque by design — see the type docs.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The connection failed or was dropped while in use.
+    ///
+    /// This is transition T5 [`docs/spec/02-session-lifecycle.md` §2.2]: no
+    /// notification is received, the session is *not* closed, and the client
+    /// is still entitled to attempt recovery.
+    #[error("stream connection lost: {reason}")]
+    ConnectionLost {
+        /// What ended it.
+        reason: String,
+    },
+
+    /// A control request could not be delivered.
+    #[error("cannot send control request `{name}`: {reason}")]
+    Send {
+        /// The request name, as TLCP spells it — `control`, `msg`, `heartbeat`
+        /// [`docs/spec/03-requests.md` §1].
+        name: &'static str,
+        /// What went wrong.
+        reason: String,
+    },
+
+    /// The peer sent a frame that cannot be turned into TLCP lines — a binary
+    /// WebSocket message, or bytes that are not valid UTF-8.
+    #[error("malformed frame: {reason}")]
+    MalformedFrame {
+        /// What was wrong with it.
+        reason: String,
+    },
+
+    /// The peer sent more than this client is willing to buffer for it.
+    ///
+    /// Every dimension a server controls is capped, because a client that
+    /// allocates whatever it is told to is one malformed stream away from
+    /// taking its process with it. The connection is not usable afterwards:
+    /// what was buffered has been discarded, so the line stream has a hole in
+    /// it and the session must be recovered rather than resumed.
+    #[error("{reason}, exceeding this client's limit of {limit_bytes} bytes")]
+    Capacity {
+        /// The ceiling that was exceeded.
+        limit_bytes: usize,
+        /// What exceeded it. Never contains a credential.
+        reason: String,
+    },
+}
 
 /// A code and message exactly as the server supplied them.
 ///

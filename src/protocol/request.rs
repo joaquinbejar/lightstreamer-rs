@@ -1118,7 +1118,7 @@ impl TlcpRequest for CreateSession {
         // which is the correct behaviour when this client can decode none,
         // whereas the encoder must never emit an empty value that could be
         // read as a declaration.
-        let diffs = crate::subscription::update::supported_diffs();
+        let diffs = crate::protocol::diff::supported_diffs();
         if !diffs.is_empty() {
             // Verbatim: the value is a comma-separated list of single-letter
             // format tags [`docs/spec/04-notifications.md` §2.3], which
@@ -2078,7 +2078,7 @@ mod tests {
     /// not present in the spec's example and must be accounted for
     /// separately.
     fn supported_diffs_tail() -> String {
-        let diffs = crate::subscription::update::supported_diffs();
+        let diffs = crate::protocol::diff::supported_diffs();
         if diffs.is_empty() {
             String::new()
         } else {
@@ -2136,7 +2136,7 @@ mod tests {
         // When the registry is empty the parameter is omitted, never sent
         // empty.
         let body = CreateSession::default().http_body()?;
-        let diffs = crate::subscription::update::supported_diffs();
+        let diffs = crate::protocol::diff::supported_diffs();
         if diffs.is_empty() {
             assert!(!body.contains("LS_supported_diffs"));
         } else {

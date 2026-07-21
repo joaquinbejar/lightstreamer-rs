@@ -9,11 +9,10 @@
 use std::num::NonZeroU32;
 
 use crate::config::ConfigError;
-use crate::protocol::request::{
+use crate::session::{
     DecimalNumber, RequestedBufferSize, RequestedMaxFrequency, Snapshot as WireSnapshot,
-    SubscriptionMode as WireMode,
+    SubscriptionMode as WireMode, SubscriptionSpec,
 };
-use crate::session::SubscriptionSpec;
 
 /// How the server treats the items of a subscription
 /// [`docs/spec/03-requests.md` §6.1].
@@ -687,7 +686,11 @@ impl Subscription {
 
     /// Translates into what the session state machine subscribes with.
     pub(crate) fn into_spec(self) -> SubscriptionSpec {
+        let declared_items = self.declared_items();
+        let declared_fields = self.declared_fields();
         SubscriptionSpec {
+            declared_items,
+            declared_fields,
             group: self.items.text,
             schema: self.fields.text,
             mode: self.mode.to_wire(),

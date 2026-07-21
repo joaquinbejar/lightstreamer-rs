@@ -9,9 +9,11 @@ use tokio::sync::mpsc;
 use crate::client::events::SubscriptionId;
 use crate::client::router::RouterCommand;
 use crate::error::ServerError;
-use crate::protocol::response::{FilteringMode, MaxFrequency as WireFrequency};
+use crate::session::{
+    CommandFields as WireCommandFields, FilteringMode, MaxFrequency as WireFrequency,
+    SubscriptionEvent as Wire,
+};
 use crate::subscription::item_update::ItemUpdate;
-use crate::subscription::manager::{CommandFields as WireCommandFields, SubscriptionEvent as Wire};
 
 /// Where the key and the command sit in a `COMMAND`-mode field schema
 /// [`docs/spec/04-notifications.md` §3.2].

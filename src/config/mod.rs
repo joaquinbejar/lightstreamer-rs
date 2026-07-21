@@ -31,10 +31,6 @@ pub use address::ServerAddress;
 pub use credentials::{AdapterSet, Credentials};
 pub use options::{ConnectionOptions, RetryPolicy, Transport};
 
-use crate::protocol::request::ConnectionMode;
-use crate::session::backoff::BackoffPolicy;
-use crate::session::options::{Credentials as SessionCredentials, SessionOptions};
-
 /// The longest any timing in this crate may be set to: 365 days.
 ///
 /// A choice of this crate, and an upper bound rather than a recommendation —
@@ -348,47 +344,16 @@ impl ClientConfig {
         &self.options
     }
 
-    /// Translates into what the session state machine expects.
+    /// Takes the configuration apart for the layer that will run it.
     ///
-    /// Internal: [`SessionOptions`] is session machinery and is deliberately
-    /// not part of the public surface.
-    pub(crate) fn into_session_options(self) -> SessionOptions {
-        let (user, password) = self.credentials.into_parts();
-        let adapter_set = self.adapter_set.map(|set| set.as_str().to_owned());
-        let retry = self.options.retry();
-
-        SessionOptions {
-            credentials: SessionCredentials {
-                user,
-                password,
-                adapter_set,
-            },
-            connection: ConnectionMode::Streaming {
-                inactivity_millis: self
-                    .options
-                    .inactivity_commitment()
-                    .map(as_millis_saturating),
-                keepalive_millis: self.options.keepalive_hint().map(as_millis_saturating),
-                // The server's default is `true`, so the parameter is sent
-                // only to switch the notifications off
-                // [`docs/spec/03-requests.md` §2.1].
-                send_sync: if self.options.send_sync() {
-                    None
-                } else {
-                    Some(false)
-                },
-            },
-            content_length: self.options.content_length().map(std::num::NonZeroU64::get),
-            keepalive_slack: self.options.keepalive_slack(),
-            open_timeout: self.options.open_timeout(),
-            backoff: BackoffPolicy {
-                initial: retry.initial_delay(),
-                max: retry.max_delay(),
-                max_attempts: retry.max_attempts(),
-            },
-            event_capacity: self.options.session_event_capacity(),
-            command_capacity: SessionOptions::default().command_capacity,
-        }
+    /// This module is a **leaf**: it validates what the caller wrote and knows
+    /// nothing about the state machine, the wire, or the transports — it cannot
+    /// even name them. The translation from this vocabulary into theirs
+    /// therefore lives on the other side of the boundary, in
+    /// `SessionOptions::from_client_config`, and this is the one accessor it
+    /// needs.
+    pub(crate) fn into_parts(self) -> (Option<AdapterSet>, Credentials, ConnectionOptions) {
+        (self.adapter_set, self.credentials, self.options)
     }
 }
 
@@ -549,18 +514,8 @@ fn require_millis(field: &'static str, value: Duration) -> Result<(), ConfigErro
         .map_err(|_| ConfigError::DurationTooLarge { field })
 }
 
-/// Converts to whole milliseconds, having already checked the value fits.
-///
-/// The saturation is unreachable for a value that passed
-/// [`require_millis`]; saturating rather than wrapping keeps a hypothetical
-/// bug from turning a huge interval into a tiny one.
-fn as_millis_saturating(value: Duration) -> u64 {
-    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
 
     use super::*;
 
@@ -812,64 +767,5 @@ mod tests {
             .with_options(ConnectionOptions::default().with_retry(retry))
             .build();
         assert!(built.is_ok());
-    }
-
-    #[test]
-    fn test_session_options_carry_the_configured_values() {
-        let adapters = match AdapterSet::try_new("DEMO") {
-            Ok(set) => set,
-            Err(error) => unreachable!("the fixture adapter set is valid: {error}"),
-        };
-        let retry = RetryPolicy::default()
-            .with_initial_delay(Duration::from_millis(100))
-            .with_max_delay(Duration::from_secs(2))
-            .with_max_attempts(NonZeroU32::new(3));
-        let config = ClientConfig::builder(address())
-            .with_adapter_set(adapters)
-            .with_credentials(Credentials::new("alice", "hunter2"))
-            .with_options(
-                ConnectionOptions::default()
-                    .with_inactivity_commitment(Some(Duration::from_secs(20)))
-                    .with_keepalive_hint(Some(Duration::from_secs(5)))
-                    .with_send_sync(false)
-                    .with_retry(retry),
-            )
-            .build();
-
-        let config = match config {
-            Ok(config) => config,
-            Err(error) => panic!("rejected: {error}"),
-        };
-        let session = config.into_session_options();
-
-        assert_eq!(session.credentials.user.as_deref(), Some("alice"));
-        assert_eq!(session.credentials.adapter_set.as_deref(), Some("DEMO"));
-        assert_eq!(session.backoff.initial, Duration::from_millis(100));
-        assert_eq!(session.backoff.max, Duration::from_secs(2));
-        assert_eq!(session.backoff.max_attempts.map(NonZeroU32::get), Some(3));
-        match session.connection {
-            ConnectionMode::Streaming {
-                inactivity_millis,
-                keepalive_millis,
-                send_sync,
-            } => {
-                assert_eq!(inactivity_millis, Some(20_000));
-                assert_eq!(keepalive_millis, Some(5_000));
-                assert_eq!(send_sync, Some(false));
-            }
-            ConnectionMode::Polling { .. } => panic!("expected a streaming connection"),
-        }
-    }
-
-    #[test]
-    fn test_session_options_omit_send_sync_when_it_is_enabled() {
-        let config = match ClientConfig::builder(address()).build() {
-            Ok(config) => config,
-            Err(error) => panic!("rejected: {error}"),
-        };
-        match config.into_session_options().connection {
-            ConnectionMode::Streaming { send_sync, .. } => assert_eq!(send_sync, None),
-            ConnectionMode::Polling { .. } => panic!("expected a streaming connection"),
-        }
     }
 }

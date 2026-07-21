@@ -209,5 +209,4 @@ pub use client::{
 };
 
 // --- Errors -----------------------------------------------------------------
-pub use error::{Error, Result, ServerError};
-pub use transport::TransportError;
+pub use error::{Error, Result, ServerError, TransportError};

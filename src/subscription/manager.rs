@@ -26,7 +26,6 @@
 //! the manager that owns it is the session layer's responsibility. A manager
 //! interprets whatever it is given.
 //!
-//! [`SubscriptionKey`]: crate::session::SubscriptionKey
 //! [`ItemState`]: crate::subscription::update::ItemState
 
 use std::sync::Arc;

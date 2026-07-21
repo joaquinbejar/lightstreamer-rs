@@ -79,6 +79,43 @@ The most visible differences:
   supplies the builders. It pulls in no dependency and adds nothing to the
   default public surface; enable it under `[dev-dependencies]`.
 
+### Internal
+
+None of the following changes the public API. They are recorded because the
+crate ships its own design documents, and a reader comparing them with the
+source should find the two agreeing.
+
+- **The module boundaries are enforced rather than documented.**
+  `tests/architecture.rs` reads `src/` and fails when a layer names a module
+  its layer may not — the graph being `client → session → {protocol, transport
+  port}` with `error` and `config` as leaves. It closes the four layering
+  findings of the v1 review, each of which had compiled cleanly:
+  - the `^T` and `^P` diff decoders, and the registry the `LS_supported_diffs`
+    advertisement is derived from, moved from `subscription` into
+    `protocol::diff`. Both halves of the ADR-0004 invariant now live on the
+    pure side, and the protocol layer once again depends on nothing else in the
+    crate — which is what makes every wire behaviour testable from spec
+    fixtures and the clean-room citation trail checkable;
+  - the transport is chosen and built by a session-layer composition root over
+    the closed `AnyTransport` enum ADR-0007 §3 called for, so the public façade
+    no longer names a concrete adapter, and the session owns each
+    subscription's item state and hands the façade a typed subscription event
+    instead of a parsed notification;
+  - `TransportError` is defined in `src/error.rs` beside the rest of the public
+    taxonomy instead of in the private transport port. A type inside the semver
+    promise belongs to the module that makes the promise; leaving it in the
+    port contradicted ADR-0007's own statement that adding a transport is not a
+    semver event. The type, its variants and its path from the crate root are
+    unchanged;
+  - the public configuration is a leaf again: it no longer names the protocol
+    or session layers, and `SessionOptions::from_client_config` is the single
+    point at which the caller's vocabulary becomes the state machine's.
+- A subscription's item state is now rebuilt whenever a **new** session
+  replaces the old one, rather than carried across. The server restarts its
+  flow on a new session, so every field baseline held for the old one is stale;
+  applying an unchanged token or a diff across that boundary would have
+  produced a plausible but wrong value.
+
 ### Requirements
 
 - **MSRV is Rust 1.88**, declared as `rust-version` in `Cargo.toml` and

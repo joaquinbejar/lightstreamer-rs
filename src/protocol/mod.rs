@@ -10,6 +10,7 @@
 //! normative parsing algorithm), `docs/spec/03-requests.md` (request
 //! encoding), `docs/spec/04-notifications.md` (notification parsing).
 
+pub(crate) mod diff;
 pub(crate) mod escaping;
 pub(crate) mod request;
 pub(crate) mod response;
@@ -91,4 +92,18 @@ pub enum ProtocolError {
         /// What was wrong with the value.
         reason: String,
     },
+}
+
+/// Builds the error every field-value failure reports.
+///
+/// A malformed value list is never a panic and never a silently dropped field
+/// [`docs/spec/04-notifications.md` §2.3]. Shared by the diff decoders here and
+/// by the value-list decoder above them, so both spell the same failure the
+/// same way.
+#[cold]
+#[inline(never)]
+pub(crate) fn field_value_error(reason: impl Into<String>) -> ProtocolError {
+    ProtocolError::FieldValue {
+        reason: reason.into(),
+    }
 }

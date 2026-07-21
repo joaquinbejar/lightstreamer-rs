@@ -61,11 +61,9 @@ pub use updates::{CommandFields, Filtering, SubscriptionEvent, UpdateFrequency, 
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::{ClientConfig, Transport};
+use crate::config::ClientConfig;
 use crate::error::{Error, Result};
 use crate::session::{self, SessionHandle};
-use crate::subscription::manager::SubscriptionManager;
-use crate::transport::ws::WsTransport;
 
 use self::events::SessionEvents as SessionEventStream;
 use self::router::{Router, RouterCommand};
@@ -264,11 +262,13 @@ impl Client {
             shutdown_timeout: config.options().open_timeout(),
         };
 
-        let transport = match config.transport() {
-            Transport::WebSocket => WsTransport::try_new(config.address().as_str())?,
-        };
-
-        Self::assemble(transport, config.into_session_options(), capacities).await
+        // Which transport carries the session, and how it is built, is the
+        // session layer's composition root — not this one. The façade names no
+        // adapter, so a second transport is added below without touching the
+        // semver-governed surface
+        // [`docs/adr/0007-transport-port-shape.md` §3].
+        let parts = session::connect_configured(config)?;
+        Self::assemble(parts, capacities).await
     }
 
     /// Wires the driver, the router and the unsubscriber together and waits
@@ -276,14 +276,19 @@ impl Client {
     ///
     /// Generic over the transport so that the whole client — not merely the
     /// session layer — can be exercised over a scripted one, with no socket and
-    /// no real timer [`docs/adr/0007-transport-port-shape.md`].
+    /// no real timer [`docs/adr/0007-transport-port-shape.md`]. It takes the
+    /// session already composed, because choosing and building a transport is
+    /// not this layer's business.
     async fn assemble<T>(
-        transport: T,
-        options: crate::session::options::SessionOptions,
+        parts: (
+            session::SessionDriver<T>,
+            SessionHandle,
+            mpsc::Receiver<session::SessionEvent>,
+        ),
         capacities: Capacities,
     ) -> Result<(Self, SessionEvents)>
     where
-        T: crate::transport::Transport + Send + 'static,
+        T: session::Transport + Send + 'static,
     {
         let Capacities {
             update: update_capacity,
@@ -291,10 +296,7 @@ impl Client {
             shutdown_timeout,
         } = capacities;
         let id = ClientId::allocate()?;
-        let (driver, handle, session_events) =
-            session::connect(transport, options).map_err(|error| Error::Internal {
-                reason: error.to_string(),
-            })?;
+        let (driver, handle, session_events) = parts;
 
         let (router_tx, router_rx) = mpsc::unbounded_channel();
         let (unsubscribe_tx, unsubscribe_rx) = mpsc::unbounded_channel();
@@ -449,13 +451,6 @@ impl Client {
         // than a `Deferred` on a stream that never activates.
         subscription.validate()?;
 
-        let manager = SubscriptionManager::new(
-            subscription.mode().to_wire(),
-            subscription.snapshot().is_requested(),
-            subscription.declared_items(),
-            subscription.declared_fields(),
-        );
-
         let (events_tx, events_rx) = mpsc::channel(self.update_capacity.get());
         // The key is allocated, and everything it names registered, *before*
         // the request that could produce a notification for it is queued. The
@@ -478,7 +473,6 @@ impl Client {
         self.router
             .send(RouterCommand::Register {
                 id,
-                manager: Box::new(manager),
                 events: events_tx,
             })
             .map_err(|_| Error::Disconnected)?;
@@ -713,11 +707,10 @@ mod tests {
     use super::*;
     use crate::client::events::Connected;
     use crate::client::router::Router;
-    use crate::protocol::response::Notification;
     use crate::session::{
         BindKind, BoundInfo, SessionClosed as WireClosed, SessionEvent as WireEvent, SessionId,
+        SubscriptionError, SubscriptionEvent as WireSubscriptionEvent,
     };
-    use crate::subscription::manager::SubscriptionManager;
     use std::time::Duration;
 
     /// A fresh client identity, as [`Client::assemble`] would allocate one.
@@ -916,12 +909,6 @@ mod tests {
                 .commands
                 .send(RouterCommand::Register {
                     id,
-                    manager: Box::new(SubscriptionManager::new(
-                        crate::protocol::request::SubscriptionMode::Merge,
-                        false,
-                        vec!["item1".to_owned()],
-                        vec!["price".to_owned()],
-                    )),
                     events: events_tx,
                 })
                 .is_ok()
@@ -948,12 +935,6 @@ mod tests {
                 .commands
                 .send(RouterCommand::Register {
                     id,
-                    manager: Box::new(SubscriptionManager::new(
-                        crate::protocol::request::SubscriptionMode::Merge,
-                        false,
-                        vec!["item1".to_owned()],
-                        vec!["price".to_owned()],
-                    )),
                     events: events_tx,
                 })
                 .is_ok()
@@ -964,25 +945,24 @@ mod tests {
                 .session_tx
                 .send(data(
                     id,
-                    Notification::SubscriptionOk {
-                        subscription_id: 1,
+                    WireSubscriptionEvent::Activated {
                         item_count: 1,
                         field_count: 1,
+                        command_fields: None,
                     }
                 ))
                 .await
                 .is_ok()
         );
-        for value in ["1.0", "2.0", "3.0"] {
+        for dropped_count in [1, 2, 3] {
             assert!(
                 harness
                     .session_tx
                     .send(data(
                         id,
-                        Notification::Update {
-                            subscription_id: 1,
+                        WireSubscriptionEvent::Overflow {
                             item_index: 1,
-                            raw_values: value.to_owned(),
+                            dropped_count,
                         }
                     ))
                     .await
@@ -990,20 +970,17 @@ mod tests {
             );
         }
 
-        // Nothing was dropped: activation, then all three updates, in order.
+        // Nothing was dropped: activation, then all three events, in order.
         assert!(matches!(
             events_rx.recv().await,
             Some(SubscriptionEvent::Activated { field_count: 1, .. })
         ));
-        for expected in ["1.0", "2.0", "3.0"] {
+        for expected in [1, 2, 3] {
             match events_rx.recv().await {
-                Some(SubscriptionEvent::Update(update)) => {
-                    assert_eq!(
-                        update.field(1).and_then(|value| value.text()),
-                        Some(expected)
-                    );
+                Some(SubscriptionEvent::Overflow { dropped_count, .. }) => {
+                    assert_eq!(dropped_count, expected);
                 }
-                other => panic!("expected an update carrying {expected}, got {other:?}"),
+                other => panic!("expected an overflow of {expected}, got {other:?}"),
             }
         }
     }
@@ -1018,29 +995,19 @@ mod tests {
                 .commands
                 .send(RouterCommand::Register {
                     id,
-                    manager: Box::new(SubscriptionManager::new(
-                        crate::protocol::request::SubscriptionMode::Merge,
-                        false,
-                        Vec::new(),
-                        Vec::new(),
-                    )),
                     events: events_tx,
                 })
                 .is_ok()
         );
 
-        // An update before the subscription was ever activated: the manager
-        // has no schema to decode it against.
+        // An update before the subscription was ever activated: the session
+        // had no schema to decode it against, and says so in a typed error.
         assert!(
             harness
                 .session_tx
-                .send(data(
+                .send(undecodable(
                     id,
-                    Notification::Update {
-                        subscription_id: 1,
-                        item_index: 1,
-                        raw_values: "x".to_owned(),
-                    }
+                    SubscriptionError::NotActivated { tag: "U" }
                 ))
                 .await
                 .is_ok()
@@ -1129,12 +1096,6 @@ mod tests {
                 .commands
                 .send(RouterCommand::Register {
                     id,
-                    manager: Box::new(SubscriptionManager::new(
-                        crate::protocol::request::SubscriptionMode::Merge,
-                        false,
-                        vec!["item1".to_owned()],
-                        vec!["price".to_owned()],
-                    )),
                     events: events_tx,
                 })
                 .is_ok()
@@ -1213,10 +1174,10 @@ mod tests {
                 .session_tx
                 .send(data(
                     id,
-                    Notification::SubscriptionOk {
-                        subscription_id: 2,
+                    WireSubscriptionEvent::Activated {
                         item_count: 1,
                         field_count: 1,
+                        command_fields: None,
                     }
                 ))
                 .await
@@ -1254,10 +1215,10 @@ mod tests {
                 .session_tx
                 .send(data(
                     id,
-                    Notification::SubscriptionOk {
-                        subscription_id: 1,
+                    WireSubscriptionEvent::Activated {
                         item_count: 1,
                         field_count: 1,
+                        command_fields: None,
                     }
                 ))
                 .await
@@ -1304,10 +1265,10 @@ mod tests {
                 .session_tx
                 .send(data(
                     id,
-                    Notification::SubscriptionOk {
-                        subscription_id: 1,
+                    WireSubscriptionEvent::Activated {
                         item_count: 1,
                         field_count: 1,
+                        command_fields: None,
                     }
                 ))
                 .await
@@ -1327,7 +1288,7 @@ mod tests {
                 .session_tx
                 .send(WireEvent::Unparsed {
                     line: "FUTURE,1,2".to_owned(),
-                    error: crate::protocol::ProtocolError::UnknownTag {
+                    error: crate::session::ProtocolError::UnknownTag {
                         tag: "FUTURE".to_owned(),
                         line: "FUTURE,1,2".to_owned(),
                     },
@@ -1342,11 +1303,24 @@ mod tests {
         }
     }
 
-    fn data(id: SubscriptionId, notification: Notification) -> WireEvent {
-        WireEvent::Data {
+    /// One subscription event as the session layer would hand it up.
+    ///
+    /// The session interprets the wire line and routes the *meaning*; these
+    /// tests are about the fan-out, so they start where the router does.
+    fn data(id: SubscriptionId, event: WireSubscriptionEvent) -> WireEvent {
+        WireEvent::Subscription {
             progressive: 1,
-            subscription: Some(id.key()),
-            notification,
+            key: id.key(),
+            outcome: Box::new(Ok(event)),
+        }
+    }
+
+    /// A line the session could not reconcile with this subscription's state.
+    fn undecodable(id: SubscriptionId, error: SubscriptionError) -> WireEvent {
+        WireEvent::Subscription {
+            progressive: 1,
+            key: id.key(),
+            outcome: Box::new(Err(error)),
         }
     }
 
@@ -1359,9 +1333,9 @@ mod tests {
     #[derive(Debug)]
     struct NullTransport;
 
-    impl crate::transport::Transport for NullTransport {
-        fn properties(&self) -> crate::transport::TransportProperties {
-            crate::transport::TransportProperties {
+    impl session::Transport for NullTransport {
+        fn properties(&self) -> session::TransportProperties {
+            session::TransportProperties {
                 control_shares_stream: true,
                 ends_on_content_length: false,
                 is_polling: false,
@@ -1372,25 +1346,25 @@ mod tests {
 
         async fn open_stream(
             &mut self,
-            _request: crate::transport::StreamOpen,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+            _request: session::StreamOpen,
+        ) -> std::result::Result<(), crate::error::TransportError> {
             Ok(())
         }
 
         async fn next_line(
             &mut self,
-        ) -> Option<std::result::Result<String, crate::transport::TransportError>> {
+        ) -> Option<std::result::Result<String, crate::error::TransportError>> {
             std::future::pending().await
         }
 
         async fn send_control(
             &mut self,
-            _request: crate::transport::EncodedRequest,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+            _request: session::EncodedRequest,
+        ) -> std::result::Result<(), crate::error::TransportError> {
             Ok(())
         }
 
-        async fn close(&mut self) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn close(&mut self) -> std::result::Result<(), crate::error::TransportError> {
             Ok(())
         }
     }
@@ -1406,7 +1380,7 @@ mod tests {
             let spec = crate::session::SubscriptionSpec::new(
                 format!("item{index}"),
                 "price",
-                crate::protocol::request::SubscriptionMode::Merge,
+                session::SubscriptionMode::Merge,
             );
             match handle.subscribe(spec).await {
                 Ok(key) => keys.push(key),
@@ -1475,9 +1449,9 @@ mod tests {
         }
     }
 
-    impl crate::transport::Transport for ScriptedTransport {
-        fn properties(&self) -> crate::transport::TransportProperties {
-            crate::transport::TransportProperties {
+    impl session::Transport for ScriptedTransport {
+        fn properties(&self) -> session::TransportProperties {
+            session::TransportProperties {
                 control_shares_stream: true,
                 ends_on_content_length: false,
                 is_polling: false,
@@ -1488,14 +1462,14 @@ mod tests {
 
         async fn open_stream(
             &mut self,
-            _request: crate::transport::StreamOpen,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+            _request: session::StreamOpen,
+        ) -> std::result::Result<(), crate::error::TransportError> {
             match self.scripts.pop_front() {
                 Some(Some(script)) => {
                     self.current = script.into();
                     Ok(())
                 }
-                Some(None) => Err(crate::transport::TransportError::ConnectionLost {
+                Some(None) => Err(crate::error::TransportError::ConnectionLost {
                     reason: "scripted failure".to_owned(),
                 }),
                 None => {
@@ -1507,7 +1481,7 @@ mod tests {
 
         async fn next_line(
             &mut self,
-        ) -> Option<std::result::Result<String, crate::transport::TransportError>> {
+        ) -> Option<std::result::Result<String, crate::error::TransportError>> {
             loop {
                 match self.current.front().copied() {
                     Some(Say::Line(line)) => {
@@ -1529,15 +1503,15 @@ mod tests {
 
         async fn send_control(
             &mut self,
-            request: crate::transport::EncodedRequest,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+            request: session::EncodedRequest,
+        ) -> std::result::Result<(), crate::error::TransportError> {
             if let Ok(mut log) = self.log.lock() {
                 log.controls.push(request.parameters);
             }
             Ok(())
         }
 
-        async fn close(&mut self) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn close(&mut self) -> std::result::Result<(), crate::error::TransportError> {
             if let Ok(mut log) = self.log.lock() {
                 log.closes = log.closes.saturating_add(1);
             }
@@ -1583,7 +1557,10 @@ mod tests {
 
         let (client, mut events) = tokio::time::timeout(
             Duration::from_secs(30),
-            Client::assemble(transport, session_options(), capacities(1)),
+            Client::assemble(
+                session::connect(transport, session_options()).expect("a valid session"),
+                capacities(1),
+            ),
         )
         .await
         .expect("connect must not wait on a stream the caller cannot hold yet")
@@ -1616,7 +1593,10 @@ mod tests {
 
         let (client, events) = tokio::time::timeout(
             Duration::from_secs(30),
-            Client::assemble(transport, session_options(), capacities(16)),
+            Client::assemble(
+                session::connect(transport, session_options()).expect("a valid session"),
+                capacities(16),
+            ),
         )
         .await
         .expect("connect must not wait on a stream the caller cannot hold yet")
@@ -1644,7 +1624,10 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(30),
-            Client::assemble(transport, session_options(), capacities(1)),
+            Client::assemble(
+                session::connect(transport, session_options()).expect("a valid session"),
+                capacities(1),
+            ),
         )
         .await
         .expect("connect must not hang once the retries are spent");
@@ -1680,9 +1663,12 @@ mod tests {
         ])]);
         let log = transport.log();
 
-        let (client, mut events) = Client::assemble(transport, session_options(), capacities(16))
-            .await
-            .expect("the session bound");
+        let (client, mut events) = Client::assemble(
+            session::connect(transport, session_options()).expect("a valid session"),
+            capacities(16),
+        )
+        .await
+        .expect("the session bound");
 
         tokio::time::timeout(Duration::from_secs(10), client.disconnect())
             .await
@@ -1725,9 +1711,12 @@ mod tests {
         ])]);
         let log = transport.log();
 
-        let (client, events) = Client::assemble(transport, session_options(), capacities(1))
-            .await
-            .expect("the session bound");
+        let (client, events) = Client::assemble(
+            session::connect(transport, session_options()).expect("a valid session"),
+            capacities(1),
+        )
+        .await
+        .expect("the session bound");
         // Let the router reach the wedge before asking it to stop.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -1830,9 +1819,12 @@ mod tests {
                 Say::AwaitControls(usize::MAX),
             ])]);
             let log = transport.log();
-            let (client, events) = Client::assemble(transport, session_options(), capacities(16))
-                .await
-                .expect("the session bound");
+            let (client, events) = Client::assemble(
+                session::connect(transport, session_options()).expect("a valid session"),
+                capacities(16),
+            )
+            .await
+            .expect("the session bound");
             drop(events);
             let updates = client
                 .subscribe(Subscription::new(
@@ -1908,12 +1900,6 @@ mod tests {
                 .commands
                 .send(RouterCommand::Register {
                     id,
-                    manager: Box::new(SubscriptionManager::new(
-                        crate::protocol::request::SubscriptionMode::Merge,
-                        false,
-                        vec!["item1".to_owned()],
-                        vec!["price".to_owned()],
-                    )),
                     events: events_tx,
                 })
                 .is_ok()
@@ -1925,25 +1911,24 @@ mod tests {
                 .session_tx
                 .send(data(
                     id,
-                    Notification::SubscriptionOk {
-                        subscription_id: 1,
+                    WireSubscriptionEvent::Activated {
                         item_count: 1,
                         field_count: 1,
+                        command_fields: None,
                     }
                 ))
                 .await
                 .is_ok()
         );
-        for value in ["1.0", "2.0"] {
+        for dropped_count in [1, 2] {
             assert!(
                 harness
                     .session_tx
                     .send(data(
                         id,
-                        Notification::Update {
-                            subscription_id: 1,
+                        WireSubscriptionEvent::Overflow {
                             item_index: 1,
-                            raw_values: value.to_owned(),
+                            dropped_count,
                         }
                     ))
                     .await
@@ -1975,12 +1960,6 @@ mod tests {
                 .commands
                 .send(RouterCommand::Register {
                     id,
-                    manager: Box::new(SubscriptionManager::new(
-                        crate::protocol::request::SubscriptionMode::Merge,
-                        false,
-                        vec!["item1".to_owned()],
-                        vec!["price".to_owned()],
-                    )),
                     events: events_tx,
                 })
                 .is_ok()
@@ -1990,10 +1969,9 @@ mod tests {
                 .session_tx
                 .send(data(
                     id,
-                    Notification::Update {
-                        subscription_id: 1,
+                    WireSubscriptionEvent::Overflow {
                         item_index: 1,
-                        raw_values: "1.0".to_owned(),
+                        dropped_count: 1,
                     },
                 ))
                 .await;

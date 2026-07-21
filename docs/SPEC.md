@@ -48,19 +48,25 @@ Total: **4784 lines**, **91 flagged ambiguities**.
 Each row is the contract for one module: the module implements that spec
 material, cites it, and is tested against the fixtures quoted there.
 
+The dependency graph these modules sit in — `client → session → {protocol,
+transport port}`, with `error` and `config` as leaves — is enforced by
+`tests/architecture.rs`, not merely documented.
+
 | Spec material | Module | Owner agent |
 |---|---|---|
 | §01 ch.6 request syntax, §03 all requests | `src/protocol/request.rs` | `protocol-expert` |
 | §01 ch.7 line format + parsing algorithm, §04 all notifications | `src/protocol/response.rs` | `protocol-expert` |
 | §01 §7.2 percent-encoding, §04 §2 second-level value syntax (`#`/`$`, unchanged-field runs) | `src/protocol/escaping.rs` | `protocol-expert` |
-| §04 §2 update decoding and diff application | `src/subscription/update.rs` | `protocol-expert` |
+| §04 §2.2 and Appendix D diff algorithms, and the `LS_supported_diffs` registry they are derived from | `src/protocol/diff.rs` | `protocol-expert` |
+| §04 §2 update decoding: which field a token addresses and whether it may be a diff base | `src/subscription/update.rs` | `protocol-expert` |
 | §04 §2 COMMAND key/command semantics, snapshot classification | `src/subscription/item_update.rs` | `protocol-expert` |
 | §01 ch.6 transport framing (WS subprotocol; HTTP paths/methods) | `src/transport/ws.rs`; `src/transport/http.rs` *(not written)* | `transport-expert` |
 | §02 the state machine, rebind/loop, recovery, definitive loss, long polling | `src/session/mod.rs` | `transport-expert` |
 | §02 ch.8 liveness — keepalive, `PROBE`, reverse heartbeat, content-length limits | `src/session/liveness.rs` | `transport-expert` |
 | §03 control operations, subscription id allocation, resubscribe-on-recovery | `src/subscription/manager.rs` | `transport-expert` |
 | §03 session-creation parameters as user-facing options | `src/config/*` | `api-expert` |
-| §05 the code catalog and recoverability classification | `src/error.rs` | `api-expert` |
+| §03 session-creation parameters translated into what the state machine runs | `src/session/options.rs` | `transport-expert` |
+| §05 the code catalog and recoverability classification, and the whole public error taxonomy including `TransportError` | `src/error.rs` | `api-expert` |
 | §06 MPN | *(none — out of scope for v1)* | — |
 
 ## What the specification does not decide — now recorded as ADRs

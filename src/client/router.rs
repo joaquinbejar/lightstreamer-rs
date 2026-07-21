@@ -69,10 +69,9 @@ use crate::client::message::MessageOutcome;
 use crate::client::updates::SubscriptionEvent;
 use crate::error::{Error, ServerError};
 use crate::session::{
-    ControlOutcome, ControlTarget, SessionEvent as WireEvent, SessionHandle, SubscriptionKey,
-    SubscriptionOperation,
+    ControlOutcome, ControlTarget, SessionEvent as WireEvent, SessionHandle, SubscriptionError,
+    SubscriptionEvent as WireSubscriptionEvent, SubscriptionKey, SubscriptionOperation,
 };
-use crate::subscription::manager::SubscriptionManager;
 
 /// What the client asks the router to do.
 #[derive(Debug)]
@@ -85,8 +84,6 @@ pub(crate) enum RouterCommand {
     Register {
         /// Which subscription.
         id: SubscriptionId,
-        /// Its item state and its interpretation of every notification.
-        manager: Box<SubscriptionManager>,
         /// Where its events go.
         events: mpsc::Sender<SubscriptionEvent>,
     },
@@ -128,10 +125,13 @@ fn control_failure(outcome: ControlOutcome) -> Option<SessionEvent> {
     }
 }
 
-/// One registered subscription.
+/// One registered subscription: where its events go.
+///
+/// Deliberately nothing else. The item state that interprets a notification
+/// lives with the session that routes it; this layer only fans typed events out
+/// to the caller's streams.
 #[derive(Debug)]
 struct Registered {
-    manager: SubscriptionManager,
     events: mpsc::Sender<SubscriptionEvent>,
 }
 
@@ -230,18 +230,8 @@ impl Router {
 
     fn on_command(&mut self, command: RouterCommand) {
         match command {
-            RouterCommand::Register {
-                id,
-                manager,
-                events,
-            } => {
-                self.subscriptions.insert(
-                    id.key(),
-                    Registered {
-                        manager: *manager,
-                        events,
-                    },
-                );
+            RouterCommand::Register { id, events } => {
+                self.subscriptions.insert(id.key(), Registered { events });
             }
 
             RouterCommand::Unregister { id } => {
@@ -314,19 +304,8 @@ impl Router {
                 false
             }
 
-            WireEvent::Data {
-                subscription,
-                notification,
-                ..
-            } => {
-                match subscription {
-                    Some(key) => self.route(key, notification).await,
-                    // A data notification naming no subscription. Message
-                    // outcomes arrive as `WireEvent::Message` instead, so
-                    // there is nothing left here to attribute; it is logged
-                    // rather than invented into an event.
-                    None => tracing::debug!(?notification, "unattributed data notification"),
-                }
+            WireEvent::Subscription { key, outcome, .. } => {
+                self.route(key, *outcome).await;
                 false
             }
 
@@ -337,10 +316,9 @@ impl Router {
                 false
             }
 
-            WireEvent::ServerInfo(notification) => {
-                if let Some(info) = ServerInfo::from_notification(notification) {
-                    self.emit(SessionEvent::ServerInfo(info)).await;
-                }
+            WireEvent::ServerInfo(announcement) => {
+                self.emit(SessionEvent::ServerInfo(ServerInfo::from(announcement)))
+                    .await;
                 false
             }
 
@@ -467,13 +445,13 @@ impl Router {
         deliver(&sender, event, &mut self.stop).await;
     }
 
-    /// Sends one notification to the subscription it belongs to.
+    /// Sends one subscription event to the stream it belongs to.
     async fn route(
         &mut self,
         key: SubscriptionKey,
-        notification: crate::protocol::response::Notification,
+        outcome: Result<WireSubscriptionEvent, SubscriptionError>,
     ) {
-        let Some(entry) = self.subscriptions.get_mut(&key) else {
+        if !self.subscriptions.contains_key(&key) {
             // Registration precedes the request that could produce this, so an
             // unknown key means the stream is already gone: either it ended on
             // a terminal event or the caller dropped it. Nothing to deliver it
@@ -483,11 +461,10 @@ impl Router {
                 "a notification arrived for a subscription with no stream"
             );
             return;
-        };
+        }
 
-        let event = match entry.manager.handle(&notification) {
-            Ok(Some(event)) => SubscriptionEvent::from_wire(event),
-            Ok(None) => return,
+        let event = match outcome {
+            Ok(event) => SubscriptionEvent::from_wire(event),
             Err(error) => {
                 tracing::warn!(key = key.get(), %error, "a notification did not decode");
                 SubscriptionEvent::Undecodable {
@@ -496,6 +473,9 @@ impl Router {
             }
         };
         let terminal = event.is_terminal();
+        let Some(entry) = self.subscriptions.get(&key) else {
+            return;
+        };
         let sender = entry.events.clone();
 
         // Awaited, never dropped: see the module documentation. A failure

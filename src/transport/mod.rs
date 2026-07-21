@@ -11,10 +11,14 @@
 //! sees one ordered sequence of lines and never learns how many sockets are
 //! involved.
 
-// The session layer that drives these is still being built
-// (see `docs/SPEC.md`, implementation order steps 3-5).
+// The port is deliberately wider than its single current adapter: `path` and
+// `ends_on_content_length` exist for the HTTP transports ADR-0002 promises and
+// ADR-0007 shaped the trait around, and the WebSocket adapter has no use for
+// them. Narrowing the port to what one transport happens to need would have to
+// be undone the moment the second arrives.
 #![allow(dead_code)]
 
+pub(crate) use crate::error::TransportError;
 use crate::protocol::request::{BindSession, CreateSession};
 
 pub(crate) mod ws;
@@ -23,7 +27,7 @@ pub(crate) mod ws;
 ///
 /// The session machine branches on these declared properties, never on which
 /// transport is in use, so that a further transport needs no change to it
-/// [`docs/adr/0007-transport-port-shape.md`].
+/// (`docs/adr/0007-transport-port-shape.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransportProperties {
     /// Whether control requests travel on the stream connection itself.
@@ -78,69 +82,6 @@ pub(crate) struct EncodedRequest {
     pub(crate) parameters: String,
 }
 
-/// Something went wrong moving bytes. Carries no protocol meaning.
-///
-/// This type is public — re-exported from the crate root — because the
-/// distinction it draws is actionable for a caller: failing to *connect* and
-/// losing an established stream call for different responses. The transports
-/// themselves stay private; only their error taxonomy is exposed.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum TransportError {
-    /// The connection could not be established.
-    #[error("cannot connect to {target}: {source}")]
-    Connect {
-        /// What was being connected to.
-        target: String,
-        /// The underlying failure.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// The connection failed or was dropped while in use.
-    ///
-    /// This is transition T5 [`docs/spec/02-session-lifecycle.md` §2.2]: no
-    /// notification is received, the session is *not* closed, and the client
-    /// is still entitled to attempt recovery.
-    #[error("stream connection lost: {reason}")]
-    ConnectionLost {
-        /// What ended it.
-        reason: String,
-    },
-
-    /// A control request could not be delivered.
-    #[error("cannot send control request `{name}`: {reason}")]
-    Send {
-        /// The request name.
-        name: &'static str,
-        /// What went wrong.
-        reason: String,
-    },
-
-    /// The peer sent a frame this transport cannot turn into TLCP lines —
-    /// a binary WebSocket message, or bytes that are not valid UTF-8.
-    #[error("malformed frame: {reason}")]
-    MalformedFrame {
-        /// What was wrong with it.
-        reason: String,
-    },
-
-    /// The peer sent more than this client is willing to buffer for it.
-    ///
-    /// Every dimension a server controls is capped, because a client that
-    /// allocates whatever it is told to is one malformed stream away from
-    /// taking its process with it. The connection is not usable afterwards:
-    /// what was buffered has been discarded, so the line stream has a hole in
-    /// it and the session must be recovered rather than resumed.
-    #[error("{reason}, exceeding this client's limit of {limit_bytes} bytes")]
-    Capacity {
-        /// The ceiling that was exceeded.
-        limit_bytes: usize,
-        /// What exceeded it. Never contains a credential.
-        reason: String,
-    },
-}
-
 /// Moves TLCP lines between this client and a server.
 ///
 /// Implementations own framing: CR-LF splitting, WebSocket message
@@ -173,7 +114,7 @@ pub(crate) trait Transport {
     ///
     /// This is the single point through which **all** server output reaches
     /// the session layer, control responses included
-    /// [`docs/adr/0007-transport-port-shape.md`].
+    /// (`docs/adr/0007-transport-port-shape.md`).
     fn next_line(&mut self) -> impl Future<Output = Option<Result<String, TransportError>>> + Send;
 
     /// Send a control request.
@@ -188,4 +129,63 @@ pub(crate) trait Transport {
 
     /// Close the stream connection and release every resource it owns.
     fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send;
+}
+
+/// Every transport this crate ships, as one type.
+///
+/// The caller chooses a transport at run time, but `async fn` in a trait is not
+/// object-safe, so a `dyn Transport` would need boxed futures and a macro
+/// dependency to produce them. A **closed enum that implements the port by
+/// delegation** gives the same runtime choice with neither
+/// (`docs/adr/0007-transport-port-shape.md`, §3). Transports are a set this
+/// crate owns and closes; the protocol, not the socket, is the extension point.
+///
+/// It lives below the session layer on purpose. The session layer's composition
+/// root — `session::connect_configured` — is the only place that names a
+/// concrete adapter, so adding one is an edit here and there and never in the
+/// public façade, which is what keeps a new transport out of the semver
+/// surface.
+#[derive(Debug)]
+pub(crate) enum AnyTransport {
+    /// TLCP over WebSocket, with control requests multiplexed on the stream
+    /// connection [`docs/spec/02-session-lifecycle.md` §1].
+    WebSocket(ws::WsTransport),
+}
+
+impl Transport for AnyTransport {
+    fn properties(&self) -> TransportProperties {
+        match self {
+            Self::WebSocket(transport) => transport.properties(),
+        }
+    }
+
+    fn set_control_link(&mut self, host: Option<&str>) {
+        match self {
+            Self::WebSocket(transport) => transport.set_control_link(host),
+        }
+    }
+
+    async fn open_stream(&mut self, request: StreamOpen) -> Result<(), TransportError> {
+        match self {
+            Self::WebSocket(transport) => transport.open_stream(request).await,
+        }
+    }
+
+    async fn next_line(&mut self) -> Option<Result<String, TransportError>> {
+        match self {
+            Self::WebSocket(transport) => transport.next_line().await,
+        }
+    }
+
+    async fn send_control(&mut self, request: EncodedRequest) -> Result<(), TransportError> {
+        match self {
+            Self::WebSocket(transport) => transport.send_control(request).await,
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        match self {
+            Self::WebSocket(transport) => transport.close().await,
+        }
+    }
 }

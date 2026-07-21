@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use crate::config::ConfigError;
 use crate::error::ServerError;
-use crate::protocol::request::SequenceName as WireSequenceName;
-use crate::protocol::response::MessageSequence;
-use crate::session::{MessageResult as WireResult, OutgoingMessage};
+use crate::session::{
+    MessageResult as WireResult, MessageSequence, OutgoingMessage, SequenceName as WireSequenceName,
+};
 
 /// The name of an ordered message sequence
 /// [`docs/spec/03-requests.md` §12.1].

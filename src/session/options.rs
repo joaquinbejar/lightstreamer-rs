@@ -17,6 +17,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use crate::config::ClientConfig;
 use crate::protocol::request::ConnectionMode;
 use crate::session::backoff::BackoffPolicy;
 
@@ -144,6 +145,55 @@ impl Default for SessionOptions {
 }
 
 impl SessionOptions {
+    /// Translates a caller's [`ClientConfig`] into what the state machine
+    /// expects.
+    ///
+    /// The translation lives here rather than on [`ClientConfig`] because
+    /// `src/config/*` is a **validated leaf**: it knows what a caller may
+    /// write and nothing about the wire, the transports or this state machine.
+    /// Putting the mapping on the configuration would make the public
+    /// vocabulary depend on two internal layers at once, which is exactly the
+    /// coupling the module boundaries forbid. Everything below is therefore
+    /// one-way — config in, session options out — and this function is the
+    /// single point at which the two vocabularies meet.
+    #[must_use]
+    pub(crate) fn from_client_config(config: ClientConfig) -> Self {
+        let (adapter_set, credentials, options) = config.into_parts();
+        let (user, password) = credentials.into_parts();
+        let retry = options.retry();
+        let defaults = Self::default();
+
+        Self {
+            credentials: Credentials {
+                user,
+                password,
+                adapter_set: adapter_set.map(|set| set.as_str().to_owned()),
+            },
+            connection: ConnectionMode::Streaming {
+                inactivity_millis: options.inactivity_commitment().map(as_millis),
+                keepalive_millis: options.keepalive_hint().map(as_millis),
+                // The server's default is `true`, so the parameter is sent
+                // only to switch the notifications off
+                // [`docs/spec/03-requests.md` §2.1].
+                send_sync: if options.send_sync() {
+                    None
+                } else {
+                    Some(false)
+                },
+            },
+            content_length: options.content_length().map(std::num::NonZeroU64::get),
+            keepalive_slack: options.keepalive_slack(),
+            open_timeout: options.open_timeout(),
+            backoff: BackoffPolicy {
+                initial: retry.initial_delay(),
+                max: retry.max_delay(),
+                max_attempts: retry.max_attempts(),
+            },
+            event_capacity: options.session_event_capacity(),
+            command_capacity: defaults.command_capacity,
+        }
+    }
+
     /// Sets the credentials the session is created with.
     #[must_use = "builders do nothing unless the result is used"]
     pub(crate) fn with_credentials(mut self, credentials: Credentials) -> Self {
@@ -196,6 +246,17 @@ impl SessionOptions {
     }
 }
 
+/// Converts a duration the configuration layer already accepted into the whole
+/// milliseconds the wire carries.
+///
+/// [`ClientConfig`] refuses at construction any duration whose millisecond
+/// count does not fit a `u64`, so the fallback is unreachable; it is written as
+/// the maximum rather than zero so that a hypothetical bug upstream could only
+/// ever lengthen an interval, never turn a long one into an immediate deadline.
+fn as_millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +290,81 @@ mod tests {
     #[test]
     fn test_options_no_heartbeat_without_a_commitment() {
         assert_eq!(SessionOptions::default().heartbeat_interval(), None);
+    }
+
+    // -- The config -> session-options boundary (R-04) -----------------------
+
+    fn address() -> crate::config::ServerAddress {
+        match crate::config::ServerAddress::try_new("wss://push.example.com") {
+            Ok(address) => address,
+            Err(error) => unreachable!("the fixture address is valid: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_session_options_carry_the_configured_values() {
+        use std::num::NonZeroU32;
+
+        use crate::config::{
+            AdapterSet, ClientConfig, ConnectionOptions, Credentials as PublicCredentials,
+            RetryPolicy,
+        };
+
+        let adapters = match AdapterSet::try_new("DEMO") {
+            Ok(set) => set,
+            Err(error) => unreachable!("the fixture adapter set is valid: {error}"),
+        };
+        let retry = RetryPolicy::default()
+            .with_initial_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(2))
+            .with_max_attempts(NonZeroU32::new(3));
+        let config = ClientConfig::builder(address())
+            .with_adapter_set(adapters)
+            .with_credentials(PublicCredentials::new("alice", "hunter2"))
+            .with_options(
+                ConnectionOptions::default()
+                    .with_inactivity_commitment(Some(Duration::from_secs(20)))
+                    .with_keepalive_hint(Some(Duration::from_secs(5)))
+                    .with_send_sync(false)
+                    .with_retry(retry),
+            )
+            .build();
+
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => panic!("rejected: {error}"),
+        };
+        let session = SessionOptions::from_client_config(config);
+
+        assert_eq!(session.credentials.user.as_deref(), Some("alice"));
+        assert_eq!(session.credentials.adapter_set.as_deref(), Some("DEMO"));
+        assert_eq!(session.backoff.initial, Duration::from_millis(100));
+        assert_eq!(session.backoff.max, Duration::from_secs(2));
+        assert_eq!(session.backoff.max_attempts.map(NonZeroU32::get), Some(3));
+        match session.connection {
+            ConnectionMode::Streaming {
+                inactivity_millis,
+                keepalive_millis,
+                send_sync,
+            } => {
+                assert_eq!(inactivity_millis, Some(20_000));
+                assert_eq!(keepalive_millis, Some(5_000));
+                assert_eq!(send_sync, Some(false));
+            }
+            ConnectionMode::Polling { .. } => panic!("expected a streaming connection"),
+        }
+    }
+
+    #[test]
+    fn test_session_options_omit_send_sync_when_it_is_enabled() {
+        let config = match crate::config::ClientConfig::builder(address()).build() {
+            Ok(config) => config,
+            Err(error) => panic!("rejected: {error}"),
+        };
+        match SessionOptions::from_client_config(config).connection {
+            ConnectionMode::Streaming { send_sync, .. } => assert_eq!(send_sync, None),
+            ConnectionMode::Polling { .. } => panic!("expected a streaming connection"),
+        }
     }
 
     #[test]

@@ -25,10 +25,10 @@ use std::time::Duration;
 use crate::client::ClientId;
 use crate::client::message::MessageOutcome;
 use crate::error::{Error, ServerError};
-use crate::protocol::response::{Bandwidth, Notification};
 use crate::session::{
-    BindKind, BoundInfo, RecoveryKind, RecoveryOutcome as WireRecovery, ResubscribedEntry,
-    SessionClosed as WireClosed, SubscriptionKey, UnbindReason,
+    Bandwidth, BindKind, BoundInfo, RecoveryKind, RecoveryOutcome as WireRecovery,
+    ResubscribedEntry, ServerAnnouncement, SessionClosed as WireClosed, SubscriptionKey,
+    UnbindReason,
 };
 
 /// An opaque handle identifying one subscription for as long as you hold it.
@@ -673,17 +673,19 @@ pub enum ServerInfo {
     },
 }
 
-impl ServerInfo {
-    /// Translates the session-level notifications that carry no state change.
+impl From<ServerAnnouncement> for ServerInfo {
+    /// Translates what the session layer heard the server say about itself.
     ///
-    /// Returns `None` for anything else, so a notification that later becomes
-    /// meaningful is not silently mislabelled as server info.
-    pub(crate) fn from_notification(notification: Notification) -> Option<Self> {
-        match notification {
-            Notification::ServerName { name } => Some(Self::ServerName(name)),
-            Notification::ClientIp { address } => Some(Self::ClientIp(address)),
-            Notification::Sync { elapsed_seconds } => Some(Self::Clock { elapsed_seconds }),
-            Notification::ConstraintsChanged { bandwidth } => Some(match bandwidth {
+    /// Total: the session already decided which notifications are server info,
+    /// so there is no "not really one of these" case left to represent, and no
+    /// way for a notification that later becomes meaningful to be silently
+    /// mislabelled here.
+    fn from(announcement: ServerAnnouncement) -> Self {
+        match announcement {
+            ServerAnnouncement::Name(name) => Self::ServerName(name),
+            ServerAnnouncement::ClientIp(address) => Self::ClientIp(address),
+            ServerAnnouncement::Clock { elapsed_seconds } => Self::Clock { elapsed_seconds },
+            ServerAnnouncement::Bandwidth(bandwidth) => match bandwidth {
                 Bandwidth::Limited { kbps } => Self::BandwidthLimit {
                     kbps: Some(kbps),
                     managed: true,
@@ -697,8 +699,7 @@ impl ServerInfo {
                     managed: false,
                 },
                 Bandwidth::Unrecognized { literal } => Self::UnreadableBandwidthLimit { literal },
-            }),
-            _ => None,
+            },
         }
     }
 }
@@ -1132,45 +1133,47 @@ mod tests {
     }
 
     #[test]
-    fn test_server_info_translates_the_diagnostic_notifications() {
+    fn test_server_info_translates_what_the_session_announced() {
         assert!(matches!(
-            ServerInfo::from_notification(Notification::ServerName {
-                name: "Lightstreamer HTTP Server".to_owned()
-            }),
-            Some(ServerInfo::ServerName(name)) if name.contains("Lightstreamer")
+            ServerInfo::from(ServerAnnouncement::Name(
+                "Lightstreamer HTTP Server".to_owned()
+            )),
+            ServerInfo::ServerName(name) if name.contains("Lightstreamer")
         ));
         assert!(matches!(
-            ServerInfo::from_notification(Notification::Sync {
+            ServerInfo::from(ServerAnnouncement::Clock {
                 elapsed_seconds: 12
             }),
-            Some(ServerInfo::Clock {
+            ServerInfo::Clock {
                 elapsed_seconds: 12
-            })
+            }
         ));
         assert!(matches!(
-            ServerInfo::from_notification(Notification::ConstraintsChanged {
-                bandwidth: Bandwidth::Unmanaged
-            }),
-            Some(ServerInfo::BandwidthLimit {
+            ServerInfo::from(ServerAnnouncement::ClientIp("0:0:0:0:0:0:0:1".to_owned())),
+            ServerInfo::ClientIp(address) if address == "0:0:0:0:0:0:0:1"
+        ));
+        assert!(matches!(
+            ServerInfo::from(ServerAnnouncement::Bandwidth(Bandwidth::Unmanaged)),
+            ServerInfo::BandwidthLimit {
                 kbps: None,
                 managed: false
-            })
+            }
+        ));
+        assert!(matches!(
+            ServerInfo::from(ServerAnnouncement::Bandwidth(Bandwidth::Unlimited)),
+            ServerInfo::BandwidthLimit {
+                kbps: None,
+                managed: true
+            }
         ));
         // A bandwidth the parser could not read is reported as unreadable, not
         // as a limit of `Some("")` [`docs/spec/04-notifications.md` §5.1].
         assert!(matches!(
-            ServerInfo::from_notification(Notification::ConstraintsChanged {
-                bandwidth: Bandwidth::Unrecognized {
-                    literal: String::new(),
-                },
-            }),
-            Some(ServerInfo::UnreadableBandwidthLimit { literal }) if literal.is_empty()
+            ServerInfo::from(ServerAnnouncement::Bandwidth(Bandwidth::Unrecognized {
+                literal: String::new(),
+            })),
+            ServerInfo::UnreadableBandwidthLimit { literal } if literal.is_empty()
         ));
-        // Anything that is not diagnostic is not mislabelled as diagnostic.
-        assert!(
-            ServerInfo::from_notification(Notification::Unsubscribed { subscription_id: 1 })
-                .is_none()
-        );
     }
 
     #[test]

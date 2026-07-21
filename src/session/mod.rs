@@ -36,7 +36,7 @@
 //! Every transport-dependent decision here reads a declared
 //! [`TransportProperties`] flag. There is no match on a concrete transport type
 //! in this module, and adding a fourth transport requires no change to it
-//! [`docs/adr/0007-transport-port-shape.md`].
+//! (`docs/adr/0007-transport-port-shape.md`).
 //!
 //! # Concurrency and shutdown
 //!
@@ -65,8 +65,11 @@
 //! up at once. Any event that had not yet been delivered when a stop is ordered
 //! is discarded, since the stream it was going to is about to end anyway.
 
-// The client façade that will consume this module does not exist yet
-// (see `docs/SPEC.md`, implementation order step 5).
+// Several of this module's `pub(crate)` operations — `reconfigure`,
+// `force_rebind`, `shutdown` and some builder setters — are exercised by this
+// file's own tests but not yet reached from the public façade, which exposes a
+// deliberately smaller surface than the state machine supports. They are
+// covered, not unwritten.
 #![allow(dead_code)]
 
 pub(crate) mod backoff;
@@ -82,20 +85,50 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use crate::protocol::ProtocolError;
+use crate::config::ClientConfig;
+pub(crate) use crate::protocol::ProtocolError;
 use crate::protocol::request::{
     BindSession, CreateSession, DestroyCause, DestroySession, ForceRebind, Heartbeat,
-    MaxFrequencyLimit, MessageSend, ReconfigureSubscription, RequestId, RequestedBufferSize,
-    RequestedMaxFrequency, SequenceName, Snapshot, Subscribe, SubscriptionMode, TlcpRequest,
+    MaxFrequencyLimit, MessageSend, ReconfigureSubscription, RequestId, Subscribe, TlcpRequest,
     TransportKind, Unsubscribe,
 };
-use crate::protocol::response::{MessageSequence, Notification, parse_line};
+use crate::protocol::response::{Notification, parse_line};
 use crate::session::backoff::Backoff;
 use crate::session::liveness::{Liveness, LivenessAction};
 use crate::session::options::SessionOptions;
-use crate::transport::{
-    EncodedRequest, StreamOpen, Transport, TransportError, TransportProperties,
+use crate::subscription::manager::SubscriptionManager;
+use crate::transport::ws::WsTransport;
+use crate::transport::{AnyTransport, TransportError};
+
+// ---------------------------------------------------------------------------
+// The vocabulary this layer publishes upward
+// ---------------------------------------------------------------------------
+
+// The façade above talks to this module and to nothing below it: the documented
+// dependency graph is `client -> session -> {protocol, transport port}`, with no
+// edge from `client` to `protocol` or `transport`. Some of what the façade needs
+// is nonetheless defined in those layers — a subscription mode is a wire value,
+// a decoded update is subscription state — so this block is the curated list of
+// what a caller of this module may name.
+//
+// It is a narrowing, not a formality. Everything not re-exported here — the
+// parser, the request encoders, `Notification`, `ProtocolError`, the transports
+// — is unreachable from `client`, and `tests/architecture.rs` fails if that
+// stops being true. Adding a name here is a deliberate widening of the seam.
+pub(crate) use crate::protocol::request::{
+    DecimalNumber, RequestedBufferSize, RequestedMaxFrequency, SequenceName, Snapshot,
+    SubscriptionMode,
 };
+pub(crate) use crate::protocol::response::{
+    Bandwidth, FilteringMode, MaxFrequency, MessageSequence,
+};
+pub(crate) use crate::subscription::manager::{
+    CommandFields, SubscriptionError, SubscriptionEvent,
+};
+// `connect` is generic over the port, so the port is part of this layer's own
+// signature: a test that drives a whole client over a scripted transport must
+// be able to name it. What stays unreachable from above is every *adapter*.
+pub(crate) use crate::transport::{EncodedRequest, StreamOpen, Transport, TransportProperties};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -234,6 +267,19 @@ pub(crate) struct SubscriptionSpec {
     /// [`ResubscribedEntry::snapshot_requested`]
     /// (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
     pub(crate) snapshot: Option<Snapshot>,
+
+    /// The caller's own names for the items, in order, or empty when the
+    /// subscription named a server-side group.
+    ///
+    /// Not a request parameter: TLCP transmits item counts and never names
+    /// [`docs/spec/04-notifications.md` §3.1], so these exist only to label the
+    /// updates this session hands upward. They travel with the spec because the
+    /// [`SubscriptionManager`] that needs them is rebuilt from it whenever a
+    /// replacement session re-establishes the subscription.
+    pub(crate) declared_items: Vec<String>,
+    /// The caller's own names for the fields — see
+    /// [`declared_items`](Self::declared_items).
+    pub(crate) declared_fields: Vec<String>,
 }
 
 impl SubscriptionSpec {
@@ -253,6 +299,8 @@ impl SubscriptionSpec {
             requested_buffer_size: None,
             requested_max_frequency: None,
             snapshot: None,
+            declared_items: Vec::new(),
+            declared_fields: Vec::new(),
         }
     }
 
@@ -261,6 +309,23 @@ impl SubscriptionSpec {
     #[inline]
     fn wants_snapshot(&self) -> bool {
         matches!(self.snapshot, Some(Snapshot::On | Snapshot::Length(_)))
+    }
+
+    /// A fresh [`SubscriptionManager`] for this subscription.
+    ///
+    /// Built from the spec rather than handed down from the caller, so that a
+    /// subscription re-established on a replacement session gets a state
+    /// machine with no memory of the old one — the server restarts its flow, so
+    /// the baseline must restart with it
+    /// [`docs/spec/02-session-lifecycle.md` §9.5].
+    #[must_use]
+    fn new_manager(&self) -> SubscriptionManager {
+        SubscriptionManager::new(
+            self.mode,
+            self.wants_snapshot(),
+            self.declared_items.clone(),
+            self.declared_fields.clone(),
+        )
     }
 }
 
@@ -761,6 +826,39 @@ pub(crate) enum MessageResult {
     },
 }
 
+/// What one subscription notification meant, or the typed reason it could not
+/// be reconciled with what the server already said.
+///
+/// A line this client cannot decode is reported, never fatal: the subscription
+/// stays alive and the caller is told which line was lost
+/// (`docs/adr/0003-typed-event-stream-as-delivery-surface.md`).
+pub(crate) type SubscriptionOutcome = Result<SubscriptionEvent, SubscriptionError>;
+
+/// Something the server said about itself, rather than about the data
+/// [`docs/spec/02-session-lifecycle.md` §5.3].
+///
+/// A typed alternative to passing the `SERVNAME`, `CLIENTIP`, `SYNC` and `CONS`
+/// notifications upward verbatim: the parser's own types stop at this layer, so
+/// the façade above cannot come to depend on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServerAnnouncement {
+    /// `SERVNAME` — the server's configured name
+    /// [`docs/spec/04-notifications.md` §5.4].
+    Name(String),
+    /// `CLIENTIP` — the address the server sees this client at
+    /// [`docs/spec/04-notifications.md` §5.5].
+    ClientIp(String),
+    /// `SYNC` — how long the server believes the session has been running
+    /// [`docs/spec/04-notifications.md` §5.3].
+    Clock {
+        /// Seconds since the session began, as the server counts them.
+        elapsed_seconds: u64,
+    },
+    /// `CONS` — the bandwidth ceiling now in force
+    /// [`docs/spec/04-notifications.md` §5.2].
+    Bandwidth(Bandwidth),
+}
+
 /// Everything the session layer tells the layer above it.
 ///
 /// The variants that carry the ADR-0005 distinctions are [`SessionEvent::Bound`]
@@ -816,20 +914,23 @@ pub(crate) enum SessionEvent {
         result: MessageResult,
     },
 
-    /// A data notification, with the progressive it carries for recovery
-    /// purposes [`docs/spec/02-session-lifecycle.md` §5.3].
+    /// Something happened to one subscription
+    /// [`docs/spec/04-notifications.md` §2, §3].
     ///
-    /// Duplicates suppressed after a recovery never appear here, and
+    /// The notification that caused it has already been applied to that
+    /// subscription's item state here, so what travels upward is the meaning,
+    /// not the line. Duplicates suppressed after a recovery never appear, and
     /// `MSGDONE`/`MSGFAIL` arrive as [`SessionEvent::Message`] instead.
-    Data {
+    Subscription {
         /// This notification's 1-based position in the session's data-
         /// notification count — the number `LS_recovery_from` would carry if
         /// the connection broke right after it.
         progressive: u64,
-        /// Which subscription it belongs to, when it names one.
-        subscription: Option<SubscriptionKey>,
-        /// The notification itself.
-        notification: Notification,
+        /// Which subscription it belongs to.
+        key: SubscriptionKey,
+        /// What it meant, or why it could not be reconciled with what the
+        /// server already said. Boxed only to keep [`SessionEvent`] small.
+        outcome: Box<SubscriptionOutcome>,
     },
 
     /// A control request was answered [`docs/spec/03-requests.md` §13].
@@ -849,10 +950,10 @@ pub(crate) enum SessionEvent {
         outcome: ControlOutcome,
     },
 
-    /// A session-related notification that is not a data notification and does
-    /// not change the state machine: `CONS`, `SYNC`, `SERVNAME`, `CLIENTIP`
+    /// The server said something about itself that does not change the state
+    /// machine: `CONS`, `SYNC`, `SERVNAME`, `CLIENTIP`
     /// [`docs/spec/02-session-lifecycle.md` §5.3].
-    ServerInfo(Notification),
+    ServerInfo(ServerAnnouncement),
 
     /// A line arrived that this client could not parse.
     ///
@@ -1230,6 +1331,13 @@ struct RegistryEntry {
     /// Whether the server ever confirmed it, in any session. Reported on
     /// re-subscription so the caller knows what it is getting back.
     was_active: bool,
+    /// The item and field state of this subscription: schema, baselines, and
+    /// the §2.4 snapshot classification.
+    ///
+    /// It lives here because the notifications that drive it are routed by this
+    /// layer and by nothing else. The façade above never sees a
+    /// [`Notification`]; it receives the [`SubscriptionEvent`] this produced.
+    manager: SubscriptionManager,
 }
 
 /// The desired subscription set, and its mapping onto the current session's
@@ -1266,6 +1374,13 @@ impl Registry {
         for entry in self.entries.values_mut() {
             entry.wire = None;
             entry.state = SubscriptionState::Pending;
+            // A new session is a new flow: the server restarts the subscription
+            // from scratch, so every field baseline, every schema and every
+            // snapshot classification held for it is stale
+            // [`docs/spec/02-session-lifecycle.md` §9.5]. Keeping one would let
+            // an unchanged token or a diff from the new session be applied to a
+            // value from the old.
+            entry.manager = entry.spec.new_manager();
         }
         self.by_sub_id.clear();
         self.next_sub_id = 1;
@@ -1432,6 +1547,43 @@ enum Opened {
 // ---------------------------------------------------------------------------
 // The driver
 // ---------------------------------------------------------------------------
+
+/// Creates a session from a caller's configuration, choosing and building the
+/// transport it asks for.
+///
+/// This is the **composition root**: the one place in the crate that turns a
+/// public [`ClientConfig`] into a concrete transport adapter and the options
+/// that drive it. Keeping it here rather than in the façade is what lets a
+/// second transport be added without touching a semver-governed module
+/// (`docs/adr/0007-transport-port-shape.md`, §3); the façade above never names
+/// an adapter, and the adapters below never see a `ClientConfig`.
+///
+/// # Errors
+///
+/// - [`Error::Transport`] if the configured address cannot be turned into an
+///   endpoint for the chosen transport.
+/// - [`Error::Internal`] if the options and the transport contradict each
+///   other, which only a bug in this translation can produce.
+pub(crate) fn connect_configured(
+    config: ClientConfig,
+) -> Result<
+    (
+        SessionDriver<AnyTransport>,
+        SessionHandle,
+        mpsc::Receiver<SessionEvent>,
+    ),
+    crate::error::Error,
+> {
+    let transport = match config.transport() {
+        crate::config::Transport::WebSocket => {
+            AnyTransport::WebSocket(WsTransport::try_new(config.address().as_str())?)
+        }
+    };
+    let options = SessionOptions::from_client_config(config);
+    connect(transport, options).map_err(|error| crate::error::Error::Internal {
+        reason: error.to_string(),
+    })
+}
 
 /// Creates a session over `transport`.
 ///
@@ -2296,11 +2448,30 @@ impl<T: Transport> SessionDriver<T> {
 
             // Session-related, not data
             // [`docs/spec/02-session-lifecycle.md` §5.3].
-            other @ (Notification::Sync { .. }
-            | Notification::ClientIp { .. }
-            | Notification::ServerName { .. }
-            | Notification::ConstraintsChanged { .. }) => {
-                self.emit(SessionEvent::ServerInfo(other)).await;
+            Notification::Sync { elapsed_seconds } => {
+                self.emit(SessionEvent::ServerInfo(ServerAnnouncement::Clock {
+                    elapsed_seconds,
+                }))
+                .await;
+                Flow::Continue
+            }
+            Notification::ClientIp { address } => {
+                self.emit(SessionEvent::ServerInfo(ServerAnnouncement::ClientIp(
+                    address,
+                )))
+                .await;
+                Flow::Continue
+            }
+            Notification::ServerName { name } => {
+                self.emit(SessionEvent::ServerInfo(ServerAnnouncement::Name(name)))
+                    .await;
+                Flow::Continue
+            }
+            Notification::ConstraintsChanged { bandwidth } => {
+                self.emit(SessionEvent::ServerInfo(ServerAnnouncement::Bandwidth(
+                    bandwidth,
+                )))
+                .await;
                 Flow::Continue
             }
 
@@ -2497,7 +2668,7 @@ impl<T: Transport> SessionDriver<T> {
     /// Attributes a `LOOP` to the transition that caused it.
     ///
     /// The attribution reads declared transport properties, never a transport
-    /// identity [`docs/adr/0007-transport-port-shape.md`].
+    /// identity (`docs/adr/0007-transport-port-shape.md`).
     fn loop_reason(&mut self, expected_delay: Duration) -> UnbindReason {
         if self.force_rebind_outstanding {
             self.force_rebind_outstanding = false;
@@ -2653,23 +2824,81 @@ impl<T: Transport> SessionDriver<T> {
                 .await;
             }
             notification => {
-                let subscription = self.apply_subscription_effect(&notification);
-                self.emit(SessionEvent::Data {
-                    progressive,
-                    subscription,
-                    notification,
-                })
-                .await;
+                if let Some(event) = self.interpret_for_subscription(progressive, &notification) {
+                    self.emit(event).await;
+                }
             }
         }
     }
 
-    /// Updates the registry from a subscription-bearing notification and
-    /// resolves the caller-facing key for it.
-    fn apply_subscription_effect(
+    /// Applies a subscription-bearing notification to the subscription it names
+    /// and produces the event that goes upward, if any.
+    ///
+    /// The wire line stops here. The layer above receives a typed
+    /// [`SubscriptionEvent`] — or the typed reason the line could not be
+    /// reconciled — and never a [`Notification`], which is what keeps the
+    /// public facade independent of the parser.
+    fn interpret_for_subscription(
         &mut self,
+        progressive: u64,
         notification: &Notification,
-    ) -> Option<SubscriptionKey> {
+    ) -> Option<SessionEvent> {
+        let Some((sub_id, key)) = self.resolve_subscription(notification) else {
+            // A data notification naming no subscription this client knows:
+            // either it carries no `<subscription-ID>` at all, or it names one
+            // that has already gone. Logged rather than invented into an event.
+            tracing::debug!(?notification, "unattributed data notification");
+            return None;
+        };
+        let Some(entry) = self.registry.entries.get_mut(&key) else {
+            tracing::debug!(
+                key = key.get(),
+                "a notification named a retired subscription"
+            );
+            return None;
+        };
+
+        // The manager sees the line **before** the registry acts on it, so that
+        // the `UNSUB` which removes the entry is still delivered as the
+        // subscription's own terminal event.
+        let outcome = entry.manager.handle(notification);
+
+        match notification {
+            // "Real-time updates for the subscription start after this line"
+            // [`docs/spec/04-notifications.md` §3.1].
+            Notification::SubscriptionOk { .. } | Notification::SubscriptionCommandOk { .. } => {
+                entry.state = SubscriptionState::Active;
+                entry.was_active = true;
+            }
+            // "After this line no further update for the subscription will be
+            // sent" [`docs/spec/04-notifications.md` §3.4], so the desired set
+            // loses it too — the caller asked for that.
+            Notification::Unsubscribed { .. } => {
+                self.registry.entries.remove(&key);
+                self.registry.by_sub_id.remove(&sub_id);
+            }
+            _ => {}
+        }
+
+        match outcome {
+            // A notification this subscription does not care about.
+            Ok(None) => None,
+            Ok(Some(event)) => Some(SessionEvent::Subscription {
+                progressive,
+                key,
+                outcome: Box::new(Ok(event)),
+            }),
+            Err(error) => Some(SessionEvent::Subscription {
+                progressive,
+                key,
+                outcome: Box::new(Err(error)),
+            }),
+        }
+    }
+
+    /// The `LS_subId` a notification names and the caller-facing key it maps
+    /// to, when it names one this session knows.
+    fn resolve_subscription(&self, notification: &Notification) -> Option<(u32, SubscriptionKey)> {
         let sub_id = match notification {
             Notification::Update {
                 subscription_id, ..
@@ -2695,28 +2924,8 @@ impl<T: Transport> SessionDriver<T> {
             } => *subscription_id,
             _ => return None,
         };
-
         let key = self.registry.by_sub_id.get(&sub_id).copied()?;
-
-        match notification {
-            // "Real-time updates for the subscription start after this line"
-            // [`docs/spec/04-notifications.md` §3.1].
-            Notification::SubscriptionOk { .. } | Notification::SubscriptionCommandOk { .. } => {
-                if let Some(entry) = self.registry.entries.get_mut(&key) {
-                    entry.state = SubscriptionState::Active;
-                    entry.was_active = true;
-                }
-            }
-            // "After this line no further update for the subscription will be
-            // sent" [`docs/spec/04-notifications.md` §3.4], so the desired set
-            // loses it too — the caller asked for that.
-            Notification::Unsubscribed { .. } => {
-                self.registry.entries.remove(&key);
-                self.registry.by_sub_id.remove(&sub_id);
-            }
-            _ => {}
-        }
-        Some(key)
+        Some((sub_id, key))
     }
 
     /// Takes the pending request a response names, if it still belongs to the
@@ -2888,6 +3097,7 @@ impl<T: Transport> SessionDriver<T> {
     async fn on_command(&mut self, command: SessionCommand) -> Flow {
         match command {
             SessionCommand::Subscribe { key, spec } => {
+                let manager = spec.new_manager();
                 self.registry.entries.insert(
                     key,
                     RegistryEntry {
@@ -2895,6 +3105,7 @@ impl<T: Transport> SessionDriver<T> {
                         wire: None,
                         state: SubscriptionState::Pending,
                         was_active: false,
+                        manager,
                     },
                 );
                 if self.stream_state == StreamState::Bound {
@@ -3717,7 +3928,7 @@ mod tests {
 
     /// WebSocket-shaped properties: control travels on the stream connection,
     /// the stream has no content-length end, and it does not poll
-    /// [`docs/adr/0007-transport-port-shape.md`].
+    /// (`docs/adr/0007-transport-port-shape.md`).
     const fn websocket() -> TransportProperties {
         TransportProperties {
             control_shares_stream: true,
@@ -3801,15 +4012,16 @@ mod tests {
                 .collect()
         }
 
-        fn data(&self) -> Vec<(u64, &Notification)> {
+        /// Every subscription event, with the progressive that carried it.
+        fn data(&self) -> Vec<(u64, SubscriptionKey, &SubscriptionOutcome)> {
             self.events
                 .iter()
                 .filter_map(|event| match event {
-                    SessionEvent::Data {
+                    SessionEvent::Subscription {
                         progressive,
-                        notification,
-                        ..
-                    } => Some((*progressive, notification)),
+                        key,
+                        outcome,
+                    } => Some((*progressive, *key, outcome.as_ref())),
                     _ => None,
                 })
                 .collect()
@@ -3896,6 +4108,26 @@ mod tests {
     /// [`docs/spec/02-session-lifecycle.md` §10, F8].
     const F8_CONOK: &str = "CONOK,S22dee113e3f71b1fT4327493,50000,5000,*";
     const F8_SESSION: &str = "S22dee113e3f71b1fT4327493";
+
+    /// The `add` that the transcripts' `SUBOK,1,…` answers.
+    ///
+    /// The published transcripts omit the control request that created the
+    /// subscription; a driver that never received one has nothing to route a
+    /// `U` to, so the suite issues it.
+    fn subscribe() -> SessionCommand {
+        SessionCommand::Subscribe {
+            key: SubscriptionKey(1),
+            spec: Box::new(spec()),
+        }
+    }
+
+    /// A transcript with a wait for the `add` inserted after its `CONOK`, so
+    /// the subscription is bound to `LS_subId` 1 before the server answers it.
+    fn subscribed_transcript(text: &str) -> Vec<Step> {
+        let mut steps = transcript(text);
+        steps.insert(1, Step::AwaitControls(1));
+        steps
+    }
 
     fn spec() -> SubscriptionSpec {
         // The Hands On subscription: `LS_group=item2`, the three-field stock
@@ -4045,14 +4277,16 @@ mod tests {
         let mut first = transcript(
             "
             CONOK,Se939a67a9be2d336T3823582,50000,5000,*
-            U,2,1,|15:57:51|16.27
-            U,2,1,||16.24
-            U,2,1,||16.11
-            U,2,1,|15:57:52|15.99
-            U,2,1,||15.93
+            SUBOK,1,1,3
+            U,1,1,stock|15:57:51|16.27
+            U,1,1,||16.24
+            U,1,1,||16.11
+            U,1,1,|15:57:52|15.99
+            U,1,1,||15.93
             LOOP,0
             ",
         );
+        first.insert(1, Step::AwaitControls(1));
         first.push(Step::End);
 
         let mut second = transcript(
@@ -4060,13 +4294,19 @@ mod tests {
             CONOK,Se939a67a9be2d336T3823582,50000,5000,*
             NOOP,sending placeholder data
             CONS,unlimited
-            U,2,1,|15:57:53|17.7
-            U,2,1,||17.81
+            U,1,1,|15:57:53|17.7
+            U,1,1,||17.81
             ",
         );
         second.push(line(SERVER_END));
 
-        let outcome = drive(http_streaming(), options(), vec![first, second], Vec::new()).await;
+        let outcome = drive(
+            http_streaming(),
+            options(),
+            vec![first, second],
+            vec![subscribe()],
+        )
+        .await;
 
         assert_eq!(
             outcome.unbinds(),
@@ -4087,11 +4327,15 @@ mod tests {
             Some(BindKind::Rebound)
         );
         assert!(outcome.resubscribes().is_empty());
-        // The progressive keeps counting across the rebind: five `U` before,
-        // two after.
+        // The progressive keeps counting across the rebind: `SUBOK` and five
+        // `U` before, two `U` after.
         assert_eq!(
-            outcome.data().iter().map(|(p, _)| *p).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7]
+            outcome
+                .data()
+                .iter()
+                .map(|(p, _, _)| *p)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
     }
 
@@ -4159,7 +4403,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_t3_and_t4_are_told_apart_by_declared_properties_only() {
         // The same `LOOP,0` on two transports whose only difference is a
-        // declared property [`docs/adr/0007-transport-port-shape.md`].
+        // declared property (`docs/adr/0007-transport-port-shape.md`).
         let script = || {
             vec![
                 vec![line(F1_CONOK), line("LOOP,0"), Step::End],
@@ -4189,12 +4433,18 @@ mod tests {
         // The stream of F8 up to the interruption, verbatim, whose data
         // notifications the spec counts as 15
         // [`docs/spec/02-session-lifecycle.md` §10, F8].
-        let mut first = transcript(F8_STREAM);
+        let mut first = subscribed_transcript(F8_STREAM);
         first.push(Step::Fail("connection reset"));
 
         let second = vec![line(F8_CONOK), line("PROG,15"), line(SERVER_END)];
 
-        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![subscribe()],
+        )
+        .await;
 
         assert!(matches!(
             outcome.unbinds().first(),
@@ -4259,18 +4509,17 @@ mod tests {
         // "The count should start with the `SUBOK` notification and include the
         // `CONF` and all the `U` notifications. In our example, the count
         // yields 15." [`docs/spec/02-session-lifecycle.md` §5.3, §10 F8].
-        let mut script = transcript(F8_STREAM);
+        let mut script = subscribed_transcript(F8_STREAM);
         script.push(line(SERVER_END));
 
-        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+        let outcome = drive(websocket(), options(), vec![script], vec![subscribe()]).await;
 
         let data = outcome.data();
         assert_eq!(data.len(), 15, "1 SUBOK + 1 CONF + 13 U");
-        assert_eq!(data.last().map(|(p, _)| *p), Some(15));
+        assert_eq!(data.last().map(|(p, _, _)| *p), Some(15));
         assert!(
-            data.iter()
-                .all(|(_, n)| !matches!(n, Notification::Probe | Notification::Sync { .. })),
-            "PROBE and SYNC are not data notifications"
+            data.iter().all(|(_, _, outcome)| outcome.is_ok()),
+            "PROBE and SYNC are not data notifications, and every counted line decoded"
         );
     }
 
@@ -4281,7 +4530,7 @@ mod tests {
         // notifications already sent by the Server but not received. As a
         // consequence, a few notifications will be duplicated."
         // [`docs/spec/02-session-lifecycle.md` §10, F8].
-        let mut first = transcript(F8_STREAM);
+        let mut first = subscribed_transcript(F8_STREAM);
         first.push(Step::Fail("connection reset"));
 
         let mut second = transcript(
@@ -4301,7 +4550,13 @@ mod tests {
         );
         second.push(line(SERVER_END));
 
-        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![subscribe()],
+        )
+        .await;
 
         assert_eq!(
             outcome.recoveries(),
@@ -4314,7 +4569,7 @@ mod tests {
         // Precondition 4: the four duplicates are discarded before the caller
         // sees them, and counting resumes at 16
         // [`docs/spec/02-session-lifecycle.md` §5.2].
-        let progressives: Vec<u64> = outcome.data().iter().map(|(p, _)| *p).collect();
+        let progressives: Vec<u64> = outcome.data().iter().map(|(p, _, _)| *p).collect();
         assert_eq!(progressives.len(), 15 + 2);
         assert_eq!(progressives.get(15), Some(&16));
         assert_eq!(progressives.last(), Some(&17));
@@ -4328,6 +4583,7 @@ mod tests {
         // (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
         let first = vec![
             line(F8_CONOK),
+            Step::AwaitControls(1),
             line("SUBOK,1,1,3"),
             line("U,1,1,a|b|c"),
             Step::Fail("connection reset"),
@@ -4339,7 +4595,13 @@ mod tests {
             line(SERVER_END),
         ];
 
-        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![subscribe()],
+        )
+        .await;
 
         assert_eq!(
             outcome.recoveries(),
@@ -4351,7 +4613,7 @@ mod tests {
         );
         // The counter follows the server, otherwise every later recovery would
         // ask from the wrong point.
-        assert_eq!(outcome.data().last().map(|(p, _)| *p), Some(10));
+        assert_eq!(outcome.data().last().map(|(p, _, _)| *p), Some(10));
     }
 
     // -----------------------------------------------------------------------
@@ -4817,7 +5079,7 @@ mod tests {
         // control requests are sent on the stream connection"
         // [`docs/spec/02-session-lifecycle.md` §4.5]. The request id is the
         // only thing that correlates them
-        // [`docs/adr/0007-transport-port-shape.md`].
+        // (`docs/adr/0007-transport-port-shape.md`).
         let script = vec![
             line(F1_CONOK),
             Step::AwaitControls(2),
@@ -5107,20 +5369,8 @@ mod tests {
             })
         );
         // Still alive, and its updates still route to the same key.
-        assert_eq!(
-            outcome.data().last().map(|(_, _)| ()),
-            Some(()),
-            "an update arrived after the failed delete"
-        );
-        let routed = outcome.events.iter().any(|event| {
-            matches!(
-                event,
-                SessionEvent::Data {
-                    subscription: Some(SubscriptionKey(1)),
-                    notification: Notification::Update { .. },
-                    ..
-                }
-            )
+        let routed = outcome.data().iter().any(|(_, key, outcome)| {
+            *key == SubscriptionKey(1) && matches!(outcome, Ok(SubscriptionEvent::Update(_)))
         });
         assert!(
             routed,
@@ -5734,12 +5984,14 @@ mod tests {
         // are the concrete case in v1 [`docs/spec/06-mpn.md`].
         let script = vec![
             line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("SUBOK,1,1,3"),
             line("MPNREG,devid,adapter"),
-            line("U,1,1,a|b"),
+            line("U,1,1,a|b|c"),
             line(SERVER_END),
         ];
 
-        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+        let outcome = drive(websocket(), options(), vec![script], vec![subscribe()]).await;
 
         assert!(
             outcome
@@ -5748,10 +6000,17 @@ mod tests {
                 .any(|event| matches!(event, SessionEvent::Unparsed { .. }))
         );
         // SPEC-AMBIGUITY A6: an unparsed line is not counted, so the `U` after
-        // it is still progressive 1. Under-counting makes a later recovery ask
-        // from an earlier point, which the protocol handles by re-delivering
-        // duplicates; over-counting would skip data.
-        assert_eq!(outcome.data().first().map(|(p, _)| *p), Some(1));
+        // it is progressive 2 rather than 3. Under-counting makes a later
+        // recovery ask from an earlier point, which the protocol handles by
+        // re-delivering duplicates; over-counting would skip data.
+        assert_eq!(
+            outcome
+                .data()
+                .iter()
+                .map(|(p, _, _)| *p)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert!(matches!(outcome.closed, SessionClosed::ByServer { .. }));
     }
 
@@ -5893,12 +6152,19 @@ mod tests {
         // the gate never opens and the line stream stays permanently ready.
         let script = vec![
             line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("SUBOK,1,1,1"),
             Step::FloodUntilControls("U,1,1,20.4", usize::MAX),
         ];
 
         let transport = MockTransport::new(websocket(), vec![script]);
         let log = Arc::clone(&transport.log);
         let (driver, handle, events) = connect(transport, options).expect("valid options");
+        handle
+            .commands
+            .send(subscribe())
+            .await
+            .expect("the driver has not started yet");
 
         let running = tokio::spawn(driver.run());
         // Let the driver bind, fill the single slot, and block on the next one.
