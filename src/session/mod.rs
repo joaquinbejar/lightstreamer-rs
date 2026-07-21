@@ -1,0 +1,4190 @@
+//! The session lifecycle state machine: create → bind → loop/rebind →
+//! recovery, and the terminal paths out of all of them.
+//!
+//! This is the only layer that combines the two halves of the client: it
+//! drives a [`Transport`], feeds every line it yields through
+//! [`crate::protocol::response::parse_line`], and keeps the session alive.
+//! Everything protocol-visible here is derived from
+//! `docs/spec/02-session-lifecycle.md`, whose §2.2 transition table (T1–T9) is
+//! implemented literally and cited transition by transition.
+//!
+//! # The states
+//!
+//! The specification defines exactly two session states — **Bound: Session is
+//! Streaming** and **Unbound: Session is Buffering** — plus the unnamed
+//! pre-session and destroyed endpoints of its state diagram
+//! [`docs/spec/02-session-lifecycle.md` §2.1, §2.3]. This module keeps that
+//! vocabulary. [`StreamState`] refines *Bound* into the moment before `CONOK`
+//! has arrived and the moment after, because a client must time out an
+//! unanswered handshake and the spec's two states give it nowhere to say so;
+//! the unbound state is not a variant here at all but the interval between two
+//! turns of the driver's loop, which is where it naturally lives.
+//!
+//! # What the caller is told, and why
+//!
+//! `docs/adr/0005-recovery-is-visible-in-the-event-stream.md` is binding: an
+//! application holding derived state must be able to tell an interruption that
+//! **preserved continuity** from one that **replaced the session**, and both
+//! from a session that is **definitively gone**. That is why [`BindKind`],
+//! [`RecoveryOutcome`] and [`SessionClosed`] are separate types with separate
+//! variants rather than a single "reconnected" signal: the distinction exists
+//! in the protocol, and hiding it would force every application either to
+//! rebuild state on every hiccup or to be silently wrong after a real one.
+//!
+//! # Transport independence
+//!
+//! Every transport-dependent decision here reads a declared
+//! [`TransportProperties`] flag. There is no match on a concrete transport type
+//! in this module, and adding a fourth transport requires no change to it
+//! [`docs/adr/0007-transport-port-shape.md`].
+//!
+//! # Concurrency and shutdown
+//!
+//! [`SessionDriver::run`] is the whole runtime of this layer: one future, no
+//! spawned tasks, no detached work. Whoever spawns it owns its lifetime, and
+//! every exit path — terminal notification, exhausted retries, caller
+//! shutdown, or a dropped [`SessionHandle`] — closes the transport before
+//! returning. The driver requires [`Transport::next_line`] to be cancel-safe,
+//! since it is polled inside a `select!` alongside the command channel and the
+//! liveness timer; a line must not be lost when that future is dropped.
+//!
+//! Both channels are bounded. The event channel applies backpressure rather
+//! than dropping, because a dropped data notification would desynchronise the
+//! recovery progressive that makes recovery correct
+//! [`docs/spec/02-session-lifecycle.md` §5.2].
+
+// The client façade that will consume this module does not exist yet
+// (see `docs/SPEC.md`, implementation order step 5).
+#![allow(dead_code)]
+
+pub(crate) mod backoff;
+pub(crate) mod liveness;
+pub(crate) mod options;
+
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+use crate::protocol::ProtocolError;
+use crate::protocol::request::{
+    BindSession, CreateSession, DestroyCause, DestroySession, ForceRebind, Heartbeat,
+    MaxFrequencyLimit, ReconfigureSubscription, RequestId, RequestedBufferSize,
+    RequestedMaxFrequency, Snapshot, Subscribe, SubscriptionMode, TlcpRequest, TransportKind,
+    Unsubscribe,
+};
+use crate::protocol::response::{Notification, parse_line};
+use crate::session::backoff::Backoff;
+use crate::session::liveness::{Liveness, LivenessAction};
+use crate::session::options::SessionOptions;
+use crate::transport::{
+    EncodedRequest, StreamOpen, Transport, TransportError, TransportProperties,
+};
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// A failure of the session layer itself, as opposed to a failure the server
+/// reported (which is carried in [`ServerCause`], with its code preserved).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub(crate) enum SessionError {
+    /// The options and the transport disagree about something that must match.
+    #[error("invalid session configuration: {reason}")]
+    Configuration {
+        /// What is inconsistent, in terms the caller can act on. Never
+        /// contains a credential.
+        reason: String,
+    },
+
+    /// A request could not be encoded.
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+
+    /// The driver has stopped, so no further command can be delivered.
+    #[error("the session driver has stopped")]
+    Stopped,
+}
+
+// ---------------------------------------------------------------------------
+// Identity types
+// ---------------------------------------------------------------------------
+
+/// A server-assigned session identifier
+/// [`docs/spec/02-session-lifecycle.md` §3.1].
+///
+/// It is opaque: the client echoes it and compares it, never parses it. A
+/// rebind or a recovery returns the *same* identifier, which is exactly how
+/// this module tells a resumed session from a replaced one — the Hands On
+/// transcripts show the identical id across a rebind and a recovery, and a
+/// different one after a destroy [`docs/spec/02-session-lifecycle.md` §10, F7,
+/// F8, F9].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SessionId(String);
+
+impl SessionId {
+    /// Wraps an identifier as the server sent it.
+    #[must_use]
+    #[inline]
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The identifier as it goes back on the wire.
+    #[must_use]
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A caller-facing handle on one subscription, stable for as long as the
+/// caller keeps it.
+///
+/// It is deliberately **not** the protocol's `LS_subId`. That number "must be a
+/// progressive integer number starting with 1, and must be unique within the
+/// session" [`docs/spec/02-session-lifecycle.md` §4.4], so it necessarily
+/// restarts at 1 when a lost session is replaced — the spec does not even say
+/// whether a client should try to preserve its old numbering
+/// [ibid. §9.5, ambiguity A17]. Giving the caller a key that outlives the
+/// session, and renumbering the wire ids underneath it, makes that a
+/// non-question: no subscription changes identity because the session did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SubscriptionKey(u64);
+
+impl SubscriptionKey {
+    /// The key's opaque numeric value, for logging and for a façade that needs
+    /// a map key.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// What the caller asked to subscribe to.
+///
+/// This is the *desired* subscription, held for the lifetime of the session
+/// driver. The wire request it turns into ([`Subscribe`]) additionally needs a
+/// session id, a request id and an `LS_subId`, all of which belong to one
+/// particular session and are re-derived every time the subscription is issued
+/// [`docs/spec/03-requests.md` §6.1].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubscriptionSpec {
+    /// `LS_group` — the item-group name, interpreted by the Metadata Adapter.
+    pub(crate) group: String,
+    /// `LS_schema` — the field-schema name.
+    pub(crate) schema: String,
+    /// `LS_mode` — the subscription mode of every item in the group.
+    pub(crate) mode: SubscriptionMode,
+    /// `LS_data_adapter` — which Data Adapter provides the items.
+    pub(crate) data_adapter: Option<String>,
+    /// `LS_selector` — a Metadata-Adapter-interpreted selector.
+    pub(crate) selector: Option<String>,
+    /// `LS_requested_buffer_size` — per-item buffer dimension.
+    pub(crate) requested_buffer_size: Option<RequestedBufferSize>,
+    /// `LS_requested_max_frequency` — per-item update frequency ceiling.
+    pub(crate) requested_max_frequency: Option<RequestedMaxFrequency>,
+    /// `LS_snapshot` — whether, and how much, snapshot to request.
+    ///
+    /// This is the field that decides whether a re-established subscription
+    /// restarts from a snapshot, which the caller is told about in
+    /// [`ResubscribedEntry::snapshot_requested`]
+    /// (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
+    pub(crate) snapshot: Option<Snapshot>,
+}
+
+impl SubscriptionSpec {
+    /// A minimal subscription: a group, a schema and a mode.
+    #[must_use]
+    pub(crate) fn new(
+        group: impl Into<String>,
+        schema: impl Into<String>,
+        mode: SubscriptionMode,
+    ) -> Self {
+        Self {
+            group: group.into(),
+            schema: schema.into(),
+            mode,
+            data_adapter: None,
+            selector: None,
+            requested_buffer_size: None,
+            requested_max_frequency: None,
+            snapshot: None,
+        }
+    }
+
+    /// Whether the caller asked for a snapshot.
+    #[must_use]
+    #[inline]
+    fn wants_snapshot(&self) -> bool {
+        matches!(self.snapshot, Some(Snapshot::On | Snapshot::Length(_)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outcome types
+// ---------------------------------------------------------------------------
+
+/// A cause code and message exactly as the server supplied them.
+///
+/// The code is preserved as a number and never folded into the message, so a
+/// caller can branch on it [`docs/spec/05-error-codes.md` §1]. Codes `<= 0`
+/// are Metadata-Adapter-defined and application-specific [ibid. §2].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerCause {
+    /// The `<error-code>` or `<cause-code>` from Appendix A.
+    pub(crate) code: i64,
+    /// The accompanying human-readable text, which may be empty.
+    pub(crate) message: String,
+}
+
+/// How a session came to be bound, and therefore what the caller may keep.
+///
+/// This is the ADR-0005 distinction at its sharpest: [`BindKind::Rebound`] and
+/// [`BindKind::Recovering`] leave derived state valid, [`BindKind::Recreated`]
+/// invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindKind {
+    /// T1 — the first session of this driver was created
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T1].
+    Created,
+
+    /// T1 again, but after an earlier session was lost: a **new** session with
+    /// a new identifier, its progressive restarted at zero and its
+    /// subscriptions re-executed from scratch
+    /// [`docs/spec/02-session-lifecycle.md` §6.1, §9.5]. Derived state built
+    /// on the previous session must be discarded.
+    Recreated {
+        /// The identifier of the session this one replaces, when there was one.
+        previous: Option<SessionId>,
+    },
+
+    /// T6 after a clean `LOOP` — the same session rebound with no recovery
+    /// request. The server "restarts sending real-time notifications from where
+    /// it stopped. In particular, all subscriptions are preserved, with all
+    /// their items and fields" [`docs/spec/02-session-lifecycle.md` §4.4].
+    Rebound,
+
+    /// T6 with `LS_recovery_from` — the same session, resuming from a stated
+    /// progressive. Whether the resumption was exact is reported separately by
+    /// [`SessionEvent::Recovered`], because `PROG` arrives after `CONOK`
+    /// [`docs/spec/02-session-lifecycle.md` §5.4].
+    Recovering {
+        /// The progressive the client asked to resume from.
+        requested_progressive: u64,
+    },
+}
+
+/// Where a recovered flow actually resumed, relative to where it was asked to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryOutcome {
+    /// What `LS_recovery_from` carried.
+    pub(crate) requested: u64,
+    /// What `PROG` answered.
+    pub(crate) resumed_at: u64,
+    /// The relationship between the two.
+    pub(crate) kind: RecoveryKind,
+}
+
+/// The three ways a `PROG` can relate to the requested progressive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryKind {
+    /// The server resumed exactly where the client asked. Nothing was lost and
+    /// nothing is duplicated.
+    Exact,
+
+    /// The server resumed **earlier** than asked, which it is explicitly
+    /// allowed to do. The duplicated notifications are discarded by this client
+    /// before the caller sees them, as the spec's fourth recovery precondition
+    /// requires: "the first data notifications received are discarded, until
+    /// the desired point is reached"
+    /// [`docs/spec/02-session-lifecycle.md` §5.2].
+    Duplicated {
+        /// How many notifications this client suppressed.
+        count: u64,
+    },
+
+    /// The server resumed **later** than asked: the notifications in between
+    /// are gone.
+    ///
+    /// SPEC-AMBIGUITY (A7): `PROG` "can be lower" than requested, but the spec
+    /// "never states whether it can be *higher* than requested, nor what a
+    /// client must do if it is"
+    /// [`docs/spec/02-session-lifecycle.md` §5.4]. Reporting the gap is the
+    /// defensive choice — silently continuing would tell an application that
+    /// continuity was preserved when it was not, which
+    /// `docs/adr/0005-recovery-is-visible-in-the-event-stream.md` calls out as
+    /// worse than saying nothing.
+    Gap {
+        /// How many notifications were skipped by the server.
+        missing: u64,
+    },
+}
+
+/// Why the session stopped being bound to a stream connection.
+///
+/// One variant per edge leaving *Bound* in the specification's own state
+/// diagram [`docs/spec/02-session-lifecycle.md` §2.2, §2.3], plus the two
+/// cases the diagram has no edge for: a stalled-but-not-broken connection
+/// (§8.1) and a rejected bind (§6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnbindReason {
+    /// T2 — `Force-Unbound by Client`: the client sent `LS_op=force_rebind`
+    /// and the server answered with `LOOP`
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T2].
+    ForcedByClient {
+        /// The delay `LOOP` asked for before rebinding.
+        expected_delay: Duration,
+    },
+
+    /// T3 — `Content-Length Reached`: the HTTP stream connection exhausted its
+    /// byte budget [`docs/spec/02-session-lifecycle.md` §2.2, T3].
+    ContentLengthReached {
+        /// The delay `LOOP` asked for before rebinding.
+        expected_delay: Duration,
+    },
+
+    /// T4 — `Poll Cycle Expired`: the polling cycle completed
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T4].
+    PollCycleExpired {
+        /// The delay `LOOP` asked for before rebinding. On a synchronous
+        /// polling session this may be non-zero
+        /// [`docs/spec/02-session-lifecycle.md` §4.2].
+        expected_delay: Duration,
+    },
+
+    /// A `LOOP` arrived on a transport whose declared properties identify none
+    /// of T2, T3 or T4. Rebinding is the same either way; only the label
+    /// differs.
+    Looped {
+        /// The delay `LOOP` asked for before rebinding.
+        expected_delay: Duration,
+    },
+
+    /// T5 — `Connection Failed`: "a stream connection is dropped by any cause"
+    /// and no notification is received. The session is *not* closed and a
+    /// rebind — specifically, a recovery — is still allowed
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T5].
+    ConnectionFailed {
+        /// What the transport reported. Never contains a credential.
+        detail: String,
+    },
+
+    /// The stream went quiet past its keepalive budget without ever failing.
+    ///
+    /// Not an edge in the p.8 diagram, but the spec's own prescription: "if
+    /// after the expected interval plus a configurable timeout no `PROBE` has
+    /// been received, the connection is closed and reopened"
+    /// [`docs/spec/02-session-lifecycle.md` §8.1], and "if a connection becomes
+    /// mute, the client can issue a recovery request" [ibid. §5.1].
+    KeepaliveExpired {
+        /// The budget that elapsed with no traffic at all.
+        budget: Duration,
+    },
+
+    /// A `create_session` or `bind_session` was answered with a `CONERR` whose
+    /// code permits another attempt [`docs/spec/02-session-lifecycle.md` §6.2].
+    Rejected {
+        /// The server's cause, code preserved.
+        cause: ServerCause,
+    },
+
+    /// The server ended the session with a code that tells the client to open a
+    /// new one at once — code `48`, "the client should recover by opening a new
+    /// session immediately" [`docs/spec/02-session-lifecycle.md` §6.2].
+    ServerRefresh {
+        /// The server's cause, code preserved.
+        cause: ServerCause,
+    },
+}
+
+impl UnbindReason {
+    /// Whether this unbind followed a clean `LOOP`, after which a plain rebind
+    /// is safe: "the Server will assume that all updates sent in the previous
+    /// connection (up to the `LOOP` notification) have been received"
+    /// [`docs/spec/02-session-lifecycle.md` §4.4].
+    #[must_use]
+    const fn is_clean_loop(&self) -> bool {
+        matches!(
+            self,
+            Self::ForcedByClient { .. }
+                | Self::ContentLengthReached { .. }
+                | Self::PollCycleExpired { .. }
+                | Self::Looped { .. }
+        )
+    }
+
+    /// The delay the server asked for before rebinding, if it named one.
+    #[must_use]
+    const fn expected_delay(&self) -> Option<Duration> {
+        match self {
+            Self::ForcedByClient { expected_delay }
+            | Self::ContentLengthReached { expected_delay }
+            | Self::PollCycleExpired { expected_delay }
+            | Self::Looped { expected_delay } => Some(*expected_delay),
+            _ => None,
+        }
+    }
+}
+
+/// Why the session ended, terminally. The driver has stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionClosed {
+    /// T7 or T8 — the client ended it
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T7/T8].
+    ByClient {
+        /// Whether the server confirmed the destroy with an `END`.
+        ///
+        /// `false` when the caller merely shut the driver down, or when the
+        /// destroy could not be confirmed. Dropping the connection without a
+        /// destroy leaves the session buffering server-side until its timeout
+        /// [`docs/spec/02-session-lifecycle.md` §6.3], which is the reason the
+        /// destroy path exists at all.
+        destroy_confirmed: bool,
+        /// The cause the server reported in `END`, when it sent one. The
+        /// default for a client destroy is code `31`
+        /// [`docs/spec/02-session-lifecycle.md` §10, F5].
+        cause: Option<ServerCause>,
+    },
+
+    /// The server closed the session, or refused to bind it, with a code that
+    /// admits no retry [`docs/spec/02-session-lifecycle.md` §6.2].
+    ByServer {
+        /// The server's cause, code preserved.
+        cause: ServerCause,
+    },
+
+    /// The reconnect budget was spent without ever binding again. This is T9 in
+    /// practice: the session is treated as definitively lost
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T9].
+    RetriesExhausted {
+        /// How many consecutive attempts failed.
+        attempts: u32,
+        /// The last thing that went wrong, when there was a last thing.
+        last: Option<UnbindReason>,
+    },
+
+    /// The driver could not even build the request it needed to send. A bug or
+    /// an impossible configuration, never a server condition.
+    Internal {
+        /// What failed. Never contains a credential.
+        reason: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/// What the caller learns about one bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundInfo {
+    /// The session that is now bound.
+    pub(crate) session_id: SessionId,
+    /// How it came to be bound, and therefore what derived state survives.
+    pub(crate) kind: BindKind,
+    /// `CONOK` argument 3: the longest inactivity the server guarantees
+    /// [`docs/spec/02-session-lifecycle.md` §8.1]. This, not any configured
+    /// value, is what the client's liveness budget is built from.
+    pub(crate) keep_alive: Duration,
+    /// `CONOK` argument 2: the maximum request length the server accepts, in
+    /// bytes [`docs/spec/02-session-lifecycle.md` §3.1].
+    pub(crate) request_limit_bytes: u64,
+    /// `CONOK` argument 4: the control link, or `None` when the server sent the
+    /// literal `*` [`docs/spec/02-session-lifecycle.md` §3.1].
+    pub(crate) control_link: Option<String>,
+}
+
+/// One subscription re-issued on a newly bound session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResubscribedEntry {
+    /// The caller's stable key, unchanged across the re-establishment.
+    pub(crate) key: SubscriptionKey,
+    /// The `LS_subId` allocated for it in the new session.
+    pub(crate) subscription_id: NonZeroU32,
+    /// Whether this subscription had already been confirmed by the server
+    /// before the session was replaced. `false` means it was still pending.
+    pub(crate) previously_active: bool,
+    /// Whether the subscription asks for a snapshot, and will therefore restart
+    /// from one rather than resume
+    /// (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
+    pub(crate) snapshot_requested: bool,
+}
+
+/// How a control request ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlOutcome {
+    /// `REQOK` — the server accepted the request
+    /// [`docs/spec/03-requests.md` §13.1].
+    Accepted,
+    /// `REQERR` or `ERROR` — the server refused it, with an Appendix B code
+    /// [`docs/spec/05-error-codes.md` §1].
+    Rejected {
+        /// The server's cause, code preserved.
+        cause: ServerCause,
+    },
+    /// The request never reached the server: the transport refused it or the
+    /// encoder rejected the parameters. No server code exists for this.
+    NotSent {
+        /// What went wrong. Never contains a credential.
+        reason: String,
+    },
+}
+
+/// Everything the session layer tells the layer above it.
+///
+/// The variants that carry the ADR-0005 distinctions are [`SessionEvent::Bound`]
+/// (through [`BindKind`]), [`SessionEvent::Recovered`] and
+/// [`SessionEvent::Closed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionEvent {
+    /// The session is bound to a stream connection and streaming
+    /// [`docs/spec/02-session-lifecycle.md` §2.1].
+    Bound(Box<BoundInfo>),
+
+    /// A recovery bind reported where it resumed
+    /// [`docs/spec/02-session-lifecycle.md` §5.4].
+    Recovered(RecoveryOutcome),
+
+    /// Subscriptions were re-issued on a newly bound session. Emitted whenever
+    /// any `add` is sent at bind time, which after a session replacement is
+    /// every one of them [`docs/spec/02-session-lifecycle.md` §6.1].
+    Resubscribed(Vec<ResubscribedEntry>),
+
+    /// The session left the bound state. A reconnect is already scheduled
+    /// unless `retry_in` is `None`, which means the driver is about to stop.
+    Unbound {
+        /// Which edge of the state diagram was taken.
+        reason: UnbindReason,
+        /// How long the driver will wait before its next attempt.
+        retry_in: Option<Duration>,
+    },
+
+    /// A data notification, with the progressive it carries for recovery
+    /// purposes [`docs/spec/02-session-lifecycle.md` §5.3].
+    ///
+    /// Duplicates suppressed after a recovery never appear here.
+    Data {
+        /// This notification's 1-based position in the session's data-
+        /// notification count — the number `LS_recovery_from` would carry if
+        /// the connection broke right after it.
+        progressive: u64,
+        /// Which subscription it belongs to, when it names one.
+        subscription: Option<SubscriptionKey>,
+        /// The notification itself.
+        notification: Notification,
+    },
+
+    /// A control request was answered [`docs/spec/03-requests.md` §13].
+    ControlResponse {
+        /// The request being answered, or `None` for an `ERROR`, which carries
+        /// no request id because the server could not parse one
+        /// [`docs/spec/03-requests.md` §13.2].
+        request_id: Option<RequestId>,
+        /// What the server said.
+        outcome: ControlOutcome,
+    },
+
+    /// A session-related notification that is not a data notification and does
+    /// not change the state machine: `CONS`, `SYNC`, `SERVNAME`, `CLIENTIP`
+    /// [`docs/spec/02-session-lifecycle.md` §5.3].
+    ServerInfo(Notification),
+
+    /// A line arrived that this client could not parse.
+    ///
+    /// Never fatal: "a future server version must not crash an old client".
+    /// The raw line is preserved so the caller can log or surface it.
+    Unparsed {
+        /// The line as it arrived, terminator stripped.
+        line: String,
+        /// Why it could not be parsed.
+        error: ProtocolError,
+    },
+
+    /// Terminal. The driver has stopped and no further event will follow.
+    Closed(SessionClosed),
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/// What the layer above asks the session to do.
+#[derive(Debug)]
+pub(crate) enum SessionCommand {
+    /// Add a subscription, now or as soon as a session is bound
+    /// [`docs/spec/03-requests.md` §6].
+    Subscribe {
+        /// The key the caller was handed synchronously.
+        key: SubscriptionKey,
+        /// What to subscribe to.
+        spec: Box<SubscriptionSpec>,
+    },
+
+    /// Remove a subscription [`docs/spec/03-requests.md` §7].
+    Unsubscribe {
+        /// Which one.
+        key: SubscriptionKey,
+    },
+
+    /// Change a subscription's maximum update frequency
+    /// [`docs/spec/03-requests.md` §8].
+    Reconfigure {
+        /// Which one.
+        key: SubscriptionKey,
+        /// The new ceiling.
+        max_frequency: MaxFrequencyLimit,
+    },
+
+    /// Ask the server to unbind the session so it can be rebound — T2
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T2].
+    ForceRebind {
+        /// `LS_close_socket`: whether the server should close the stream
+        /// connection rather than leave it reusable
+        /// [`docs/spec/02-session-lifecycle.md` §4.3].
+        close_socket: Option<bool>,
+    },
+
+    /// Destroy the session — T7 while bound, T8 while unbound
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T7/T8].
+    Destroy {
+        /// The cause to report in the resulting `END`, or `None` for the
+        /// server's default code `31`.
+        cause: Option<DestroyCause>,
+    },
+
+    /// Stop the driver without destroying the session. The server keeps the
+    /// session buffering until its own timeout
+    /// [`docs/spec/02-session-lifecycle.md` §6.3].
+    Shutdown,
+}
+
+/// The caller's end of the session. Cheap to clone; the driver stops when the
+/// last clone is dropped.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionHandle {
+    commands: mpsc::Sender<SessionCommand>,
+    next_key: Arc<AtomicU64>,
+}
+
+impl SessionHandle {
+    /// Requests a subscription and returns its key immediately.
+    ///
+    /// The key is allocated here rather than by the driver so that the caller
+    /// can record it before the `add` request has even been encoded. The
+    /// subscription is issued as soon as a session is bound, and re-issued on
+    /// every session that replaces it.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn subscribe(
+        &self,
+        spec: SubscriptionSpec,
+    ) -> Result<SubscriptionKey, SessionError> {
+        let key = SubscriptionKey(self.next_key.fetch_add(1, Ordering::Relaxed));
+        self.send(SessionCommand::Subscribe {
+            key,
+            spec: Box::new(spec),
+        })
+        .await?;
+        Ok(key)
+    }
+
+    /// Removes a subscription.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn unsubscribe(&self, key: SubscriptionKey) -> Result<(), SessionError> {
+        self.send(SessionCommand::Unsubscribe { key }).await
+    }
+
+    /// Changes a subscription's maximum update frequency.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn reconfigure(
+        &self,
+        key: SubscriptionKey,
+        max_frequency: MaxFrequencyLimit,
+    ) -> Result<(), SessionError> {
+        self.send(SessionCommand::Reconfigure { key, max_frequency })
+            .await
+    }
+
+    /// Asks the server to unbind the session so it is rebound at once.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn force_rebind(
+        &self,
+        close_socket: Option<bool>,
+    ) -> Result<(), SessionError> {
+        self.send(SessionCommand::ForceRebind { close_socket })
+            .await
+    }
+
+    /// Destroys the session and stops the driver.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn destroy(&self, cause: Option<DestroyCause>) -> Result<(), SessionError> {
+        self.send(SessionCommand::Destroy { cause }).await
+    }
+
+    /// Stops the driver without destroying the session.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Stopped`] if the driver has already stopped.
+    pub(crate) async fn shutdown(&self) -> Result<(), SessionError> {
+        self.send(SessionCommand::Shutdown).await
+    }
+
+    async fn send(&self, command: SessionCommand) -> Result<(), SessionError> {
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| SessionError::Stopped)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error-code classification
+// ---------------------------------------------------------------------------
+
+/// What a session-level error code leaves the client able to do.
+///
+/// The specification "has **no formal recoverable/lost taxonomy**"
+/// [`docs/spec/05-error-codes.md` §1] and states a client action for only a
+/// handful of codes. This enum is therefore a client-side policy built on the
+/// statements the spec does make; every arm of [`classify`] cites the sentence
+/// it rests on, and the arms that rest on nothing say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// The old session is gone but a new one may be created at once, and all
+    /// subscriptions re-executed
+    /// [`docs/spec/02-session-lifecycle.md` §6.1].
+    RecreateSession,
+    /// The condition is stated to be temporary; retry after a backoff.
+    RetryLater,
+    /// Retrying cannot help. The session is definitively lost.
+    Fatal,
+}
+
+/// Classifies an Appendix A session code
+/// [`docs/spec/05-error-codes.md` §2, §5].
+#[must_use]
+pub(crate) fn classify(code: i64) -> Recovery {
+    match code {
+        // "the recovery attempt failed" — and the spec's general rule for that
+        // is that "the Client can't but create a new stream connection as if it
+        // was the first time it connects" [§5.1].
+        4 => Recovery::RecreateSession,
+
+        // "Specified session not found on a `bind_session` request" — the
+        // "too much time passed" case, whose prescribed answer is to create a
+        // new session and re-execute the subscriptions
+        // [`docs/spec/02-session-lifecycle.md` §6.2, §6.1].
+        20 => Recovery::RecreateSession,
+
+        // "the client should recover by opening a new session immediately" —
+        // the one code for which the spec prescribes the action outright
+        // [`docs/spec/05-error-codes.md` §5.4].
+        48 => Recovery::RecreateSession,
+
+        // "retry later", stated verbatim for 5 and 6; 10 is "New sessions
+        // temporarily blocked" [`docs/spec/05-error-codes.md` §5.5].
+        5 | 6 | 10 => Recovery::RetryLater,
+
+        // SPEC-AMBIGUITY: the spec records no recoverability for 7, 8 and 9
+        // (licensed / configured session limits, server load on
+        // `create_session`) [`docs/spec/05-error-codes.md` §2]. They describe
+        // capacity, which is transient by nature, so they are retried under
+        // the same backoff as 5/6/10. This is a client-side reading, not a
+        // spec statement, and is reversible.
+        7..=9 => Recovery::RetryLater,
+
+        // SPEC-AMBIGUITY: 33 and 34 share one description, "An unexpected
+        // error occurred on the Server while the session was in activity", and
+        // the spec neither distinguishes them nor states recoverability
+        // [`docs/spec/05-error-codes.md` §2]. An unexpected server-side error
+        // is treated as transient and retried; a fresh session is the most a
+        // client can do about it either way.
+        33 | 34 => Recovery::RetryLater,
+
+        // SPEC-AMBIGUITY: code 21 is the session id "not compatible with this
+        // Server instance… it might pertain to a different instance", which
+        // matches the description of the permanent cluster-affinity failure
+        // that "will not be overcome by a reconnection but only by fixing the
+        // configuration" — but `docs/spec/05-error-codes.md` §5.3 warns that
+        // "the document never states the linkage. Do not assume it." Treating
+        // 21 as fatal is the defensive reading: retrying a permanent
+        // misconfiguration is a reconnect storm against a server that can
+        // never answer, and the caller is told the code so it can decide
+        // otherwise.
+        21 => Recovery::Fatal,
+
+        // Everything else, including authentication and adapter-set failures
+        // (1, 2), protocol incompatibility (3), licence restrictions (11),
+        // administrative closure (31, 32), the same-user eviction (35), the
+        // foreign manual rebind (40), and the malformed-request family
+        // (60, 64–71).
+        //
+        // SPEC-AMBIGUITY: the spec "neither reserves [the gaps in the
+        // numbering] nor says what a client should do with a positive code it
+        // does not recognise" [`docs/spec/05-error-codes.md` §2]. An unknown
+        // code is therefore fatal rather than retried: a client that retries
+        // codes it does not understand turns one server-side refusal into a
+        // reconnect storm, whereas a client that stops hands the caller a code
+        // and a message to act on.
+        //
+        // Codes `<= 0` are Metadata-Adapter-defined and "application-specific"
+        // [`docs/spec/05-error-codes.md` §2]; this client cannot know whether
+        // retrying one is safe, so it does not.
+        _ => Recovery::Fatal,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal bookkeeping
+// ---------------------------------------------------------------------------
+
+/// Where a subscription stands with the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionState {
+    /// Not yet issued on the current session, or issued and not yet confirmed.
+    Pending,
+    /// Confirmed by `SUBOK` or `SUBCMD` [`docs/spec/04-notifications.md` §3.1].
+    Active,
+    /// A `delete` has been sent; awaiting `UNSUB`
+    /// [`docs/spec/04-notifications.md` §3.4].
+    Removing,
+}
+
+/// One desired subscription and its binding, if any, in the current session.
+#[derive(Debug, Clone)]
+struct RegistryEntry {
+    spec: SubscriptionSpec,
+    /// The `LS_subId` this subscription holds in the current session, or `None`
+    /// when it has not been issued on it. Cleared whenever the session is
+    /// replaced, because `LS_subId` is unique *within the session*
+    /// [`docs/spec/02-session-lifecycle.md` §4.4].
+    wire: Option<NonZeroU32>,
+    state: SubscriptionState,
+    /// Whether the server ever confirmed it, in any session. Reported on
+    /// re-subscription so the caller knows what it is getting back.
+    was_active: bool,
+}
+
+/// The desired subscription set, and its mapping onto the current session's
+/// `LS_subId` space.
+#[derive(Debug, Default)]
+struct Registry {
+    entries: BTreeMap<SubscriptionKey, RegistryEntry>,
+    by_sub_id: BTreeMap<u32, SubscriptionKey>,
+    /// The next `LS_subId` to allocate. "A progressive integer number starting
+    /// with 1… unique within the session", and, because IDs "survive rebinds
+    /// and must not be reused", never decremented within a session
+    /// [`docs/spec/02-session-lifecycle.md` §4.4].
+    next_sub_id: u32,
+}
+
+impl Registry {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            by_sub_id: BTreeMap::new(),
+            next_sub_id: 1,
+        }
+    }
+
+    /// Drops every wire binding, for use when a **new** session replaces the
+    /// old one. Subscription ids restart at 1 in the new session
+    /// [`docs/spec/02-session-lifecycle.md` §9.5].
+    ///
+    /// Entries that were being removed are dropped outright: the new session
+    /// never had them, so there is nothing left to delete.
+    fn reset_for_new_session(&mut self) {
+        self.entries
+            .retain(|_, entry| entry.state != SubscriptionState::Removing);
+        for entry in self.entries.values_mut() {
+            entry.wire = None;
+            entry.state = SubscriptionState::Pending;
+        }
+        self.by_sub_id.clear();
+        self.next_sub_id = 1;
+    }
+
+    /// Allocates the next `LS_subId`, or `None` if the session has somehow
+    /// exhausted the 32-bit space.
+    fn allocate(&mut self) -> Option<NonZeroU32> {
+        let id = NonZeroU32::new(self.next_sub_id)?;
+        self.next_sub_id = self.next_sub_id.checked_add(1)?;
+        Some(id)
+    }
+}
+
+/// What a control request was for, so its response can be acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    Subscribe(SubscriptionKey),
+    Unsubscribe(SubscriptionKey),
+    Reconfigure(SubscriptionKey),
+    ForceRebind,
+    Destroy,
+}
+
+/// Which kind of stream-opening request is in flight, and what it means for
+/// the `CONOK` that answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenIntent {
+    /// `create_session` [`docs/spec/02-session-lifecycle.md` §3.1].
+    Create,
+    /// `bind_session` with no `LS_recovery_from`
+    /// [`docs/spec/02-session-lifecycle.md` §4.4].
+    Rebind,
+    /// `bind_session` with `LS_recovery_from`
+    /// [`docs/spec/02-session-lifecycle.md` §5.4].
+    Recover {
+        /// The progressive the request carried.
+        requested: u64,
+    },
+}
+
+/// The two moments of the specification's *Bound* state that a client must
+/// tell apart: before `CONOK`, when an unanswered handshake must time out, and
+/// after it, when the negotiated keep-alive governs
+/// [`docs/spec/02-session-lifecycle.md` §2.1, §8.1].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamState {
+    /// A stream-opening request is in flight; no `CONOK` yet.
+    Establishing,
+    /// `CONOK` arrived: the session is bound and streaming.
+    Bound,
+}
+
+/// What to open next, and after how long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reopen {
+    intent: OpenIntent,
+    delay: Duration,
+}
+
+/// What the line pump decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Flow {
+    /// Keep pumping.
+    Continue,
+    /// Leave the bound state and reopen.
+    Unbind(UnbindReason),
+    /// Stop for good.
+    Closed(SessionClosed),
+}
+
+/// Which future woke the pump.
+enum Woke {
+    Line(Option<Result<String, TransportError>>),
+    Command(Option<SessionCommand>),
+    Timer,
+}
+
+// ---------------------------------------------------------------------------
+// The driver
+// ---------------------------------------------------------------------------
+
+/// Creates a session over `transport`.
+///
+/// Returns the driver — a single future that must be polled to completion,
+/// typically by `tokio::spawn` — the caller's handle, and the event stream.
+///
+/// # Errors
+///
+/// [`SessionError::Configuration`] if the options ask for a polling connection
+/// on a transport that does not poll, or the reverse. The two must agree
+/// because `LS_polling` changes the meaning of the `CONOK` keep-alive argument
+/// and forbids `LS_keepalive_millis` and `LS_inactivity_millis` entirely
+/// [`docs/spec/02-session-lifecycle.md` §7.2, §8.4].
+pub(crate) fn connect<T: Transport>(
+    transport: T,
+    options: SessionOptions,
+) -> Result<
+    (
+        SessionDriver<T>,
+        SessionHandle,
+        mpsc::Receiver<SessionEvent>,
+    ),
+    SessionError,
+> {
+    let properties = transport.properties();
+    if properties.is_polling != options.is_polling() {
+        return Err(SessionError::Configuration {
+            reason: format!(
+                "transport declares is_polling={} but the connection mode asks for polling={}",
+                properties.is_polling,
+                options.is_polling()
+            ),
+        });
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(options.command_capacity.get());
+    let (event_tx, event_rx) = mpsc::channel(options.event_capacity.get());
+
+    let handle = SessionHandle {
+        commands: command_tx,
+        next_key: Arc::new(AtomicU64::new(1)),
+    };
+    let driver = SessionDriver::new(transport, properties, options, command_rx, event_tx);
+    Ok((driver, handle, event_rx))
+}
+
+/// The session state machine. One future, no spawned tasks.
+#[derive(Debug)]
+pub(crate) struct SessionDriver<T: Transport> {
+    transport: T,
+    properties: TransportProperties,
+    options: SessionOptions,
+    commands: mpsc::Receiver<SessionCommand>,
+    events: mpsc::Sender<SessionEvent>,
+
+    /// The current stream state, meaningful only while a stream connection is
+    /// open.
+    stream_state: StreamState,
+    /// What the in-flight stream-opening request was.
+    intent: OpenIntent,
+    /// The session the server gave us, while it is still usable.
+    session: Option<SessionId>,
+    /// The last session that was abandoned — rejected on a bind, or ended by
+    /// the server with a code that asks for a fresh one. Kept only so the
+    /// replacement can be reported as [`BindKind::Recreated`] naming what it
+    /// replaced (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`);
+    /// it is never sent on the wire again.
+    previous_session: Option<SessionId>,
+
+    /// "The count of all the notifications received since the start of the
+    /// session", which `LS_recovery_from` carries
+    /// [`docs/spec/02-session-lifecycle.md` §5.2].
+    progressive: u64,
+    /// How many duplicated data notifications are still to be discarded after
+    /// a `PROG` that resumed earlier than requested
+    /// [`docs/spec/02-session-lifecycle.md` §5.2, precondition 4].
+    skip_remaining: u64,
+
+    registry: Registry,
+    pending: HashMap<String, PendingKind>,
+    /// `LS_reqId` is "unique within the connection", where "connection" is
+    /// never defined [`docs/spec/02-session-lifecycle.md` §4.4, ambiguity A5].
+    ///
+    /// SPEC-AMBIGUITY (A5): this counter is monotonic for the **whole life of
+    /// the driver** and is never reset — not per socket, not per stream
+    /// connection, not per session. That is at least as strict as every reading
+    /// of the ambiguity, so it cannot collide under any of them, and it makes
+    /// the late responses of §4.5 — "after binding the second session, it is
+    /// possible that late responses to control requests related with the first
+    /// session arrive interspersed with notifications for the second session" —
+    /// harmless: a stale id can never be confused with a live one.
+    next_request_id: u64,
+
+    /// Set when `force_rebind` is sent, so the `LOOP` it provokes is attributed
+    /// to T2 rather than to the transport's own reason
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T2].
+    force_rebind_outstanding: bool,
+    /// Set when `destroy` is sent, so the `END` it provokes is attributed to
+    /// the client [`docs/spec/02-session-lifecycle.md` §2.2, T7].
+    destroy_requested: bool,
+
+    liveness: Liveness,
+    backoff: Backoff,
+}
+
+impl<T: Transport> SessionDriver<T> {
+    fn new(
+        transport: T,
+        properties: TransportProperties,
+        options: SessionOptions,
+        commands: mpsc::Receiver<SessionCommand>,
+        events: mpsc::Sender<SessionEvent>,
+    ) -> Self {
+        let liveness = Liveness::new(
+            options.keepalive_slack,
+            options.heartbeat_interval(),
+            Instant::now(),
+        );
+        let backoff = Backoff::new(options.backoff);
+        Self {
+            transport,
+            properties,
+            options,
+            commands,
+            events,
+            stream_state: StreamState::Establishing,
+            intent: OpenIntent::Create,
+            session: None,
+            previous_session: None,
+            progressive: 0,
+            skip_remaining: 0,
+            registry: Registry::new(),
+            pending: HashMap::new(),
+            next_request_id: 1,
+            force_rebind_outstanding: false,
+            destroy_requested: false,
+            liveness,
+            backoff,
+        }
+    }
+
+    /// The session's data-notification count so far — what a recovery bind
+    /// would ask to resume from [`docs/spec/02-session-lifecycle.md` §5.2].
+    #[must_use]
+    #[inline]
+    pub(crate) const fn progressive(&self) -> u64 {
+        self.progressive
+    }
+
+    /// The session identifier, once the server has supplied one.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn session_id(&self) -> Option<&SessionId> {
+        self.session.as_ref()
+    }
+
+    /// Runs the session to its terminal state.
+    ///
+    /// Returns why it ended; the same value is also the last event on the event
+    /// channel. The transport is closed before this returns on **every** path.
+    pub(crate) async fn run(mut self) -> SessionClosed {
+        let closed = self.drive().await;
+        if let Err(error) = self.transport.close().await {
+            tracing::warn!(%error, "transport did not close cleanly");
+        }
+        // Best effort: a caller that dropped the receiver is not an error.
+        let _ = self.events.send(SessionEvent::Closed(closed.clone())).await;
+        tracing::info!(?closed, "session ended");
+        closed
+    }
+
+    /// The outer loop: open a stream connection, pump it, decide what to open
+    /// next. Each turn is one edge of the specification's state diagram
+    /// [`docs/spec/02-session-lifecycle.md` §2.3].
+    async fn drive(&mut self) -> SessionClosed {
+        let mut next = Reopen {
+            intent: OpenIntent::Create,
+            delay: Duration::ZERO,
+        };
+        loop {
+            if let Some(closed) = self.wait_before_reopen(next.delay).await {
+                return closed;
+            }
+
+            let request = match self.build_open(&next.intent) {
+                Ok(request) => request,
+                Err(error) => {
+                    return SessionClosed::Internal {
+                        reason: error.to_string(),
+                    };
+                }
+            };
+            self.intent = next.intent.clone();
+            self.stream_state = StreamState::Establishing;
+            self.skip_remaining = 0;
+
+            let flow = match self.transport.open_stream(request).await {
+                Ok(()) => {
+                    self.liveness
+                        .on_stream_opened(self.options.open_timeout, Instant::now());
+                    self.pump().await
+                }
+                Err(error) => Flow::Unbind(UnbindReason::ConnectionFailed {
+                    detail: error.to_string(),
+                }),
+            };
+
+            match flow {
+                Flow::Closed(closed) => return closed,
+                Flow::Continue | Flow::Unbind(_) => {}
+            }
+            let reason = match flow {
+                Flow::Unbind(reason) => reason,
+                // The pump only ever returns `Unbind` or `Closed`; treating a
+                // `Continue` as a connection failure keeps this total without
+                // an `unreachable!`.
+                _ => UnbindReason::ConnectionFailed {
+                    detail: "stream ended without a reason".to_owned(),
+                },
+            };
+
+            self.liveness.on_stream_closed();
+            self.stream_state = StreamState::Establishing;
+
+            // After a clean `LOOP` the connection may legitimately be reused —
+            // with WS "the server sends the *Loop* command exactly as in the
+            // HTTP case, but it does not close the connection", and the client
+            // "is free to choose whether to rebind the session to the same
+            // stream connection or open a new one"
+            // [`docs/spec/02-session-lifecycle.md` §4.3], a choice the
+            // transport is the only layer able to make.
+            //
+            // After anything else it may not. A stalled connection must be
+            // "closed and reopened" [ibid. §8.1], and a recovery request
+            // "invalidates any further notifications (of any type) that may be
+            // later received on the original connection" [ibid. §5.1] — so the
+            // wedged socket is torn down here rather than left to be collected
+            // whenever the transport happens to replace it.
+            if !reason.is_clean_loop() {
+                if let Err(error) = self.transport.close().await {
+                    tracing::debug!(%error, "closing the failed stream connection");
+                }
+            }
+
+            match self.plan_after(&reason) {
+                Some(reopen) => {
+                    self.emit(SessionEvent::Unbound {
+                        reason: reason.clone(),
+                        retry_in: Some(reopen.delay),
+                    })
+                    .await;
+                    tracing::debug!(?reason, delay = ?reopen.delay, intent = ?reopen.intent, "reopening");
+                    next = reopen;
+                }
+                None => {
+                    self.emit(SessionEvent::Unbound {
+                        reason: reason.clone(),
+                        retry_in: None,
+                    })
+                    .await;
+                    return SessionClosed::RetriesExhausted {
+                        attempts: self.backoff.attempts(),
+                        last: Some(reason),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Waits out a reconnection delay while still serving commands, so a
+    /// shutdown or a destroy is not stuck behind a backoff.
+    async fn wait_before_reopen(&mut self, delay: Duration) -> Option<SessionClosed> {
+        if delay.is_zero() {
+            return None;
+        }
+        let deadline = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let woke = tokio::select! {
+                biased;
+                command = self.commands.recv() => Woke::Command(command),
+                () = tokio::time::sleep_until(deadline) => Woke::Timer,
+            };
+            match woke {
+                Woke::Timer => return None,
+                Woke::Command(None) => {
+                    return Some(SessionClosed::ByClient {
+                        destroy_confirmed: false,
+                        cause: None,
+                    });
+                }
+                Woke::Command(Some(command)) => match self.on_command(command).await {
+                    Flow::Closed(closed) => return Some(closed),
+                    Flow::Continue | Flow::Unbind(_) => {}
+                },
+                Woke::Line(_) => {}
+            }
+        }
+    }
+
+    /// Builds the request that opens the next stream connection.
+    ///
+    /// `LS_reduce_head` is never set. On a `bind_session` it would suppress
+    /// `CONOK` itself, and the spec then defines no substitute signal for a
+    /// successful bind, nor any way to tell success from failure
+    /// [`docs/spec/02-session-lifecycle.md` §3.2, ambiguity A4]. `CONOK` is
+    /// this state machine's only evidence of the *Unbound → Bound* transition,
+    /// so it is never asked to be withheld.
+    fn build_open(&mut self, intent: &OpenIntent) -> Result<StreamOpen, ProtocolError> {
+        let session = match (&self.session, intent) {
+            (Some(session), OpenIntent::Rebind | OpenIntent::Recover { .. }) => Some(session),
+            _ => None,
+        };
+        match (session, intent) {
+            (Some(session), OpenIntent::Recover { requested }) => {
+                Ok(StreamOpen::Bind(Box::new(BindSession {
+                    // Always explicit, even on WS where it may be defaulted to
+                    // "the last session that was bound to the WS connection"
+                    // [`docs/spec/02-session-lifecycle.md` §4.4]. Naming it
+                    // removes any question of which session a rebind applies to
+                    // when late responses from a previous one are still in
+                    // flight [ibid. §4.5].
+                    session: Some(session.as_str().to_owned()),
+                    recovery_from: Some(*requested),
+                    content_length: self.options.content_length,
+                    connection: self.options.connection,
+                    reduce_head: None,
+                })))
+            }
+            (Some(session), OpenIntent::Rebind) => Ok(StreamOpen::Bind(Box::new(BindSession {
+                session: Some(session.as_str().to_owned()),
+                recovery_from: None,
+                content_length: self.options.content_length,
+                connection: self.options.connection,
+                reduce_head: None,
+            }))),
+            _ => {
+                let credentials = &self.options.credentials;
+                Ok(StreamOpen::Create(Box::new(CreateSession {
+                    user: credentials.user.clone(),
+                    password: credentials.password.clone(),
+                    adapter_set: credentials.adapter_set.clone(),
+                    requested_max_bandwidth: None,
+                    content_length: self.options.content_length,
+                    connection: self.options.connection,
+                    reduce_head: None,
+                    ttl: None,
+                })))
+            }
+        }
+    }
+
+    /// Chooses what to open after an unbind, and how long to wait first.
+    ///
+    /// `None` means the retry budget is spent and the session is definitively
+    /// lost.
+    fn plan_after(&mut self, reason: &UnbindReason) -> Option<Reopen> {
+        // A clean `LOOP` is not a failure: the server told us to rebind and
+        // guaranteed continuity, so the backoff schedule is irrelevant and the
+        // only delay is the one `LOOP` asked for
+        // [`docs/spec/02-session-lifecycle.md` §4.2, §4.4].
+        if reason.is_clean_loop() {
+            self.backoff.reset();
+            return Some(Reopen {
+                intent: OpenIntent::Rebind,
+                delay: reason.expected_delay().unwrap_or(Duration::ZERO),
+            });
+        }
+
+        match reason {
+            // T5, and the mute-connection case of §5.1. The session is not
+            // closed, so recovery — not a plain rebind — is the right request:
+            // a plain rebind after a drop "silently loses data"
+            // [`docs/spec/02-session-lifecycle.md` §4.4].
+            UnbindReason::ConnectionFailed { .. } | UnbindReason::KeepaliveExpired { .. } => {
+                let delay = self.backoff.next_delay()?;
+                let intent = if self.session.is_some() {
+                    OpenIntent::Recover {
+                        requested: self.progressive,
+                    }
+                } else {
+                    OpenIntent::Create
+                };
+                Some(Reopen { intent, delay })
+            }
+
+            // "the client should create a new stream connection, as if it was
+            // the first time it connects to the Server, and re-execute all the
+            // subscriptions" [`docs/spec/02-session-lifecycle.md` §6.1].
+            UnbindReason::Rejected { .. } => {
+                let delay = self.backoff.next_delay()?;
+                Some(Reopen {
+                    intent: OpenIntent::Create,
+                    delay,
+                })
+            }
+
+            // Code 48: "the client should recover by opening a new session
+            // immediately" [`docs/spec/05-error-codes.md` §5.4]. Immediately
+            // means no backoff, and the schedule is reset because nothing
+            // failed.
+            UnbindReason::ServerRefresh { .. } => {
+                self.backoff.reset();
+                Some(Reopen {
+                    intent: OpenIntent::Create,
+                    delay: Duration::ZERO,
+                })
+            }
+
+            // Handled by `is_clean_loop` above.
+            UnbindReason::ForcedByClient { .. }
+            | UnbindReason::ContentLengthReached { .. }
+            | UnbindReason::PollCycleExpired { .. }
+            | UnbindReason::Looped { .. } => Some(Reopen {
+                intent: OpenIntent::Rebind,
+                delay: Duration::ZERO,
+            }),
+        }
+    }
+
+    /// Reads lines until the stream connection ends or the session does.
+    async fn pump(&mut self) -> Flow {
+        loop {
+            let deadline = self.liveness.next_deadline();
+            // Deliberately biased, server first. The state machine must stay in
+            // step with the server: a command issued against a session that has
+            // already been unbound by a line sitting unread in the buffer would
+            // be sent into a connection that no longer exists. Commands wait at
+            // most until the line stream goes quiet, which on any real
+            // connection is immediately — and the liveness timer, being last,
+            // can only fire when neither of the other two has anything, which
+            // is exactly the condition it exists to detect.
+            //
+            // This requires `next_line` to be cancel-safe: the future is
+            // dropped whenever another branch wins, and a line must not be lost
+            // with it.
+            let woke = tokio::select! {
+                biased;
+                line = self.transport.next_line() => Woke::Line(line),
+                command = self.commands.recv() => Woke::Command(command),
+                () = sleep_until_option(deadline) => Woke::Timer,
+            };
+
+            let flow = match woke {
+                Woke::Line(Some(Ok(line))) => self.on_line(line).await,
+                Woke::Line(Some(Err(error))) => Flow::Unbind(UnbindReason::ConnectionFailed {
+                    detail: error.to_string(),
+                }),
+                Woke::Line(None) => self.on_stream_end(),
+                Woke::Command(Some(command)) => self.on_command(command).await,
+                // Every handle was dropped: nobody can command the session and
+                // nobody is left to care about its events.
+                Woke::Command(None) => Flow::Closed(SessionClosed::ByClient {
+                    destroy_confirmed: false,
+                    cause: None,
+                }),
+                Woke::Timer => self.on_timer().await,
+            };
+
+            match flow {
+                Flow::Continue => {}
+                other => return other,
+            }
+        }
+    }
+
+    /// The transport reported a clean end of stream, with no `LOOP` and no
+    /// error.
+    fn on_stream_end(&mut self) -> Flow {
+        if self.destroy_requested {
+            // The destroy was sent; the connection ending without the `END`
+            // that §2.2 T7 promises is still an ended session.
+            return Flow::Closed(SessionClosed::ByClient {
+                destroy_confirmed: false,
+                cause: None,
+            });
+        }
+        if self.properties.is_polling {
+            // SPEC-AMBIGUITY: §7.1 describes the long-polling cycle as the
+            // server unbinding "and closing the stream connection" without
+            // mentioning `LOOP`, while §2.2 T4 says a `LOOP` is what marks the
+            // poll cycle expiring. A polling transport that ends its stream
+            // without a `LOOP` is therefore read as T4 — the benign reading —
+            // rather than as T5. Reading it as T5 would ask the server to
+            // recover a session that was never interrupted, on every single
+            // poll cycle.
+            return Flow::Unbind(UnbindReason::PollCycleExpired {
+                expected_delay: Duration::ZERO,
+            });
+        }
+        // T5: "a stream connection is dropped by any cause… upon connection
+        // drop, the session is not closed, hence the Client is still allowed to
+        // issue a rebind" [`docs/spec/02-session-lifecycle.md` §2.2, T5].
+        Flow::Unbind(UnbindReason::ConnectionFailed {
+            detail: "stream connection closed by the peer".to_owned(),
+        })
+    }
+
+    /// A liveness deadline fell due.
+    async fn on_timer(&mut self) -> Flow {
+        match self.liveness.due(Instant::now()) {
+            LivenessAction::Idle => Flow::Continue,
+            LivenessAction::SendHeartbeat => {
+                self.send_heartbeat().await;
+                Flow::Continue
+            }
+            LivenessAction::InboundStalled { budget } => match self.stream_state {
+                // Nothing answered the handshake within the client's own limit.
+                // The spec sets no such limit; see `SessionOptions::open_timeout`.
+                StreamState::Establishing => Flow::Unbind(UnbindReason::ConnectionFailed {
+                    detail: format!("no response to the stream-opening request within {budget:?}"),
+                }),
+                // §8.1: "if after the expected interval plus a configurable
+                // timeout no `PROBE` has been received, the connection is closed
+                // and reopened".
+                StreamState::Bound => Flow::Unbind(UnbindReason::KeepaliveExpired { budget }),
+            },
+        }
+    }
+
+    /// One line from the server.
+    async fn on_line(&mut self, line: String) -> Flow {
+        // Every line resets the inbound clock, not only `PROBE`: the keep-alive
+        // is the longest interval with no traffic of any kind
+        // [`docs/spec/02-session-lifecycle.md` §8.1].
+        self.liveness.on_inbound(Instant::now());
+
+        match parse_line(&line) {
+            Ok(notification) => self.on_notification(notification).await,
+            Err(error) => {
+                // SPEC-AMBIGUITY: an unparsed line is *not* counted toward the
+                // recovery progressive, because this client cannot know whether
+                // it was a data notification — and the one group the spec
+                // leaves unclassified, MPN, is exactly the group this client
+                // does not parse [`docs/spec/02-session-lifecycle.md` §5.3,
+                // ambiguity A6]. Under-counting is the safe direction: it makes
+                // a later recovery ask to resume from an *earlier* point, which
+                // the protocol handles by re-delivering duplicates (§5.2), the
+                // very case §5.2's fourth precondition is written for.
+                // Over-counting would silently skip data.
+                tracing::warn!(%error, "unrecognized line preserved for the caller");
+                self.emit(SessionEvent::Unparsed { line, error }).await;
+                Flow::Continue
+            }
+        }
+    }
+
+    /// The state machine proper: one arm per notification that means something
+    /// to the lifecycle, everything else forwarded or counted.
+    async fn on_notification(&mut self, notification: Notification) -> Flow {
+        match notification {
+            // T1 and T6 — the only evidence of a successful bind
+            // [`docs/spec/02-session-lifecycle.md` §2.2, T1/T6].
+            Notification::ConnectionOk {
+                session_id,
+                request_limit_bytes,
+                keep_alive_millis,
+                control_link,
+            } => {
+                self.on_conok(
+                    SessionId::new(session_id),
+                    request_limit_bytes,
+                    Duration::from_millis(keep_alive_millis),
+                    control_link,
+                )
+                .await;
+                Flow::Continue
+            }
+
+            // The session could not be created or bound
+            // [`docs/spec/02-session-lifecycle.md` §6.2].
+            Notification::ConnectionError { code, message } => {
+                let cause = ServerCause { code, message };
+                match classify(code) {
+                    Recovery::Fatal => {
+                        tracing::warn!(code, "session refused with a code that admits no retry");
+                        Flow::Closed(SessionClosed::ByServer { cause })
+                    }
+                    Recovery::RecreateSession | Recovery::RetryLater => {
+                        // A rejected bind means the old session is unusable:
+                        // it is retired so the next attempt creates a new one
+                        // and re-executes every subscription [§6.1], while its
+                        // identifier is kept for one more bind so the caller
+                        // learns what the new session replaced.
+                        self.previous_session = self.session.take();
+                        Flow::Unbind(UnbindReason::Rejected { cause })
+                    }
+                }
+            }
+
+            // The server closed the session
+            // [`docs/spec/02-session-lifecycle.md` §2.2 note, §6.2].
+            Notification::End {
+                cause_code,
+                cause_message,
+            } => self.on_end(cause_code, cause_message),
+
+            // T2, T3 or T4, depending on why
+            // [`docs/spec/02-session-lifecycle.md` §2.2, §4.2].
+            Notification::Loop {
+                expected_delay_millis,
+            } => Flow::Unbind(self.loop_reason(Duration::from_millis(expected_delay_millis))),
+
+            // Where a recovered flow resumes
+            // [`docs/spec/02-session-lifecycle.md` §5.4].
+            Notification::Progressive { progressive } => {
+                self.on_prog(progressive).await;
+                Flow::Continue
+            }
+
+            // A control request was answered [`docs/spec/03-requests.md` §13].
+            Notification::RequestOk { request_id } => {
+                self.on_request_ok(request_id).await;
+                Flow::Continue
+            }
+            Notification::RequestError {
+                request_id,
+                code,
+                message,
+            } => {
+                self.on_request_error(request_id, ServerCause { code, message })
+                    .await;
+                Flow::Continue
+            }
+            // `ERROR` carries no request id "because the server could not parse
+            // one" [`docs/spec/03-requests.md` §13.2], so nothing can be
+            // correlated; it is surfaced uncorrelated rather than guessed at.
+            Notification::Error { code, message } => {
+                tracing::warn!(code, "server rejected a request it could not correlate");
+                self.emit(SessionEvent::ControlResponse {
+                    request_id: None,
+                    outcome: ControlOutcome::Rejected {
+                        cause: ServerCause { code, message },
+                    },
+                })
+                .await;
+                Flow::Continue
+            }
+
+            // Keep-alive: already accounted for by `on_line`, and explicitly
+            // not a data notification
+            // [`docs/spec/02-session-lifecycle.md` §5.3, §8.1].
+            Notification::Probe => {
+                tracing::trace!("probe");
+                Flow::Continue
+            }
+            // "The purpose of this notification is to fill the receive buffer";
+            // the payload "is to be ignored"
+            // [`docs/spec/04-notifications.md` §5.6].
+            Notification::NoOp { .. } => Flow::Continue,
+            // The WebSocket establishment check's echo; it means the channel
+            // carries TLCP end to end [`docs/spec/03-requests.md` §15.2].
+            Notification::WsOk => {
+                tracing::debug!("websocket establishment check acknowledged");
+                Flow::Continue
+            }
+
+            // Session-related, not data
+            // [`docs/spec/02-session-lifecycle.md` §5.3].
+            other @ (Notification::Sync { .. }
+            | Notification::ClientIp { .. }
+            | Notification::ServerName { .. }
+            | Notification::ConstraintsChanged { .. }) => {
+                self.emit(SessionEvent::ServerInfo(other)).await;
+                Flow::Continue
+            }
+
+            // Everything left is a data notification
+            // [`docs/spec/02-session-lifecycle.md` §5.3].
+            data => {
+                self.on_data(data).await;
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Handles `CONOK`: the *Unbound → Bound* transition
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T1/T6].
+    async fn on_conok(
+        &mut self,
+        session_id: SessionId,
+        request_limit_bytes: u64,
+        keep_alive: Duration,
+        control_link: Option<String>,
+    ) {
+        self.stream_state = StreamState::Bound;
+        self.liveness.on_bound(keep_alive, Instant::now());
+        self.backoff.reset();
+
+        // "upon the first time the 'control link' address is used to open a new
+        // stream connection to rebind to a session, the streaming activity…
+        // will switch to the 'control link'"; the literal `*` means keep using
+        // the current address [`docs/spec/02-session-lifecycle.md` §3.1].
+        self.transport.set_control_link(control_link.as_deref());
+
+        let previous = self.session.take().or_else(|| self.previous_session.take());
+        let same_session = previous.as_ref() == Some(&session_id);
+        self.session = Some(session_id.clone());
+        self.previous_session = None;
+
+        let kind = match (&self.intent, same_session) {
+            (OpenIntent::Rebind, true) => BindKind::Rebound,
+            (OpenIntent::Recover { requested }, true) => BindKind::Recovering {
+                requested_progressive: *requested,
+            },
+            // A `bind_session` answered with a *different* session id. The spec
+            // does not contemplate it — every transcript shows the id unchanged
+            // across a rebind and a recovery
+            // [`docs/spec/02-session-lifecycle.md` §10, F7/F8].
+            //
+            // SPEC-AMBIGUITY: nothing says what a client should do here.
+            // Treating it as a replacement is the only safe reading: the
+            // progressive and the `LS_subId` space belong to a session, so
+            // carrying them into a different one would corrupt both.
+            (OpenIntent::Rebind | OpenIntent::Recover { .. }, false) => {
+                tracing::warn!(
+                    old = %previous.as_ref().map_or("<none>", SessionId::as_str),
+                    new = %session_id,
+                    "bind returned a different session id; treating it as a new session"
+                );
+                BindKind::Recreated { previous }
+            }
+            (OpenIntent::Create, _) => match previous {
+                Some(previous) => BindKind::Recreated {
+                    previous: Some(previous),
+                },
+                None => BindKind::Created,
+            },
+        };
+
+        // A new session restarts the progressive at zero and the `LS_subId`
+        // space at 1 [`docs/spec/02-session-lifecycle.md` §9.5].
+        let fresh = matches!(kind, BindKind::Created | BindKind::Recreated { .. });
+        if fresh {
+            self.progressive = 0;
+            self.skip_remaining = 0;
+            self.registry.reset_for_new_session();
+        }
+
+        tracing::info!(session = %session_id, ?kind, ?keep_alive, "session bound");
+        self.emit(SessionEvent::Bound(Box::new(BoundInfo {
+            session_id,
+            kind,
+            keep_alive,
+            request_limit_bytes,
+            control_link,
+        })))
+        .await;
+
+        // On a rebind or a recovery the server preserves every subscription
+        // "with all their items and fields", so re-issuing them would create
+        // duplicates [`docs/spec/02-session-lifecycle.md` §4.4]. Only
+        // subscriptions with no binding in the current session are issued —
+        // which, after a replacement, is all of them.
+        self.issue_unbound_subscriptions().await;
+    }
+
+    /// Handles `END` [`docs/spec/02-session-lifecycle.md` §6.2].
+    fn on_end(&mut self, cause_code: i64, cause_message: String) -> Flow {
+        let cause = ServerCause {
+            code: cause_code,
+            message: cause_message,
+        };
+        if self.destroy_requested {
+            // T7: "If successful, an `END` notification is sent on the stream
+            // connection. After that… the session is terminated"
+            // [`docs/spec/02-session-lifecycle.md` §2.2, T7]. The default code
+            // is 31 [ibid. §10, F5].
+            return Flow::Closed(SessionClosed::ByClient {
+                destroy_confirmed: true,
+                cause: Some(cause),
+            });
+        }
+        // SPEC-AMBIGUITY (A2): "the p.8 diagram has no edge labelled for a
+        // server-initiated `END` on a bound session… The spec does not
+        // reconcile the diagram with the `END` cause codes of Appendix A"
+        // [`docs/spec/02-session-lifecycle.md` §2.2]. It is treated here as an
+        // unlabelled edge out of *Bound*, terminal by default, with the single
+        // documented exception of code 48.
+        match classify(cause_code) {
+            Recovery::RecreateSession => {
+                tracing::info!(code = cause_code, "server asked for a fresh session");
+                self.previous_session = self.session.take();
+                Flow::Unbind(UnbindReason::ServerRefresh { cause })
+            }
+            Recovery::RetryLater => {
+                self.previous_session = self.session.take();
+                Flow::Unbind(UnbindReason::Rejected { cause })
+            }
+            Recovery::Fatal => {
+                tracing::warn!(code = cause_code, "server ended the session");
+                Flow::Closed(SessionClosed::ByServer { cause })
+            }
+        }
+    }
+
+    /// Attributes a `LOOP` to the transition that caused it.
+    ///
+    /// The attribution reads declared transport properties, never a transport
+    /// identity [`docs/adr/0007-transport-port-shape.md`].
+    fn loop_reason(&mut self, expected_delay: Duration) -> UnbindReason {
+        if self.force_rebind_outstanding {
+            self.force_rebind_outstanding = false;
+            // T2 — "If successful, a `LOOP` notification is sent on the stream
+            // connection" [`docs/spec/02-session-lifecycle.md` §2.2, T2].
+            return UnbindReason::ForcedByClient { expected_delay };
+        }
+        if self.properties.is_polling {
+            // T4 — "The polling cycle is complete"
+            // [`docs/spec/02-session-lifecycle.md` §2.2, T4].
+            return UnbindReason::PollCycleExpired { expected_delay };
+        }
+        if self.properties.ends_on_content_length {
+            // T3 — "The `Content-Length` of an HTTP stream connection has been
+            // reached" [`docs/spec/02-session-lifecycle.md` §2.2, T3].
+            return UnbindReason::ContentLengthReached { expected_delay };
+        }
+        UnbindReason::Looped { expected_delay }
+    }
+
+    /// Handles `PROG` [`docs/spec/02-session-lifecycle.md` §5.4].
+    async fn on_prog(&mut self, resumed_at: u64) {
+        let requested = match self.intent {
+            OpenIntent::Recover { requested } => requested,
+            // "sent only when requested via `LS_recovery_from`"
+            // [`docs/spec/02-session-lifecycle.md` §5.4]; an unsolicited one is
+            // still obeyed, since the server is telling us where the flow
+            // starts, but it is worth a warning.
+            _ => {
+                tracing::warn!(resumed_at, "PROG arrived without a recovery request");
+                self.progressive = resumed_at;
+                return;
+            }
+        };
+
+        let kind = match resumed_at.cmp(&requested) {
+            std::cmp::Ordering::Equal => RecoveryKind::Exact,
+
+            // Precondition 4: "the first data notifications received are
+            // discarded, until the desired point is reached"
+            // [`docs/spec/02-session-lifecycle.md` §5.2].
+            std::cmp::Ordering::Less => match requested.checked_sub(resumed_at) {
+                Some(count) => {
+                    self.skip_remaining = count;
+                    RecoveryKind::Duplicated { count }
+                }
+                // Unreachable: the ordering was established by the match.
+                None => RecoveryKind::Exact,
+            },
+
+            // SPEC-AMBIGUITY (A7): see `RecoveryKind::Gap`.
+            std::cmp::Ordering::Greater => match resumed_at.checked_sub(requested) {
+                Some(missing) => {
+                    self.progressive = resumed_at;
+                    tracing::warn!(
+                        requested,
+                        resumed_at,
+                        missing,
+                        "recovery resumed past the requested point"
+                    );
+                    RecoveryKind::Gap { missing }
+                }
+                None => RecoveryKind::Exact,
+            },
+        };
+
+        self.emit(SessionEvent::Recovered(RecoveryOutcome {
+            requested,
+            resumed_at,
+            kind,
+        }))
+        .await;
+    }
+
+    /// Counts, annotates and forwards a data notification
+    /// [`docs/spec/02-session-lifecycle.md` §5.3].
+    async fn on_data(&mut self, notification: Notification) {
+        if self.skip_remaining > 0 {
+            // Guarded by the branch above, so the subtraction cannot wrap.
+            if let Some(remaining) = self.skip_remaining.checked_sub(1) {
+                self.skip_remaining = remaining;
+            }
+            tracing::trace!(
+                remaining = self.skip_remaining,
+                "discarding a duplicate re-delivered by recovery"
+            );
+            return;
+        }
+
+        self.progressive = match self.progressive.checked_add(1) {
+            Some(next) => next,
+            None => {
+                tracing::error!(
+                    "data-notification counter overflowed; recovery is no longer exact"
+                );
+                self.progressive
+            }
+        };
+
+        let subscription = self.apply_subscription_effect(&notification);
+
+        self.emit(SessionEvent::Data {
+            progressive: self.progressive,
+            subscription,
+            notification,
+        })
+        .await;
+    }
+
+    /// Updates the registry from a subscription-bearing notification and
+    /// resolves the caller-facing key for it.
+    fn apply_subscription_effect(
+        &mut self,
+        notification: &Notification,
+    ) -> Option<SubscriptionKey> {
+        let sub_id = match notification {
+            Notification::Update {
+                subscription_id, ..
+            }
+            | Notification::SubscriptionOk {
+                subscription_id, ..
+            }
+            | Notification::SubscriptionCommandOk {
+                subscription_id, ..
+            }
+            | Notification::Unsubscribed { subscription_id }
+            | Notification::EndOfSnapshot {
+                subscription_id, ..
+            }
+            | Notification::ClearSnapshot {
+                subscription_id, ..
+            }
+            | Notification::Overflow {
+                subscription_id, ..
+            }
+            | Notification::SubscriptionReconfigured {
+                subscription_id, ..
+            } => *subscription_id,
+            _ => return None,
+        };
+
+        let key = self.registry.by_sub_id.get(&sub_id).copied()?;
+
+        match notification {
+            // "Real-time updates for the subscription start after this line"
+            // [`docs/spec/04-notifications.md` §3.1].
+            Notification::SubscriptionOk { .. } | Notification::SubscriptionCommandOk { .. } => {
+                if let Some(entry) = self.registry.entries.get_mut(&key) {
+                    entry.state = SubscriptionState::Active;
+                    entry.was_active = true;
+                }
+            }
+            // "After this line no further update for the subscription will be
+            // sent" [`docs/spec/04-notifications.md` §3.4], so the desired set
+            // loses it too — the caller asked for that.
+            Notification::Unsubscribed { .. } => {
+                self.registry.entries.remove(&key);
+                self.registry.by_sub_id.remove(&sub_id);
+            }
+            _ => {}
+        }
+        Some(key)
+    }
+
+    /// Correlates a `REQOK` with the request that caused it
+    /// [`docs/spec/03-requests.md` §13.1].
+    async fn on_request_ok(&mut self, request_id: Option<String>) {
+        let Some(request_id) = request_id else {
+            // The bare `REQOK` that answers an HTTP `heartbeat`, which carries
+            // no `LS_reqId` [`docs/spec/03-requests.md` §14.3].
+            tracing::trace!("heartbeat acknowledged");
+            return;
+        };
+
+        match self.pending.remove(&request_id) {
+            Some(kind) => tracing::debug!(request_id, ?kind, "control request accepted"),
+            // §4.5: "late responses to control requests related with the first
+            // session [may] arrive interspersed with notifications for the
+            // second session". Request ids are never reused, so an unknown one
+            // is a stale response and is reported, not acted on.
+            None => tracing::debug!(request_id, "response to an unknown or stale request"),
+        }
+
+        let outcome = ControlOutcome::Accepted;
+        match RequestId::try_new(request_id.clone()) {
+            Ok(id) => {
+                self.emit(SessionEvent::ControlResponse {
+                    request_id: Some(id),
+                    outcome,
+                })
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "server echoed a request id this client cannot represent");
+                self.emit(SessionEvent::ControlResponse {
+                    request_id: None,
+                    outcome,
+                })
+                .await;
+            }
+        }
+    }
+
+    /// Correlates a `REQERR` and undoes whatever the request had optimistically
+    /// recorded [`docs/spec/03-requests.md` §13.2].
+    async fn on_request_error(&mut self, request_id: String, cause: ServerCause) {
+        if let Some(kind) = self.pending.remove(&request_id) {
+            match kind {
+                // The server refused the subscription. Dropping it from the
+                // desired set is what stops it being re-issued on every future
+                // session — and the caller is told, so nothing is lost
+                // silently.
+                PendingKind::Subscribe(key) => {
+                    if let Some(entry) = self.registry.entries.remove(&key) {
+                        if let Some(sub_id) = entry.wire {
+                            self.registry.by_sub_id.remove(&sub_id.get());
+                        }
+                    }
+                    tracing::warn!(
+                        key = key.get(),
+                        code = cause.code,
+                        "subscription refused by the server"
+                    );
+                }
+                // The delete failed, so the subscription is still there.
+                PendingKind::Unsubscribe(key) => {
+                    if let Some(entry) = self.registry.entries.get_mut(&key) {
+                        entry.state = if entry.was_active {
+                            SubscriptionState::Active
+                        } else {
+                            SubscriptionState::Pending
+                        };
+                    }
+                }
+                PendingKind::Reconfigure(_) => {}
+                // No `LOOP` will follow, so the next one must not be
+                // misattributed to T2.
+                PendingKind::ForceRebind => self.force_rebind_outstanding = false,
+                // No `END` will follow.
+                PendingKind::Destroy => self.destroy_requested = false,
+            }
+        }
+
+        let outcome = ControlOutcome::Rejected { cause };
+        let id = RequestId::try_new(request_id).ok();
+        self.emit(SessionEvent::ControlResponse {
+            request_id: id,
+            outcome,
+        })
+        .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Commands
+    // -----------------------------------------------------------------------
+
+    async fn on_command(&mut self, command: SessionCommand) -> Flow {
+        match command {
+            SessionCommand::Subscribe { key, spec } => {
+                self.registry.entries.insert(
+                    key,
+                    RegistryEntry {
+                        spec: *spec,
+                        wire: None,
+                        state: SubscriptionState::Pending,
+                        was_active: false,
+                    },
+                );
+                if self.stream_state == StreamState::Bound {
+                    self.issue_subscription(key).await;
+                }
+                Flow::Continue
+            }
+
+            SessionCommand::Unsubscribe { key } => {
+                self.unsubscribe(key).await;
+                Flow::Continue
+            }
+
+            SessionCommand::Reconfigure { key, max_frequency } => {
+                self.reconfigure(key, max_frequency).await;
+                Flow::Continue
+            }
+
+            SessionCommand::ForceRebind { close_socket } => {
+                if self.stream_state != StreamState::Bound {
+                    tracing::debug!("force_rebind ignored: no stream connection is bound");
+                    return Flow::Continue;
+                }
+                let Some(session) = self.session.clone() else {
+                    return Flow::Continue;
+                };
+                let request_id = self.next_request_id();
+                // Set before sending: the `LOOP` may well arrive before the
+                // `REQOK` [`docs/spec/02-session-lifecycle.md` §4.5].
+                self.force_rebind_outstanding = true;
+                let request = ForceRebind {
+                    session: Some(session.as_str().to_owned()),
+                    request_id: request_id.clone(),
+                    polling_millis: None,
+                    close_socket,
+                };
+                self.dispatch(&request, request_id, PendingKind::ForceRebind)
+                    .await;
+                Flow::Continue
+            }
+
+            SessionCommand::Destroy { cause } => self.destroy(cause).await,
+
+            SessionCommand::Shutdown => Flow::Closed(SessionClosed::ByClient {
+                destroy_confirmed: false,
+                cause: None,
+            }),
+        }
+    }
+
+    /// T7 while bound, T8 while unbound
+    /// [`docs/spec/02-session-lifecycle.md` §2.2, T7/T8].
+    async fn destroy(&mut self, cause: Option<DestroyCause>) -> Flow {
+        let Some(session) = self.session.clone() else {
+            return Flow::Closed(SessionClosed::ByClient {
+                destroy_confirmed: false,
+                cause: None,
+            });
+        };
+        let request_id = self.next_request_id();
+        self.destroy_requested = true;
+        let request = DestroySession {
+            session: Some(session.as_str().to_owned()),
+            request_id: request_id.clone(),
+            cause,
+            close_socket: None,
+        };
+        let sent = self
+            .dispatch(&request, request_id, PendingKind::Destroy)
+            .await;
+
+        if self.stream_state == StreamState::Bound && sent {
+            // Stay in the pump and wait for the `END` that T7 promises, so the
+            // caller learns the server's cause code.
+            return Flow::Continue;
+        }
+
+        // SPEC-AMBIGUITY (A1): with no stream connection bound "there is
+        // nowhere for the `END` notification… to be delivered; the spec does
+        // not say whether `END` is dropped, buffered, or suppressed in this
+        // case" [`docs/spec/02-session-lifecycle.md` §2.2, T8]. The driver
+        // therefore does not wait for one: the request has been sent, and
+        // waiting for a notification the spec does not promise would hang the
+        // shutdown.
+        Flow::Closed(SessionClosed::ByClient {
+            destroy_confirmed: false,
+            cause: None,
+        })
+    }
+
+    async fn unsubscribe(&mut self, key: SubscriptionKey) {
+        let Some(entry) = self.registry.entries.get_mut(&key) else {
+            tracing::debug!(key = key.get(), "unsubscribe for an unknown subscription");
+            return;
+        };
+        let Some(sub_id) = entry.wire else {
+            // Never issued on this session, so there is nothing to delete: the
+            // caller simply stops wanting it.
+            self.registry.entries.remove(&key);
+            return;
+        };
+        entry.state = SubscriptionState::Removing;
+
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id();
+        let request = Unsubscribe {
+            session: Some(session.as_str().to_owned()),
+            request_id: request_id.clone(),
+            subscription_id: sub_id,
+            // Left at the server's default of `true`: the `REQOK` is what
+            // correlates the response to this request
+            // [`docs/spec/03-requests.md` §7.1].
+            ack: None,
+        };
+        self.dispatch(&request, request_id, PendingKind::Unsubscribe(key))
+            .await;
+    }
+
+    async fn reconfigure(&mut self, key: SubscriptionKey, max_frequency: MaxFrequencyLimit) {
+        let Some(entry) = self.registry.entries.get(&key) else {
+            return;
+        };
+        let Some(sub_id) = entry.wire else {
+            return;
+        };
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id();
+        let request = ReconfigureSubscription {
+            session: Some(session.as_str().to_owned()),
+            request_id: request_id.clone(),
+            subscription_id: sub_id,
+            requested_max_frequency: Some(max_frequency),
+        };
+        self.dispatch(&request, request_id, PendingKind::Reconfigure(key))
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscriptions
+    // -----------------------------------------------------------------------
+
+    /// Issues every subscription that has no binding in the current session.
+    ///
+    /// After a rebind or a recovery that is nothing, because the server
+    /// preserved them all [`docs/spec/02-session-lifecycle.md` §4.4]. After a
+    /// session replacement it is every one of them, which is precisely the
+    /// obligation of §6.1: "re-execute all the subscriptions that were active
+    /// at the moment the previous stream connection terminated".
+    async fn issue_unbound_subscriptions(&mut self) {
+        let keys: Vec<SubscriptionKey> = self
+            .registry
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.wire.is_none() && entry.state != SubscriptionState::Removing)
+            .map(|(key, _)| *key)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+
+        let mut issued = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(entry) = self.issue_subscription(key).await {
+                issued.push(entry);
+            }
+        }
+        if !issued.is_empty() {
+            tracing::info!(count = issued.len(), "subscriptions re-established");
+            self.emit(SessionEvent::Resubscribed(issued)).await;
+        }
+    }
+
+    /// Sends one `add` for a subscription that has no binding yet.
+    async fn issue_subscription(&mut self, key: SubscriptionKey) -> Option<ResubscribedEntry> {
+        let session = self.session.clone()?;
+        let sub_id = self.registry.allocate()?;
+        let entry = self.registry.entries.get_mut(&key)?;
+        entry.wire = Some(sub_id);
+        entry.state = SubscriptionState::Pending;
+        let spec = entry.spec.clone();
+        let previously_active = entry.was_active;
+        self.registry.by_sub_id.insert(sub_id.get(), key);
+
+        let request_id = self.next_request_id();
+        let request = Subscribe {
+            session: Some(session.as_str().to_owned()),
+            request_id: request_id.clone(),
+            subscription_id: sub_id,
+            group: spec.group.clone(),
+            schema: spec.schema.clone(),
+            mode: spec.mode,
+            data_adapter: spec.data_adapter.clone(),
+            selector: spec.selector.clone(),
+            requested_buffer_size: spec.requested_buffer_size,
+            requested_max_frequency: spec.requested_max_frequency.clone(),
+            snapshot: spec.snapshot,
+            // Left at the server's default of `true`: `REQOK` is what
+            // correlates the response to this request
+            // [`docs/spec/03-requests.md` §6.1].
+            ack: None,
+        };
+        self.dispatch(&request, request_id, PendingKind::Subscribe(key))
+            .await;
+
+        Some(ResubscribedEntry {
+            key,
+            subscription_id: sub_id,
+            previously_active,
+            snapshot_requested: spec.wants_snapshot(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Sending
+    // -----------------------------------------------------------------------
+
+    /// The next `LS_reqId`. See the note on
+    /// [`SessionDriver::next_request_id`] for why it never resets.
+    fn next_request_id(&mut self) -> RequestId {
+        let id = RequestId::from_progressive(self.next_request_id);
+        self.next_request_id = self.next_request_id.checked_add(1).unwrap_or(1);
+        id
+    }
+
+    /// Which encoding rules apply to a control request on this transport.
+    ///
+    /// A declared property, not a transport identity: `control_shares_stream`
+    /// is exactly the WebSocket case, where `LS_ack` is meaningful and
+    /// `LS_session` may be defaulted [`docs/spec/03-requests.md` §5.1;
+    /// `docs/adr/0007-transport-port-shape.md`].
+    #[must_use]
+    const fn control_kind(&self) -> TransportKind {
+        if self.properties.control_shares_stream {
+            TransportKind::WebSocket
+        } else {
+            TransportKind::Http
+        }
+    }
+
+    /// Encodes and sends a control request, recording it for correlation.
+    ///
+    /// Returns whether it reached the transport. A failure is surfaced to the
+    /// caller as [`ControlOutcome::NotSent`] rather than swallowed.
+    async fn dispatch<R: TlcpRequest>(
+        &mut self,
+        request: &R,
+        request_id: RequestId,
+        kind: PendingKind,
+    ) -> bool {
+        let parameters = match request.encode_parameters(self.control_kind()) {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                tracing::error!(%error, "cannot encode control request");
+                self.emit(SessionEvent::ControlResponse {
+                    request_id: Some(request_id),
+                    outcome: ControlOutcome::NotSent {
+                        reason: error.to_string(),
+                    },
+                })
+                .await;
+                return false;
+            }
+        };
+
+        self.pending.insert(request_id.as_str().to_owned(), kind);
+        let encoded = EncodedRequest {
+            name: R::NAME,
+            path: R::PATH,
+            parameters,
+        };
+        match self.transport.send_control(encoded).await {
+            Ok(()) => {
+                // "any Control Request has the same effect of a Heartbeat"
+                // [`docs/spec/02-session-lifecycle.md` §8.4].
+                self.liveness.on_outbound(Instant::now());
+                true
+            }
+            Err(error) => {
+                self.pending.remove(request_id.as_str());
+                tracing::warn!(%error, "control request could not be sent");
+                self.emit(SessionEvent::ControlResponse {
+                    request_id: Some(request_id),
+                    outcome: ControlOutcome::NotSent {
+                        reason: error.to_string(),
+                    },
+                })
+                .await;
+                false
+            }
+        }
+    }
+
+    /// Sends the `heartbeat` pseudo-request that keeps the client's
+    /// `LS_inactivity_millis` commitment
+    /// [`docs/spec/02-session-lifecycle.md` §8.4].
+    async fn send_heartbeat(&mut self) {
+        let session = self.session.as_ref().map(|s| s.as_str().to_owned());
+        // `LS_session` "is only needed for the purpose 3 above, whereby the
+        // client declares that it is still listening to the stream connection
+        // for the specified session" — which is the purpose of every heartbeat
+        // this driver sends [`docs/spec/02-session-lifecycle.md` §8.4].
+        let request = Heartbeat { session };
+        let parameters = match request.encode_parameters(self.control_kind()) {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                tracing::warn!(%error, "cannot encode heartbeat");
+                return;
+            }
+        };
+        let encoded = EncodedRequest {
+            name: Heartbeat::NAME,
+            path: Heartbeat::PATH,
+            parameters,
+        };
+        match self.transport.send_control(encoded).await {
+            Ok(()) => self.liveness.on_outbound(Instant::now()),
+            Err(error) => tracing::warn!(%error, "heartbeat could not be sent"),
+        }
+    }
+
+    /// Publishes an event, applying backpressure when the caller is slow.
+    ///
+    /// A closed receiver is not an error: the caller may legitimately stop
+    /// listening, and the driver still has a session to shut down in order.
+    async fn emit(&self, event: SessionEvent) {
+        if self.events.send(event).await.is_err() {
+            tracing::debug!("event receiver dropped; events are no longer delivered");
+        }
+    }
+}
+
+/// Sleeps until an instant, or forever when there is none.
+async fn sleep_until_option(deadline: Option<Instant>) {
+    match deadline {
+        Some(instant) => tokio::time::sleep_until(instant).await,
+        None => std::future::pending().await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::protocol::request::ConnectionMode;
+    use crate::session::backoff::BackoffPolicy;
+    use crate::session::options::{Credentials, SessionOptions};
+
+    // -----------------------------------------------------------------------
+    // A transport that replays a script
+    // -----------------------------------------------------------------------
+    //
+    // This is the whole point of `docs/adr/0007-transport-port-shape.md`: the
+    // port yields one ordered line stream, so the state machine can be driven
+    // through every transition with no socket, no network and no real timer.
+    // Several scripts below are the verbatim transcripts of
+    // `docs/spec/02-session-lifecycle.md` §10.
+
+    /// One thing the mock does when the driver asks for a line.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        /// Yield a line.
+        Line(String),
+        /// Yield a transport failure — transition T5.
+        Fail(&'static str),
+        /// Yield `None`: the stream ended cleanly.
+        End,
+        /// Never yield anything again. Models a wedged connection, which is
+        /// what the keepalive budget exists to detect.
+        Silence,
+        /// Yield nothing until at least this many control requests have been
+        /// sent. Lets a script react to what the driver does.
+        AwaitControls(usize),
+    }
+
+    fn line(text: &str) -> Step {
+        Step::Line(text.to_owned())
+    }
+
+    /// Lines split from a transcript block, blank lines and elisions removed.
+    fn transcript(text: &str) -> Vec<Step> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "[…]")
+            .map(line)
+            .collect()
+    }
+
+    /// What the driver asked the transport to open.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum OpenRecord {
+        Create,
+        Bind {
+            session: Option<String>,
+            recovery_from: Option<u64>,
+        },
+    }
+
+    #[derive(Debug, Default)]
+    struct MockLog {
+        opens: Vec<OpenRecord>,
+        controls: Vec<EncodedRequest>,
+        control_links: Vec<Option<String>>,
+        closes: usize,
+    }
+
+    impl MockLog {
+        fn control_parameters(&self) -> Vec<String> {
+            self.controls
+                .iter()
+                .map(|request| request.parameters.clone())
+                .collect()
+        }
+    }
+
+    struct MockTransport {
+        properties: TransportProperties,
+        scripts: VecDeque<Vec<Step>>,
+        current: VecDeque<Step>,
+        log: Arc<Mutex<MockLog>>,
+    }
+
+    impl MockTransport {
+        fn new(properties: TransportProperties, scripts: Vec<Vec<Step>>) -> Self {
+            Self {
+                properties,
+                scripts: scripts.into(),
+                current: VecDeque::new(),
+                log: Arc::new(Mutex::new(MockLog::default())),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn properties(&self) -> TransportProperties {
+            self.properties
+        }
+
+        fn set_control_link(&mut self, host: Option<&str>) {
+            self.log
+                .lock()
+                .expect("mock log poisoned")
+                .control_links
+                .push(host.map(str::to_owned));
+        }
+
+        async fn open_stream(&mut self, request: StreamOpen) -> Result<(), TransportError> {
+            let record = match request {
+                StreamOpen::Create(_) => OpenRecord::Create,
+                StreamOpen::Bind(bind) => OpenRecord::Bind {
+                    session: bind.session.clone(),
+                    recovery_from: bind.recovery_from,
+                },
+            };
+            self.log
+                .lock()
+                .expect("mock log poisoned")
+                .opens
+                .push(record);
+            self.current = self.scripts.pop_front().unwrap_or_default().into();
+            Ok(())
+        }
+
+        async fn next_line(&mut self) -> Option<Result<String, TransportError>> {
+            loop {
+                let Some(step) = self.current.front().cloned() else {
+                    return std::future::pending().await;
+                };
+                match step {
+                    Step::Line(text) => {
+                        self.current.pop_front();
+                        return Some(Ok(text));
+                    }
+                    Step::Fail(reason) => {
+                        self.current.pop_front();
+                        return Some(Err(TransportError::ConnectionLost {
+                            reason: reason.to_owned(),
+                        }));
+                    }
+                    Step::End => {
+                        self.current.pop_front();
+                        return None;
+                    }
+                    Step::Silence => return std::future::pending().await,
+                    Step::AwaitControls(wanted) => {
+                        let sent = self.log.lock().expect("mock log poisoned").controls.len();
+                        if sent >= wanted {
+                            self.current.pop_front();
+                            continue;
+                        }
+                        return std::future::pending().await;
+                    }
+                }
+            }
+        }
+
+        async fn send_control(&mut self, request: EncodedRequest) -> Result<(), TransportError> {
+            self.log
+                .lock()
+                .expect("mock log poisoned")
+                .controls
+                .push(request);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.log.lock().expect("mock log poisoned").closes += 1;
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Harness
+    // -----------------------------------------------------------------------
+
+    /// WebSocket-shaped properties: control travels on the stream connection,
+    /// the stream has no content-length end, and it does not poll
+    /// [`docs/adr/0007-transport-port-shape.md`].
+    const fn websocket() -> TransportProperties {
+        TransportProperties {
+            control_shares_stream: true,
+            ends_on_content_length: false,
+            is_polling: false,
+        }
+    }
+
+    /// HTTP-streaming-shaped properties: control needs its own connection and
+    /// the stream ends when its content length is reached — transition T3.
+    const fn http_streaming() -> TransportProperties {
+        TransportProperties {
+            control_shares_stream: false,
+            ends_on_content_length: true,
+            is_polling: false,
+        }
+    }
+
+    /// HTTP long-polling properties — transition T4.
+    const fn http_polling() -> TransportProperties {
+        TransportProperties {
+            control_shares_stream: false,
+            ends_on_content_length: false,
+            is_polling: true,
+        }
+    }
+
+    fn options() -> SessionOptions {
+        SessionOptions::default()
+            .with_credentials(Credentials {
+                user: None,
+                password: None,
+                adapter_set: Some("WELCOME".to_owned()),
+            })
+            .with_backoff(BackoffPolicy {
+                initial: Duration::from_millis(10),
+                max: Duration::from_millis(40),
+                max_attempts: NonZeroU32::new(4),
+            })
+    }
+
+    struct Outcome {
+        closed: SessionClosed,
+        events: Vec<SessionEvent>,
+        log: Arc<Mutex<MockLog>>,
+    }
+
+    impl Outcome {
+        fn opens(&self) -> Vec<OpenRecord> {
+            self.log.lock().expect("mock log poisoned").opens.clone()
+        }
+
+        fn controls(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .expect("mock log poisoned")
+                .control_parameters()
+        }
+
+        fn closes(&self) -> usize {
+            self.log.lock().expect("mock log poisoned").closes
+        }
+
+        fn bound(&self) -> Vec<&BoundInfo> {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Bound(info) => Some(info.as_ref()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn unbinds(&self) -> Vec<&UnbindReason> {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Unbound { reason, .. } => Some(reason),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn data(&self) -> Vec<(u64, &Notification)> {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Data {
+                        progressive,
+                        notification,
+                        ..
+                    } => Some((*progressive, notification)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn recoveries(&self) -> Vec<RecoveryOutcome> {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Recovered(outcome) => Some(*outcome),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn resubscribes(&self) -> Vec<&Vec<ResubscribedEntry>> {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Resubscribed(entries) => Some(entries),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Runs a driver over a mock transport to its terminal state, with every
+    /// command pre-queued before the first line is read.
+    async fn drive(
+        properties: TransportProperties,
+        options: SessionOptions,
+        scripts: Vec<Vec<Step>>,
+        commands: Vec<SessionCommand>,
+    ) -> Outcome {
+        let transport = MockTransport::new(properties, scripts);
+        let log = Arc::clone(&transport.log);
+        let (driver, handle, mut events) =
+            connect(transport, options).expect("options must match the transport");
+        for command in commands {
+            handle
+                .commands
+                .send(command)
+                .await
+                .expect("the driver has not started yet");
+        }
+        let closed = driver.run().await;
+        drop(handle);
+
+        let mut collected = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            collected.push(event);
+        }
+        Outcome {
+            closed,
+            events: collected,
+            log,
+        }
+    }
+
+    /// The `END` this suite uses to stop a driver whose scenario does not end
+    /// on its own: "The session was closed on the Server side, via software or
+    /// by the administrator" [`docs/spec/05-error-codes.md` §2, code 32].
+    const SERVER_END: &str = "END,32,session closed on the Server side";
+
+    /// The `CONOK` of the session-creation transcript
+    /// [`docs/spec/02-session-lifecycle.md` §10, F1].
+    const F1_CONOK: &str = "CONOK,S1d7c802482843a26T5626355,50000,5000,*";
+    const F1_SESSION: &str = "S1d7c802482843a26T5626355";
+
+    /// The `CONOK` of the rebinding transcripts
+    /// [`docs/spec/02-session-lifecycle.md` §10, F6/F7].
+    const F6_CONOK: &str = "CONOK,Se939a67a9be2d336T3823582,50000,5000,*";
+    const F6_SESSION: &str = "Se939a67a9be2d336T3823582";
+
+    /// The `CONOK` of the recovery transcript
+    /// [`docs/spec/02-session-lifecycle.md` §10, F8].
+    const F8_CONOK: &str = "CONOK,S22dee113e3f71b1fT4327493,50000,5000,*";
+    const F8_SESSION: &str = "S22dee113e3f71b1fT4327493";
+
+    fn spec() -> SubscriptionSpec {
+        // The Hands On subscription: `LS_group=item2`, the three-field stock
+        // schema, `MERGE` [`docs/spec/02-session-lifecycle.md` §10, F8].
+        let mut spec = SubscriptionSpec::new(
+            "item2",
+            "stock_name time last_price",
+            SubscriptionMode::Merge,
+        );
+        spec.data_adapter = Some("STOCKS".to_owned());
+        spec
+    }
+
+    // -----------------------------------------------------------------------
+    // T1 — initial → Bound, `Session Created`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t1_create_session_binds_and_reports_a_new_session() {
+        // The whole of fixture F1, verbatim
+        // [`docs/spec/02-session-lifecycle.md` §10, F1].
+        let mut script = transcript(
+            "
+            CONOK,S1d7c802482843a26T5626355,50000,5000,*
+            SERVNAME,Lightstreamer HTTP Server
+            CLIENTIP,0:0:0:0:0:0:0:1
+            NOOP,sending placeholder data
+            CONS,unlimited
+            PROBE
+            PROBE
+            PROBE
+            ",
+        );
+        script.push(line(SERVER_END));
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        let bound = outcome.bound();
+        assert_eq!(bound.len(), 1);
+        let info = bound.first().expect("one bind");
+        // T1: "Record session ID, request limit, keep-alive time and control
+        // link" [`docs/spec/02-session-lifecycle.md` §2.2, T1].
+        assert_eq!(info.session_id.as_str(), F1_SESSION);
+        assert_eq!(info.request_limit_bytes, 50_000);
+        assert_eq!(info.keep_alive, Duration::from_millis(5000));
+        // The literal `*` means "no control link configured" [§3.1].
+        assert_eq!(info.control_link, None);
+        assert_eq!(info.kind, BindKind::Created);
+        assert_eq!(outcome.opens(), vec![OpenRecord::Create]);
+        // The transport is closed on the way out, always.
+        assert_eq!(outcome.closes(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t1_head_notifications_are_surfaced_but_not_counted() {
+        // `SERVNAME`, `CLIENTIP` and `CONS` are session-related, not data
+        // notifications [`docs/spec/02-session-lifecycle.md` §5.3]; `NOOP` and
+        // `PROBE` carry nothing at all.
+        let mut script = transcript(
+            "
+            CONOK,S1d7c802482843a26T5626355,50000,5000,*
+            SERVNAME,Lightstreamer HTTP Server
+            CLIENTIP,0:0:0:0:0:0:0:1
+            NOOP,sending placeholder data
+            CONS,unlimited
+            PROBE
+            ",
+        );
+        script.push(line(SERVER_END));
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        let infos = outcome
+            .events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ServerInfo(_)))
+            .count();
+        assert_eq!(infos, 3, "SERVNAME, CLIENTIP and CONS reach the caller");
+        assert!(
+            outcome.data().is_empty(),
+            "none of them is a data notification"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T2 — Bound → Unbound, `Force-Unbound by Client`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t2_force_rebind_unbinds_and_rebinds_the_same_session() {
+        let first = vec![
+            line(F6_CONOK),
+            // Wait for the `force_rebind` control request, then answer as T2
+            // says the server does: "If successful, a `LOOP` notification is
+            // sent on the stream connection"
+            // [`docs/spec/02-session-lifecycle.md` §2.2, T2].
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("LOOP,0"),
+            Step::End,
+        ];
+        let second = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![SessionCommand::ForceRebind {
+                close_socket: Some(true),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.unbinds(),
+            vec![&UnbindReason::ForcedByClient {
+                expected_delay: Duration::ZERO
+            }]
+        );
+        let controls = outcome.controls();
+        assert!(
+            controls
+                .iter()
+                .any(|parameters| parameters.contains("LS_op=force_rebind")
+                    && parameters.contains("LS_close_socket=true")),
+            "{controls:?}"
+        );
+        // T6: the rebind is a plain `bind_session`, with no recovery, because
+        // a `LOOP` is a clean unbind [§4.4].
+        assert_eq!(
+            outcome.opens().get(1),
+            Some(&OpenRecord::Bind {
+                session: Some(F6_SESSION.to_owned()),
+                recovery_from: None,
+            })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T3 — Bound → Unbound, `Content-Length Reached`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t3_content_length_reached_rebinds_on_a_new_connection() {
+        // The tail of F6 and the whole of F7, verbatim
+        // [`docs/spec/02-session-lifecycle.md` §10, F6, F7].
+        let mut first = transcript(
+            "
+            CONOK,Se939a67a9be2d336T3823582,50000,5000,*
+            U,2,1,|15:57:51|16.27
+            U,2,1,||16.24
+            U,2,1,||16.11
+            U,2,1,|15:57:52|15.99
+            U,2,1,||15.93
+            LOOP,0
+            ",
+        );
+        first.push(Step::End);
+
+        let mut second = transcript(
+            "
+            CONOK,Se939a67a9be2d336T3823582,50000,5000,*
+            NOOP,sending placeholder data
+            CONS,unlimited
+            U,2,1,|15:57:53|17.7
+            U,2,1,||17.81
+            ",
+        );
+        second.push(line(SERVER_END));
+
+        let outcome = drive(http_streaming(), options(), vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.unbinds(),
+            vec![&UnbindReason::ContentLengthReached {
+                expected_delay: Duration::ZERO
+            }]
+        );
+        // F7's three test-relevant observations: the session id is identical,
+        // the rebind carries no recovery, and nothing is re-subscribed.
+        let bound = outcome.bound();
+        assert_eq!(bound.len(), 2);
+        assert_eq!(
+            bound.first().map(|info| info.session_id.clone()),
+            bound.get(1).map(|info| info.session_id.clone())
+        );
+        assert_eq!(
+            bound.get(1).map(|info| info.kind.clone()),
+            Some(BindKind::Rebound)
+        );
+        assert!(outcome.resubscribes().is_empty());
+        // The progressive keeps counting across the rebind: five `U` before,
+        // two after.
+        assert_eq!(
+            outcome.data().iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T4 — Bound → Unbound, `Poll Cycle Expired`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t4_poll_cycle_expired_rebinds_after_the_expected_delay() {
+        // "A value greater than 0 is actually used only on polling sessions"
+        // [`docs/spec/02-session-lifecycle.md` §4.2].
+        let first = vec![line(F1_CONOK), line("LOOP,2000"), Step::End];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let polling = options().with_connection(ConnectionMode::Polling {
+            polling_millis: 2000,
+            idle_millis: Some(10_000),
+        });
+        let outcome = drive(http_polling(), polling, vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.unbinds(),
+            vec![&UnbindReason::PollCycleExpired {
+                expected_delay: Duration::from_millis(2000)
+            }]
+        );
+        // The delay `LOOP` asked for is the delay the driver waits, not a
+        // backoff [§4.2].
+        let retry_in = outcome.events.iter().find_map(|event| match event {
+            SessionEvent::Unbound { retry_in, .. } => *retry_in,
+            _ => None,
+        });
+        assert_eq!(retry_in, Some(Duration::from_millis(2000)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t4_polling_stream_ending_without_a_loop_is_still_a_poll_cycle() {
+        // SPEC-AMBIGUITY exercised: §7.1 describes the cycle without naming
+        // `LOOP`, so a clean end on a polling transport is read as T4.
+        let first = vec![line(F1_CONOK), Step::End];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let polling = options().with_connection(ConnectionMode::Polling {
+            polling_millis: 1000,
+            idle_millis: None,
+        });
+        let outcome = drive(http_polling(), polling, vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.unbinds(),
+            vec![&UnbindReason::PollCycleExpired {
+                expected_delay: Duration::ZERO
+            }]
+        );
+        // A poll cycle is not a failure, so the rebind carries no recovery.
+        assert_eq!(
+            outcome.opens().get(1),
+            Some(&OpenRecord::Bind {
+                session: Some(F1_SESSION.to_owned()),
+                recovery_from: None,
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t3_and_t4_are_told_apart_by_declared_properties_only() {
+        // The same `LOOP,0` on two transports whose only difference is a
+        // declared property [`docs/adr/0007-transport-port-shape.md`].
+        let script = || {
+            vec![
+                vec![line(F1_CONOK), line("LOOP,0"), Step::End],
+                vec![line(F1_CONOK), line(SERVER_END)],
+            ]
+        };
+
+        let a = drive(http_streaming(), options(), script(), Vec::new()).await;
+        assert!(matches!(
+            a.unbinds().first(),
+            Some(UnbindReason::ContentLengthReached { .. })
+        ));
+
+        let b = drive(websocket(), options(), script(), Vec::new()).await;
+        assert!(matches!(
+            b.unbinds().first(),
+            Some(UnbindReason::Looped { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // T5 — Bound → Unbound, `Connection Failed`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t5_connection_failed_recovers_from_the_counted_progressive() {
+        // The stream of F8 up to the interruption, verbatim, whose data
+        // notifications the spec counts as 15
+        // [`docs/spec/02-session-lifecycle.md` §10, F8].
+        let mut first = transcript(F8_STREAM);
+        first.push(Step::Fail("connection reset"));
+
+        let second = vec![line(F8_CONOK), line("PROG,15"), line(SERVER_END)];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert!(matches!(
+            outcome.unbinds().first(),
+            Some(UnbindReason::ConnectionFailed { .. })
+        ));
+        // T5's client action: "Attempt **recovery** (`bind_session` +
+        // `LS_recovery_from`), not a plain rebind"
+        // [`docs/spec/02-session-lifecycle.md` §2.2, T5].
+        assert_eq!(
+            outcome.opens().get(1),
+            Some(&OpenRecord::Bind {
+                session: Some(F8_SESSION.to_owned()),
+                recovery_from: Some(15),
+            })
+        );
+        assert_eq!(
+            outcome.recoveries(),
+            vec![RecoveryOutcome {
+                requested: 15,
+                resumed_at: 15,
+                kind: RecoveryKind::Exact,
+            }]
+        );
+        assert_eq!(
+            outcome.bound().get(1).map(|info| info.kind.clone()),
+            Some(BindKind::Recovering {
+                requested_progressive: 15
+            })
+        );
+    }
+
+    /// The stream of F8 up to the manual interruption, verbatim
+    /// [`docs/spec/02-session-lifecycle.md` §10, F8, p.77].
+    const F8_STREAM: &str = "
+        CONOK,S22dee113e3f71b1fT4327493,50000,5000,*
+        SERVNAME,Lightstreamer HTTP Server
+        CLIENTIP,0:0:0:0:0:0:0:1
+        NOOP,sending placeholder data
+        CONS,unlimited
+        PROBE
+        SUBOK,1,1,3
+        CONF,1,unlimited,filtered
+        PROBE
+        U,1,1,Ations Europe|15:55:08|14.81
+        U,1,1,||14.66
+        U,1,1,|15:55:09|14.62
+        U,1,1,||14.71
+        U,1,1,|15:55:10|14.63
+        U,1,1,||14.77
+        U,1,1,|15:55:11|
+        U,1,1,||14.61
+        U,1,1,|15:55:12|14.5
+        U,1,1,|15:55:13|14.64
+        U,1,1,|15:55:14|
+        SYNC,25
+        U,1,1,||14.74
+        U,1,1,||14.66
+        ";
+
+    #[tokio::test(start_paused = true)]
+    async fn test_data_notification_count_matches_the_spec_worked_example() {
+        // "The count should start with the `SUBOK` notification and include the
+        // `CONF` and all the `U` notifications. In our example, the count
+        // yields 15." [`docs/spec/02-session-lifecycle.md` §5.3, §10 F8].
+        let mut script = transcript(F8_STREAM);
+        script.push(line(SERVER_END));
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        let data = outcome.data();
+        assert_eq!(data.len(), 15, "1 SUBOK + 1 CONF + 13 U");
+        assert_eq!(data.last().map(|(p, _)| *p), Some(15));
+        assert!(
+            data.iter()
+                .all(|(_, n)| !matches!(n, Notification::Probe | Notification::Sync { .. })),
+            "PROBE and SYNC are not data notifications"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_recovery_resuming_earlier_discards_the_duplicates() {
+        // The recovery response of F8, verbatim: the server answers `PROG,11`
+        // to a request that asked for a later point, "in order to simulate
+        // notifications already sent by the Server but not received. As a
+        // consequence, a few notifications will be duplicated."
+        // [`docs/spec/02-session-lifecycle.md` §10, F8].
+        let mut first = transcript(F8_STREAM);
+        first.push(Step::Fail("connection reset"));
+
+        let mut second = transcript(
+            "
+            CONOK,S22dee113e3f71b1fT4327493,50000,5000,*
+            NOOP,sending placeholder data
+            CONS,unlimited
+            PROG,11
+            U,1,1,|15:55:13|14.64
+            U,1,1,|15:55:14|
+            U,1,1,||14.74
+            U,1,1,||14.66
+            U,1,1,|15:55:15|17.7
+            U,1,1,||17.81
+            SYNC,5
+            ",
+        );
+        second.push(line(SERVER_END));
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.recoveries(),
+            vec![RecoveryOutcome {
+                requested: 15,
+                resumed_at: 11,
+                kind: RecoveryKind::Duplicated { count: 4 },
+            }]
+        );
+        // Precondition 4: the four duplicates are discarded before the caller
+        // sees them, and counting resumes at 16
+        // [`docs/spec/02-session-lifecycle.md` §5.2].
+        let progressives: Vec<u64> = outcome.data().iter().map(|(p, _)| *p).collect();
+        assert_eq!(progressives.len(), 15 + 2);
+        assert_eq!(progressives.get(15), Some(&16));
+        assert_eq!(progressives.last(), Some(&17));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_recovery_resuming_later_is_reported_as_a_gap() {
+        // SPEC-AMBIGUITY A7: `PROG` higher than requested is undefined. It is
+        // reported rather than hidden, because telling an application that
+        // continuity held when it did not is worse than saying nothing
+        // (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
+        let first = vec![
+            line(F8_CONOK),
+            line("SUBOK,1,1,3"),
+            line("U,1,1,a|b|c"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![
+            line(F8_CONOK),
+            line("PROG,9"),
+            line("U,1,1,d|e|f"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.recoveries(),
+            vec![RecoveryOutcome {
+                requested: 2,
+                resumed_at: 9,
+                kind: RecoveryKind::Gap { missing: 7 },
+            }]
+        );
+        // The counter follows the server, otherwise every later recovery would
+        // ask from the wrong point.
+        assert_eq!(outcome.data().last().map(|(p, _)| *p), Some(10));
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 — Unbound → Bound, `Session Rebound`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t6_rebind_preserves_the_session_and_its_subscriptions() {
+        // "all subscriptions are preserved, with all their items and fields"
+        // [`docs/spec/02-session-lifecycle.md` §4.4], which is why the client
+        // must **not** re-subscribe after a rebind.
+        let first = vec![
+            line(F6_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            line("LOOP,0"),
+            Step::End,
+        ];
+        let second = vec![line(F6_CONOK), line("U,1,1,x|y|z"), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second],
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(1),
+                spec: Box::new(spec()),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.bound().get(1).map(|info| info.kind.clone()),
+            Some(BindKind::Rebound)
+        );
+        let adds = outcome
+            .controls()
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .count();
+        assert_eq!(adds, 1, "the subscription must not be issued twice");
+        assert!(outcome.resubscribes().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // T7 / T8 — `Destroyed by Client`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t7_destroy_while_bound_ends_with_the_servers_cause() {
+        // Fixture F5: `REQOK,3` then `END,31,Destroy invoked by client`
+        // [`docs/spec/02-session-lifecycle.md` §10, F5].
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("END,31,Destroy invoked by client"),
+            Step::End,
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::Destroy { cause: None }],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.closed,
+            SessionClosed::ByClient {
+                destroy_confirmed: true,
+                cause: Some(ServerCause {
+                    code: 31,
+                    message: "Destroy invoked by client".to_owned(),
+                }),
+            }
+        );
+        assert!(
+            outcome
+                .controls()
+                .iter()
+                .any(|parameters| parameters.contains("LS_op=destroy")),
+            "{:?}",
+            outcome.controls()
+        );
+        assert_eq!(outcome.closes(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t8_destroy_while_unbound_ends_without_waiting_for_an_end() {
+        // SPEC-AMBIGUITY A1: with nothing bound there is nowhere for the `END`
+        // of T7 to be delivered, and the spec does not say whether it is
+        // dropped, buffered or suppressed. The driver does not wait for one.
+        let first = vec![line(F1_CONOK), line("LOOP,60000"), Step::End];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first],
+            vec![SessionCommand::Destroy { cause: None }],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.closed,
+            SessionClosed::ByClient {
+                destroy_confirmed: false,
+                cause: None,
+            }
+        );
+        // Exactly one stream connection was ever opened: the destroy landed
+        // during the rebind delay.
+        assert_eq!(outcome.opens(), vec![OpenRecord::Create]);
+    }
+
+    // -----------------------------------------------------------------------
+    // T9 — Unbound → final, `Timed Out`
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_t9_timed_out_session_is_recreated_and_subscriptions_re_executed() {
+        // T9: the unbound session is discarded server-side, "a later
+        // `bind_session` then fails with `CONERR,20`", and the client must
+        // "`create_session` and re-execute all subscriptions"
+        // [`docs/spec/02-session-lifecycle.md` §2.2, T9; §6.1].
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(2),
+            line("REQOK,1"),
+            line("REQOK,2"),
+            line("SUBOK,1,1,3"),
+            line("SUBOK,2,1,3"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line("CONERR,20,Specified session not found"), Step::End];
+        let third = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second, third],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(2),
+                    spec: Box::new(SubscriptionSpec::new(
+                        "item1",
+                        "last_price",
+                        SubscriptionMode::Merge,
+                    )),
+                },
+            ],
+        )
+        .await;
+
+        // The failed bind is retryable, so it produced an unbind, not a close.
+        assert!(matches!(
+            outcome.unbinds().get(1),
+            Some(UnbindReason::Rejected {
+                cause: ServerCause { code: 20, .. }
+            })
+        ));
+        // A brand-new session: continuity is gone and the caller is told so.
+        assert_eq!(
+            outcome.bound().get(1).map(|info| info.kind.clone()),
+            Some(BindKind::Recreated {
+                previous: Some(SessionId::new(F1_SESSION)),
+            })
+        );
+        // Losing a subscription silently is the defect this asserts against.
+        let resubscribed = outcome.resubscribes();
+        let entries = resubscribed.first().expect("a resubscribe batch");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.iter().map(|e| e.key).collect::<Vec<_>>(),
+            vec![SubscriptionKey(1), SubscriptionKey(2)]
+        );
+        // `LS_subId` restarts at 1 in the new session
+        // [`docs/spec/02-session-lifecycle.md` §9.5], while the caller's keys
+        // do not change.
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.subscription_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(entries.iter().all(|e| e.previously_active));
+        // Four `add` requests in total: two per session.
+        let adds = outcome
+            .controls()
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .count();
+        assert_eq!(adds, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-initiated END on a bound session (§2.2 note, ambiguity A2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_server_initiated_end_on_a_bound_session_is_definitive_loss() {
+        // Code 35: "the Metadata Adapter… requested the closure of the current
+        // session upon opening of a new session for the same user"
+        // [`docs/spec/02-session-lifecycle.md` §6.2]. Reconnecting would fight
+        // the other client, so it is fatal.
+        let script = vec![
+            line(F1_CONOK),
+            line("END,35,Another session was opened for this user"),
+            Step::End,
+        ];
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert_eq!(
+            outcome.closed,
+            SessionClosed::ByServer {
+                cause: ServerCause {
+                    code: 35,
+                    message: "Another session was opened for this user".to_owned(),
+                },
+            }
+        );
+        assert_eq!(outcome.opens().len(), 1, "no retry after a fatal cause");
+        assert!(matches!(
+            outcome.events.last(),
+            Some(SessionEvent::Closed(SessionClosed::ByServer { .. }))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_server_end_code_48_recreates_the_session_immediately() {
+        // "the client should recover by opening a new session immediately"
+        // [`docs/spec/02-session-lifecycle.md` §6.2, code 48].
+        let first = vec![
+            line(F1_CONOK),
+            line("END,48,Maximum session duration reached"),
+            Step::End,
+        ];
+        let second = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert!(matches!(
+            outcome.unbinds().first(),
+            Some(UnbindReason::ServerRefresh {
+                cause: ServerCause { code: 48, .. }
+            })
+        ));
+        // Immediately: no backoff delay at all.
+        let retry_in = outcome.events.iter().find_map(|event| match event {
+            SessionEvent::Unbound { retry_in, .. } => *retry_in,
+            _ => None,
+        });
+        assert_eq!(retry_in, Some(Duration::ZERO));
+        assert_eq!(outcome.opens().get(1), Some(&OpenRecord::Create));
+    }
+
+    // -----------------------------------------------------------------------
+    // CONERR: definitive loss versus permitted retry (§6.2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_conerr_authentication_failure_is_definitive_loss() {
+        // Code 1, "User/password check failed" — retrying cannot help
+        // [`docs/spec/05-error-codes.md` §2].
+        let script = vec![line("CONERR,1,User/password check failed"), Step::End];
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert_eq!(
+            outcome.closed,
+            SessionClosed::ByServer {
+                cause: ServerCause {
+                    code: 1,
+                    message: "User/password check failed".to_owned(),
+                },
+            }
+        );
+        assert_eq!(outcome.opens().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_conerr_retry_later_code_is_retried_and_succeeds() {
+        // Codes 5 and 6 both end with "retry later"
+        // [`docs/spec/05-error-codes.md` §5.5].
+        let first = vec![
+            line("CONERR,5,The Server is temporarily overloaded: retry later"),
+            Step::End,
+        ];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert!(matches!(
+            outcome.unbinds().first(),
+            Some(UnbindReason::Rejected {
+                cause: ServerCause { code: 5, .. }
+            })
+        ));
+        assert_eq!(outcome.bound().len(), 1);
+        assert_eq!(outcome.opens().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_conerr_cluster_affinity_code_is_treated_as_permanent() {
+        // SPEC-AMBIGUITY: code 21 matches the description of the permanent
+        // clustering failure, but `docs/spec/05-error-codes.md` §5.3 warns
+        // "the document never states the linkage. Do not assume it."
+        // Retrying a permanent misconfiguration is a reconnect storm, so the
+        // defensive reading stops and hands the caller the code.
+        let script = vec![
+            line("CONERR,21,Session ID not compatible with this Server instance"),
+            Step::End,
+        ];
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert!(matches!(
+            outcome.closed,
+            SessionClosed::ByServer {
+                cause: ServerCause { code: 21, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_covers_every_code_the_spec_prescribes_an_action_for() {
+        // The only codes for which the spec states a client action
+        // [`docs/spec/05-error-codes.md` §5].
+        assert_eq!(classify(4), Recovery::RecreateSession);
+        assert_eq!(classify(20), Recovery::RecreateSession);
+        assert_eq!(classify(48), Recovery::RecreateSession);
+        assert_eq!(classify(5), Recovery::RetryLater);
+        assert_eq!(classify(6), Recovery::RetryLater);
+        assert_eq!(classify(10), Recovery::RetryLater);
+        // Fatal by policy, each documented at its arm.
+        assert_eq!(classify(1), Recovery::Fatal);
+        assert_eq!(classify(21), Recovery::Fatal);
+        assert_eq!(classify(31), Recovery::Fatal);
+        // An unknown positive code, and an adapter-supplied one, are not
+        // retried: the spec says nothing about either.
+        assert_eq!(classify(9999), Recovery::Fatal);
+        assert_eq!(classify(0), Recovery::Fatal);
+        assert_eq!(classify(-7), Recovery::Fatal);
+    }
+
+    // -----------------------------------------------------------------------
+    // Liveness (§8)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_keepalive_expiry_forces_a_rebind_on_a_wedged_connection() {
+        // The failure mode this client exists to prevent: a connection that
+        // never errors and never delivers. `CONOK` negotiates 5000 ms and the
+        // configured slack is 3000 ms [`docs/spec/02-session-lifecycle.md`
+        // §8.1]. Time is paused, so this test advances the virtual clock only.
+        let first = vec![line(F1_CONOK), Step::Silence];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert_eq!(
+            outcome.unbinds(),
+            vec![&UnbindReason::KeepaliveExpired {
+                budget: Duration::from_millis(8000)
+            }]
+        );
+        // §5.1: "if a connection becomes mute, the client can issue a recovery
+        // request" — so it is a recovery, not a plain rebind.
+        assert_eq!(
+            outcome.opens().get(1),
+            Some(&OpenRecord::Bind {
+                session: Some(F1_SESSION.to_owned()),
+                recovery_from: Some(0),
+            })
+        );
+        // §8.1: the wedged connection is "closed and reopened", not merely
+        // abandoned — once for the stall, once on the way out.
+        assert_eq!(outcome.closes(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_open_timeout_abandons_an_unanswered_handshake() {
+        // Nothing at all arrives, not even a `CONOK`. The keepalive budget
+        // cannot apply because it has not been negotiated yet, so the client's
+        // own open timeout is what ends the attempt.
+        let first = vec![Step::Silence];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let outcome = drive(websocket(), options(), vec![first, second], Vec::new()).await;
+
+        assert!(matches!(
+            outcome.unbinds().first(),
+            Some(UnbindReason::ConnectionFailed { .. })
+        ));
+        assert_eq!(outcome.bound().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reverse_heartbeat_is_sent_before_the_inactivity_commitment_expires() {
+        // "If no request is needed, a heartbeat pseudo-request can be sent. If
+        // no request is received for more than this time, the Server can assume
+        // that the client is stuck" [`docs/spec/02-session-lifecycle.md` §8.4].
+        // The commitment is 8000 ms, so a heartbeat is due at 4000 ms — before
+        // the 8000 ms keepalive budget ends the connection.
+        let first = vec![line(F1_CONOK), Step::Silence];
+        let second = vec![line(F1_CONOK), line(SERVER_END)];
+
+        let committed = options().with_connection(ConnectionMode::Streaming {
+            inactivity_millis: Some(8000),
+            keepalive_millis: None,
+            send_sync: None,
+        });
+        let outcome = drive(websocket(), committed, vec![first, second], Vec::new()).await;
+
+        let controls = outcome.controls();
+        assert!(
+            controls
+                .iter()
+                .any(|parameters| parameters.contains("LS_session=")),
+            "the heartbeat declares the session it is listening to: {controls:?}"
+        );
+        assert!(!controls.is_empty(), "a heartbeat must have been sent");
+        // And the stall still fires afterwards, because a heartbeat is an
+        // outbound obligation and says nothing about the inbound one.
+        assert!(matches!(
+            outcome.unbinds().first(),
+            Some(UnbindReason::KeepaliveExpired { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_quiet_but_probing_connection_is_never_declared_stalled() {
+        // `PROBE` is what the server sends "when no other activity has been
+        // sent on the stream connection" [§8.1]; receiving them means the
+        // connection is healthy however little data flows.
+        let mut script = vec![line(F1_CONOK)];
+        for _ in 0..20 {
+            script.push(line("PROBE"));
+        }
+        script.push(line(SERVER_END));
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert!(outcome.unbinds().is_empty());
+        assert!(matches!(outcome.closed, SessionClosed::ByServer { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Control-response correlation (§4.5, ADR-0007)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_control_responses_are_correlated_when_interleaved_with_data() {
+        // "responses may always arrive interspersed with notifications, when
+        // control requests are sent on the stream connection"
+        // [`docs/spec/02-session-lifecycle.md` §4.5]. The request id is the
+        // only thing that correlates them
+        // [`docs/adr/0007-transport-port-shape.md`].
+        let script = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(2),
+            line("U,1,1,a|b|c"),
+            // Out of order on purpose: "responses may arrive out of order"
+            // [`docs/spec/02-session-lifecycle.md` §11.3].
+            line("REQOK,2"),
+            line("U,1,1,d|e|f"),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(2),
+                    spec: Box::new(SubscriptionSpec::new(
+                        "item1",
+                        "last_price",
+                        SubscriptionMode::Merge,
+                    )),
+                },
+            ],
+        )
+        .await;
+
+        let responses: Vec<String> = outcome
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ControlResponse {
+                    request_id: Some(id),
+                    outcome: ControlOutcome::Accepted,
+                } => Some(id.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses, vec!["2".to_owned(), "1".to_owned()]);
+
+        // The `LS_reqId` on the wire is what the response echoed, and the two
+        // subscriptions carry different ids.
+        let controls = outcome.controls();
+        assert_eq!(
+            controls
+                .iter()
+                .filter(|parameters| parameters.contains("LS_reqId=1"))
+                .count(),
+            1,
+            "{controls:?}"
+        );
+        assert_eq!(
+            controls
+                .iter()
+                .filter(|parameters| parameters.contains("LS_reqId=2"))
+                .count(),
+            1,
+            "{controls:?}"
+        );
+        // And the data around them still reached the caller, in order.
+        assert_eq!(outcome.data().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_ids_are_never_reused_across_sessions() {
+        // SPEC-AMBIGUITY A5: "unique within the connection", where
+        // "connection" is undefined. A single monotonic sequence for the life
+        // of the driver satisfies every reading, and makes the late responses
+        // of §4.5 impossible to misattribute.
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line("CONERR,20,Specified session not found"), Step::End];
+        let third = vec![line(F6_CONOK), Step::AwaitControls(2), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second, third],
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(1),
+                spec: Box::new(spec()),
+            }],
+        )
+        .await;
+
+        let controls = outcome.controls();
+        assert_eq!(controls.len(), 2);
+        assert_eq!(
+            controls
+                .iter()
+                .filter(|parameters| parameters.contains("LS_reqId=1"))
+                .count(),
+            1,
+            "{controls:?}"
+        );
+        assert_eq!(
+            controls
+                .iter()
+                .filter(|parameters| parameters.contains("LS_reqId=2"))
+                .count(),
+            1,
+            "{controls:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rejected_subscription_is_reported_and_not_re_issued() {
+        // A subscription the server refuses must not be retried on every future
+        // session — but the caller must be told, because losing one silently is
+        // the defect this guards against.
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQERR,1,23,Bad Field schema name"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line("CONERR,20,Specified session not found"), Step::End];
+        let third = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second, third],
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(1),
+                spec: Box::new(spec()),
+            }],
+        )
+        .await;
+
+        let rejected = outcome.events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::ControlResponse {
+                    outcome: ControlOutcome::Rejected {
+                        cause: ServerCause { code: 23, .. }
+                    },
+                    ..
+                }
+            )
+        });
+        assert!(rejected, "the refusal must reach the caller");
+        let adds = outcome
+            .controls()
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .count();
+        assert_eq!(adds, 1, "a refused subscription is not re-issued");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_uncorrelatable_error_is_surfaced_without_a_request_id() {
+        // `ERROR` "carries no request ID, because the server could not parse
+        // one" [`docs/spec/03-requests.md` §13.2].
+        let script = vec![
+            line(F1_CONOK),
+            line("ERROR,67,Malformed request"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ControlResponse {
+                request_id: None,
+                outcome: ControlOutcome::Rejected {
+                    cause: ServerCause { code: 67, .. }
+                },
+            }
+        )));
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-0005: the caller can tell the outcomes apart
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_adr0005_recovery_and_reestablishment_are_distinguishable() {
+        // Same interruption, two server answers. An application holding derived
+        // state must be able to keep it in one case and discard it in the other
+        // (`docs/adr/0005-recovery-is-visible-in-the-event-stream.md`).
+        let interrupted = || {
+            vec![
+                line(F8_CONOK),
+                line("SUBOK,1,1,3"),
+                Step::Fail("connection reset"),
+            ]
+        };
+
+        let recovered = drive(
+            websocket(),
+            options(),
+            vec![
+                interrupted(),
+                vec![line(F8_CONOK), line("PROG,1"), line(SERVER_END)],
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            recovered.bound().get(1).map(|info| info.kind.clone()),
+            Some(BindKind::Recovering {
+                requested_progressive: 1
+            })
+        );
+        assert_eq!(
+            recovered.recoveries().first().map(|outcome| outcome.kind),
+            Some(RecoveryKind::Exact)
+        );
+
+        let replaced = drive(
+            websocket(),
+            options(),
+            vec![
+                interrupted(),
+                vec![line("CONERR,4,Recovery not possible"), Step::End],
+                vec![line(F1_CONOK), line(SERVER_END)],
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            replaced.bound().get(1).map(|info| info.kind.clone()),
+            Some(BindKind::Recreated {
+                previous: Some(SessionId::new(F8_SESSION)),
+            })
+        );
+        assert!(replaced.recoveries().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_adr0005_snapshot_re_delivery_is_visible_on_resubscribe() {
+        // "a subscription's data restarted from a snapshot, versus resumed
+        // without one" (ADR-0005). The spec says a snapshot is sent only if the
+        // subscription asked for it [`docs/spec/03-requests.md` §6.1], so the
+        // request is what the caller is told about.
+        let mut with_snapshot = spec();
+        with_snapshot.snapshot = Some(Snapshot::On);
+
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line("CONERR,20,Specified session not found"), Step::End];
+        let third = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second, third],
+            vec![SessionCommand::Subscribe {
+                key: SubscriptionKey(1),
+                spec: Box::new(with_snapshot),
+            }],
+        )
+        .await;
+
+        let resubscribed = outcome.resubscribes();
+        let entry = resubscribed
+            .first()
+            .and_then(|entries| entries.first())
+            .expect("one re-subscribed entry");
+        assert!(entry.snapshot_requested);
+        assert!(entry.previously_active);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconnection policy and shutdown
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retries_are_bounded_and_reported_as_definitive_loss() {
+        // An unbounded retry that never surfaces a typed outcome is exactly
+        // what the backoff policy exists to prevent.
+        // The stream never binds: a `CONOK` would reset the budget, which is
+        // what `test_a_successful_bind_resets_the_retry_budget` covers.
+        let failing = || vec![Step::Fail("connection refused")];
+        let options = options().with_backoff(BackoffPolicy {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+            max_attempts: NonZeroU32::new(2),
+        });
+
+        let outcome = drive(
+            websocket(),
+            options,
+            vec![failing(), failing(), failing(), failing()],
+            Vec::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome.closed,
+            SessionClosed::RetriesExhausted { .. }
+        ));
+        // The initial attempt plus two retries.
+        assert_eq!(outcome.opens().len(), 3);
+        // Every failed connection is torn down, and so is the last one.
+        assert_eq!(outcome.closes(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_successful_bind_resets_the_retry_budget() {
+        // Otherwise a long-lived session would eventually exhaust its budget on
+        // unrelated hiccups spread over days.
+        let options = options().with_backoff(BackoffPolicy {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+            max_attempts: NonZeroU32::new(1),
+        });
+        let outcome = drive(
+            websocket(),
+            options,
+            vec![
+                vec![line(F1_CONOK), Step::Fail("blip")],
+                vec![line(F1_CONOK), Step::Fail("blip")],
+                vec![line(F1_CONOK), line(SERVER_END)],
+            ],
+            Vec::new(),
+        )
+        .await;
+
+        assert!(matches!(outcome.closed, SessionClosed::ByServer { .. }));
+        assert_eq!(outcome.bound().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_stops_the_driver_and_closes_the_transport() {
+        let script = vec![line(F1_CONOK), Step::Silence];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![script],
+            vec![SessionCommand::Shutdown],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.closed,
+            SessionClosed::ByClient {
+                destroy_confirmed: false,
+                cause: None,
+            }
+        );
+        assert_eq!(outcome.closes(), 1);
+        assert_eq!(outcome.opens().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dropping_every_handle_stops_the_driver() {
+        let transport = MockTransport::new(websocket(), vec![vec![line(F1_CONOK), Step::Silence]]);
+        let log = Arc::clone(&transport.log);
+        let (driver, handle, _events) =
+            connect(transport, options()).expect("options must match the transport");
+        drop(handle);
+
+        let closed = driver.run().await;
+
+        assert_eq!(
+            closed,
+            SessionClosed::ByClient {
+                destroy_confirmed: false,
+                cause: None,
+            }
+        );
+        assert_eq!(log.lock().expect("mock log poisoned").closes, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration and forward compatibility
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_rejects_a_polling_mismatch_between_options_and_transport() {
+        // `LS_polling` changes the meaning of the `CONOK` keep-alive argument
+        // and forbids `LS_keepalive_millis` [§7.2, §8.4], so the two must agree.
+        let transport = MockTransport::new(http_polling(), Vec::new());
+        let result = connect(transport, options());
+        assert!(matches!(result, Err(SessionError::Configuration { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_unknown_tag_is_surfaced_and_never_fatal() {
+        // "a future server version must not crash an old client". The MPN tags
+        // are the concrete case in v1 [`docs/spec/06-mpn.md`].
+        let script = vec![
+            line(F1_CONOK),
+            line("MPNREG,devid,adapter"),
+            line("U,1,1,a|b"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Unparsed { .. }))
+        );
+        // SPEC-AMBIGUITY A6: an unparsed line is not counted, so the `U` after
+        // it is still progressive 1. Under-counting makes a later recovery ask
+        // from an earlier point, which the protocol handles by re-delivering
+        // duplicates; over-counting would skip data.
+        assert_eq!(outcome.data().first().map(|(p, _)| *p), Some(1));
+        assert!(matches!(outcome.closed, SessionClosed::ByServer { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_control_link_is_handed_to_the_transport() {
+        // "the address… to which every following session rebind and control
+        // request must be sent to" [`docs/spec/02-session-lifecycle.md` §3.1].
+        let script = vec![
+            line("CONOK,S1,50000,5000,push2.example.com:8080"),
+            line(SERVER_END),
+        ];
+
+        let outcome = drive(websocket(), options(), vec![script], Vec::new()).await;
+
+        assert_eq!(
+            outcome.log.lock().expect("mock log poisoned").control_links,
+            vec![Some("push2.example.com:8080".to_owned())]
+        );
+        assert_eq!(
+            outcome
+                .bound()
+                .first()
+                .and_then(|info| info.control_link.clone()),
+            Some("push2.example.com:8080".to_owned())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_unsubscribe_removes_the_subscription_from_the_desired_set() {
+        // After `UNSUB` "no further update for the subscription will be sent"
+        // [`docs/spec/04-notifications.md` §3.4], so it must not come back on
+        // the next session either.
+        let first = vec![
+            line(F1_CONOK),
+            Step::AwaitControls(1),
+            line("REQOK,1"),
+            line("SUBOK,1,1,3"),
+            Step::AwaitControls(2),
+            line("REQOK,2"),
+            line("UNSUB,1"),
+            Step::Fail("connection reset"),
+        ];
+        let second = vec![line("CONERR,20,Specified session not found"), Step::End];
+        let third = vec![line(F6_CONOK), line(SERVER_END)];
+
+        let outcome = drive(
+            websocket(),
+            options(),
+            vec![first, second, third],
+            vec![
+                SessionCommand::Subscribe {
+                    key: SubscriptionKey(1),
+                    spec: Box::new(spec()),
+                },
+                SessionCommand::Unsubscribe {
+                    key: SubscriptionKey(1),
+                },
+            ],
+        )
+        .await;
+
+        let adds = outcome
+            .controls()
+            .iter()
+            .filter(|parameters| parameters.contains("LS_op=add"))
+            .count();
+        assert_eq!(adds, 1, "an unsubscribed item is not re-established");
+        assert!(outcome.resubscribes().is_empty());
+    }
+}

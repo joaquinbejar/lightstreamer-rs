@@ -17,4 +17,8 @@ pub enum Error {
     /// TLCP, or the client was asked to build a request it cannot encode.
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+
+    /// Something went wrong moving bytes — connecting, sending, or receiving.
+    #[error("transport error: {0}")]
+    Transport(#[from] crate::transport::TransportError),
 }

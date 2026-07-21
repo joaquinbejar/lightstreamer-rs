@@ -26,6 +26,9 @@
 pub mod error;
 
 mod protocol;
+mod session;
 mod subscription;
+mod transport;
 
 pub use error::{Error, Result};
+pub use transport::TransportError;
