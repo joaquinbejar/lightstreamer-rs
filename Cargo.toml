@@ -20,7 +20,10 @@ categories = ["network-programming", "api-bindings"]
 # repository that may move.
 # `.git/info/exclude` keeps these out of git, but `cargo package` does not read
 # it, so they have to be named here too or they ship to crates.io.
-exclude = ["/rules", "/.claude", "/.agents", "/.codex", "/.github"]
+# `docs/V1_CODE_REVIEW.md` is a gitignored working document; it is named here
+# too as defence in depth, so a stray `git add -f` could never leak the
+# internal review into a published package.
+exclude = ["/rules", "/.claude", "/.agents", "/.codex", "/.github", "docs/V1_CODE_REVIEW.md"]
 
 [features]
 default = []
