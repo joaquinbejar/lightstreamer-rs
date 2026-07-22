@@ -57,7 +57,7 @@ every wire behaviour.
 
 ```toml
 [dependencies]
-lightstreamer-rs = "1.0.0-alpha.1"
+lightstreamer-rs = "1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures-util = "0.3"   # for StreamExt, to poll the update streams
 ```
@@ -77,7 +77,7 @@ be decoded. Turn it on if your server's adapters emit JSON documents that
 benefit from patch compression:
 
 ```toml
-lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["json-patch"] }
+lightstreamer-rs = { version = "1.0.0", features = ["json-patch"] }
 ```
 
 `test-util` exists because the payloads this crate delivers cannot be built
@@ -92,7 +92,7 @@ Cargo turns it on for your tests and leaves your release build untouched:
 
 ```toml
 [dev-dependencies]
-lightstreamer-rs = { version = "1.0.0-alpha.1", features = ["test-util"] }
+lightstreamer-rs = { version = "1.0.0", features = ["test-util"] }
 ```
 
 <!-- `ignore`, and deliberately: `my_parser` and `my_state_policy` are *your*
@@ -360,12 +360,13 @@ Under active development toward `1.0.0`.
 | HTTP streaming and long polling | implemented, verified against live servers ([ADR-0002](docs/adr/0002-all-three-transports-in-1-0-0.md)) |
 | MPN | out of scope |
 
-Nearly 600 tests, all hermetic — no network, no real timers. The examples are
-the live verification, and all five have been run against real servers.
+Over 600 tests, all hermetic — no network, no real timers. The examples are
+the live verification: all five have been run against real servers, and all
+three transports deliver live data.
 
-`1.0.0-alpha.1` is an alpha for a reason: a repository-wide review is open
-against this tree, and the two missing transports are not the only thing
-between it and a stable release. Treat the API as still moving.
+`1.0.0` is the first stable release. It followed a repository-wide review whose
+findings are all remediated, and the public API is what this version commits
+to under semantic versioning.
 
 ### Development
 

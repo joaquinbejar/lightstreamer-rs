@@ -4,11 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.0
+## 1.0.0 — 2026-07-22
 
-The manifest currently declares `1.0.0-alpha.1`. It becomes `1.0.0` when the
-release gates in `RELEASING.md` are green; until then this section describes
-what `1.0.0` will contain, not what has been published.
+The first stable release, and the first under MIT.
 
 ### Licence
 
