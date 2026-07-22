@@ -60,7 +60,7 @@ transport port}`, with `error` and `config` as leaves — is enforced by
 | §04 §2.2 and Appendix D diff algorithms, and the `LS_supported_diffs` registry they are derived from | `src/protocol/diff.rs` | `protocol-expert` |
 | §04 §2 update decoding: which field a token addresses and whether it may be a diff base | `src/subscription/update.rs` | `protocol-expert` |
 | §04 §2 COMMAND key/command semantics, snapshot classification | `src/subscription/item_update.rs` | `protocol-expert` |
-| §01 ch.6 transport framing (WS subprotocol; HTTP paths/methods) | `src/transport/ws.rs`; `src/transport/http.rs` *(not written)* | `transport-expert` |
+| §01 ch.6 transport framing (WS subprotocol; HTTP paths/methods) | `src/transport/ws.rs`; `src/transport/http.rs` | `transport-expert` |
 | §02 the state machine, rebind/loop, recovery, definitive loss, long polling | `src/session/mod.rs` | `transport-expert` |
 | §02 ch.8 liveness — keepalive, `PROBE`, reverse heartbeat, content-length limits | `src/session/liveness.rs` | `transport-expert` |
 | §03 control operations, subscription id allocation, resubscribe-on-recovery | `src/subscription/manager.rs` | `transport-expert` |
@@ -83,8 +83,8 @@ Transport port, written once the implementation made the choice concrete); see
    and the implementation cannot drift.
 2. **Transport scope for 1.0.0** — [ADR-0002](adr/0002-all-three-transports-in-1-0-0.md).
    WebSocket, HTTP streaming, and long polling all ship, behind one port —
-   whose shape [ADR-0007](adr/0007-transport-port-shape.md) then fixed. Only
-   WebSocket is implemented, so this decision is not yet kept.
+   whose shape [ADR-0007](adr/0007-transport-port-shape.md) then fixed. All
+   three are implemented and verified against a live server.
 3. **The event surface** — [ADR-0003](adr/0003-typed-event-stream-as-delivery-surface.md).
    A typed `Stream` of exhaustively-matchable events; no listener traits.
    Amended 2026-07-21: delivery is bounded and lossless *while the client is
@@ -103,9 +103,10 @@ Transport port, written once the implementation made the choice concrete); see
 ## Implementation order
 
 Derived from the dependency structure above — each milestone is testable before
-the next begins. Steps 1–6 are **written**; step 7 is not. "Written" is not
-"finished": an open repository-wide review records findings against every one
-of them, and its verdict is that the tree is not yet a release candidate.
+the next begins. All seven steps are **written**. "Written" is not "finished":
+a repository-wide review recorded findings against every one of them, all of
+which have been remediated; what remains before a `1.0.0` are the judgement
+gates in `RELEASING.md`, not code.
 
 1. ✅ **`protocol` core** — line format, parsing algorithm, percent-encoding,
    request encoding. Pure, no I/O, fixtures lifted verbatim from §01/§03/§04.
@@ -127,11 +128,13 @@ of them, and its verdict is that the tree is not yet a release candidate.
    (`src/test_util.rs`) belongs to this step: the payloads this crate delivers
    are unconstructible from outside it by design, which would otherwise make a
    consumer's own handling of them untestable.
-7. ⬜ **HTTP streaming and long polling** — the second and third transports
-   against the now-proven port (ADR-0002), each re-running the full lifecycle
-   test suite from step 4. **Not started.** This is the one place where the
-   implementation contradicts an accepted ADR, and `1.0.0` cannot be published
-   until either the transports exist or ADR-0002 is explicitly superseded.
+7. ✅ **HTTP streaming and long polling** — the second and third transports
+   against the now-proven port (ADR-0002), `src/transport/{http,framing}.rs`.
+   A narrow slice of HTTP/1.1 spoken by hand over a TLS stream, adding no HTTP
+   client to the dependency graph. All three transports were verified against
+   the live demo server; the polling establishment budget was corrected there,
+   since a bind poll legitimately withholds its response for the negotiated
+   idle time and the generic open timeout was killing it first.
 
 Steps 1 and 2 were the foundation everything else rests on, and they are the two
 that are entirely testable from this reference alone. They were written first,

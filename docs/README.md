@@ -42,7 +42,7 @@ nobody can find is not governing anything.
 | ADR | Decision | Status |
 |---|---|---|
 | [0001](adr/0001-mit-relicensing-clean-room.md) | MIT relicensing by clean-room rewrite; `legacy-gpl` is inadmissible | Accepted |
-| [0002](adr/0002-all-three-transports-in-1-0-0.md) | WebSocket, HTTP streaming, and long polling all ship in 1.0.0 | Accepted — **not yet met**: only WebSocket is implemented. Keep it or supersede it before publishing `1.0.0` |
+| [0002](adr/0002-all-three-transports-in-1-0-0.md) | WebSocket, HTTP streaming, and long polling all ship in 1.0.0 | Accepted — **met**: all three implemented and verified live |
 | [0003](adr/0003-typed-event-stream-as-delivery-surface.md) | A typed `Stream` is the delivery surface, not listener traits | Accepted; **amended 2026-07-21** — delivery is bounded and lossless *while the client is running*, with an ordered stop as the single exemption |
 | [0004](adr/0004-supported-diffs-derived-from-decoders.md) | `LS_supported_diffs` is derived from the implemented decoders | Accepted |
 | [0005](adr/0005-recovery-is-visible-in-the-event-stream.md) | Recovery and session loss are visible in the event stream | Accepted |

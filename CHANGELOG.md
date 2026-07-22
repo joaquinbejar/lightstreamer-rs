@@ -58,6 +58,10 @@ The most visible differences:
 - The WebSocket transport, behind a `Transport` port shaped so the session
   layer needs no socket to test
   (`docs/adr/0007-transport-port-shape.md`).
+- All three transports behind one port (`docs/adr/0002-all-three-transports-in-1-0-0.md`):
+  WebSocket, HTTP streaming, and HTTP long polling, each verified against a
+  live server. The HTTP transports speak a narrow slice of HTTP/1.1 by hand
+  over a TLS stream and add no HTTP client to the dependency graph.
 - The session state machine: the specification's normative transitions,
   request-id sequencing across reconnects, keepalive and reverse-heartbeat
   liveness, bounded jittered backoff, and resubscribe-on-recovery.
@@ -125,9 +129,10 @@ source should find the two agreeing.
 
 ### Known gaps
 
-- HTTP streaming and HTTP long polling are specified and designed for but not
-  yet implemented; WebSocket is the working transport
-  (`docs/adr/0002-all-three-transports-in-1-0-0.md`).
+- HTTP long polling uses crate-default cycle timings; there is no public
+  surface yet for `LS_polling_millis` / `LS_idle_millis`, so a caller cannot
+  tune the poll cadence. The transport works; the ergonomic knobs are a
+  follow-up.
 - Mobile Push Notifications (MPN) are out of scope (`docs/spec/06-mpn.md`).
 - Points where the specification does not determine behaviour are handled
   defensively and marked `SPEC-AMBIGUITY` in the source, pending empirical

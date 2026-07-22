@@ -357,7 +357,7 @@ Under active development toward `1.0.0`.
 | Session state machine, liveness, recovery | implemented, tested |
 | Subscription state, all four modes | implemented, tested |
 | Public API, config, error taxonomy | implemented |
-| HTTP streaming and long polling | designed, not yet implemented ([ADR-0002](docs/adr/0002-all-three-transports-in-1-0-0.md)) |
+| HTTP streaming and long polling | implemented, verified against live servers ([ADR-0002](docs/adr/0002-all-three-transports-in-1-0-0.md)) |
 | MPN | out of scope |
 
 Nearly 600 tests, all hermetic — no network, no real timers. The examples are
