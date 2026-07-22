@@ -88,15 +88,16 @@ use tokio::time::Instant;
 use crate::config::ClientConfig;
 pub(crate) use crate::protocol::ProtocolError;
 use crate::protocol::request::{
-    BindSession, CreateSession, DestroyCause, DestroySession, ForceRebind, Heartbeat,
-    MaxFrequencyLimit, MessageSend, ReconfigureSubscription, RequestId, Subscribe, TlcpRequest,
-    TransportKind, Unsubscribe,
+    BindSession, ConnectionMode, CreateSession, DestroyCause, DestroySession, ForceRebind,
+    Heartbeat, MaxFrequencyLimit, MessageSend, ReconfigureSubscription, RequestId, Subscribe,
+    TlcpRequest, TransportKind, Unsubscribe,
 };
 use crate::protocol::response::{Notification, parse_line};
 use crate::session::backoff::Backoff;
 use crate::session::liveness::{Liveness, LivenessAction};
 use crate::session::options::SessionOptions;
 use crate::subscription::manager::SubscriptionManager;
+use crate::transport::http::{HttpMode, HttpTransport};
 use crate::transport::ws::WsTransport;
 use crate::transport::{AnyTransport, TransportError};
 
@@ -1574,16 +1575,69 @@ pub(crate) fn connect_configured(
     ),
     crate::error::Error,
 > {
-    let transport = match config.transport() {
+    let choice = config.transport();
+    let address = config.address().as_str().to_owned();
+    let transport = match choice {
         crate::config::Transport::WebSocket => {
-            AnyTransport::WebSocket(WsTransport::try_new(config.address().as_str())?)
+            AnyTransport::WebSocket(WsTransport::try_new(address)?)
+        }
+        crate::config::Transport::HttpStreaming => {
+            AnyTransport::Http(HttpTransport::try_new(address, HttpMode::Streaming)?)
+        }
+        crate::config::Transport::HttpPolling => {
+            AnyTransport::Http(HttpTransport::try_new(address, HttpMode::Polling)?)
         }
     };
-    let options = SessionOptions::from_client_config(config);
+
+    let mut options = SessionOptions::from_client_config(config);
+    if matches!(choice, crate::config::Transport::HttpPolling) {
+        // The session's connection mode must agree with the polling transport's
+        // declared `is_polling`, and `LS_polling` changes the meaning of the
+        // `CONOK` keep-alive while forbidding the streaming liveness parameters
+        // [`docs/spec/02-session-lifecycle.md` §7.2, §8.4]. The public
+        // `ConnectionOptions` exposes no polling knobs yet, so the cycle timings
+        // are this crate's defaults; the keep-alive *hint*, if the caller set
+        // one, becomes the poll's idle time, which is what the `CONOK`
+        // keep-alive reports back for a polling connection
+        // [`docs/spec/02-session-lifecycle.md` §7.2].
+        let idle_millis = match options.connection {
+            ConnectionMode::Streaming {
+                keepalive_millis, ..
+            } => keepalive_millis,
+            ConnectionMode::Polling { idle_millis, .. } => idle_millis,
+        }
+        .unwrap_or(DEFAULT_IDLE_MILLIS);
+        options = options.with_connection(ConnectionMode::Polling {
+            polling_millis: DEFAULT_POLLING_MILLIS,
+            idle_millis: Some(idle_millis),
+        });
+    }
+
     connect(transport, options).map_err(|error| crate::error::Error::Internal {
         reason: error.to_string(),
     })
 }
+
+/// Default `LS_polling_millis` for the HTTP long-polling transport: the
+/// session-keep-alive budget the server allows between poll cycles
+/// [`docs/spec/02-session-lifecycle.md` §7.2].
+///
+/// A choice of this crate — the public [`crate::ConnectionOptions`] exposes no
+/// polling knob yet, so a single sensible default stands in until an ergonomic
+/// surface for it is designed. The server clamps a value it considers too high
+/// and reports the one it used.
+const DEFAULT_POLLING_MILLIS: u64 = 5_000;
+
+/// Default `LS_idle_millis` for the HTTP long-polling transport: how long the
+/// server holds a poll open waiting for a notification when none is ready
+/// [`docs/spec/02-session-lifecycle.md` §7.2].
+///
+/// A choice of this crate, and deliberately **positive**: a synchronous poll
+/// (`idle_millis` of zero) returns at once even when idle, which would spin the
+/// bind/rebind loop against a quiet session. Fifteen seconds holds the
+/// connection open for real-time delivery while a cache-flushing close still
+/// happens promptly when data arrives.
+const DEFAULT_IDLE_MILLIS: u64 = 15_000;
 
 /// Creates a session over `transport`.
 ///
@@ -1750,6 +1804,17 @@ pub(crate) struct SessionDriver<T: Transport> {
     /// Consecutive failures to send the outbound heartbeat.
     heartbeat_failures: u32,
 
+    /// The keep-alive the server last reported in `CONOK`, `None` until the
+    /// first one arrives.
+    ///
+    /// On a **polling** connection this argument is `LS_idle_millis` — how long
+    /// the server may hold the poll open waiting for a notification
+    /// [`docs/spec/02-session-lifecycle.md` §7.2] — so the whole response,
+    /// `CONOK` included, may be withheld for that long. It is kept here so the
+    /// establishment budget of the *next* poll cycle can exceed it; see
+    /// [`SessionDriver::establishment_budget`].
+    negotiated_keep_alive: Option<Duration>,
+
     liveness: Liveness,
     backoff: Backoff,
 }
@@ -1792,9 +1857,48 @@ impl<T: Transport> SessionDriver<T> {
             destroy_requested: false,
             refresh_streak: 0,
             heartbeat_failures: 0,
+            negotiated_keep_alive: None,
             liveness,
             backoff,
         }
+    }
+
+    /// How long to allow for a stream connection to be established and to
+    /// deliver its first line.
+    ///
+    /// For a **streaming** connection this is the caller's
+    /// [`SessionOptions::open_timeout`]: `CONOK` is expected within one round
+    /// trip. For a **polling** connection it is that round-trip budget **plus
+    /// the idle time**, because the server may legitimately withhold the whole
+    /// response — the HTTP head and `CONOK` included — for up to
+    /// `LS_idle_millis` while it waits for a notification
+    /// [`docs/spec/02-session-lifecycle.md` §7.2]. Killing the connection at the
+    /// bare round-trip budget would abort every quiet poll cycle before its
+    /// `CONOK` could arrive.
+    ///
+    /// The idle time used is the one the server **negotiated** in the last
+    /// `CONOK` (which it may have clamped above what was requested), falling back
+    /// to the requested `LS_idle_millis` before the first `CONOK`. Adding it to
+    /// the round-trip budget encodes `budget > idle` structurally, so the two
+    /// cannot silently invert the way a fixed budget against a larger negotiated
+    /// idle did.
+    #[must_use]
+    fn establishment_budget(&self) -> Duration {
+        let ConnectionMode::Polling { idle_millis, .. } = self.options.connection else {
+            return self.options.open_timeout;
+        };
+        // `LS_idle_millis` absent or zero is a synchronous poll that returns at
+        // once, so there is no idle hold to budget for
+        // [`docs/spec/02-session-lifecycle.md` §7.2].
+        let requested = Duration::from_millis(idle_millis.unwrap_or(0));
+        let idle = self
+            .negotiated_keep_alive
+            .unwrap_or(requested)
+            .max(requested);
+        self.options
+            .open_timeout
+            .checked_add(idle)
+            .unwrap_or(Duration::MAX)
     }
 
     /// The session's data-notification count so far — what a recovery bind
@@ -1857,8 +1961,12 @@ impl<T: Transport> SessionDriver<T> {
 
             let flow = match self.open_stream(request).await {
                 Opened::Established => {
+                    // The wait for `CONOK` gets the same budget the open did: on
+                    // a polling connection the server may hold `CONOK` back for
+                    // the idle time even when the head arrived at once
+                    // [`SessionDriver::establishment_budget`].
                     self.liveness
-                        .on_stream_opened(self.options.open_timeout, Instant::now());
+                        .on_stream_opened(self.establishment_budget(), Instant::now());
                     self.pump().await
                 }
                 Opened::Failed { detail } => {
@@ -1940,18 +2048,21 @@ impl<T: Transport> SessionDriver<T> {
         }
     }
 
-    /// Opens the next stream connection under the configured budget.
+    /// Opens the next stream connection under the establishment budget.
     ///
     /// The budget covers the **whole** establishment — name resolution, the
     /// TCP and TLS handshakes, the protocol handshake, and the first write —
-    /// not merely the wait for `CONOK` that follows it. The specification
-    /// defines no such limit; this is the client-side one of
-    /// [`SessionOptions::open_timeout`], and without it a connect that hangs
-    /// below the port hangs the session for as long as the operating system
-    /// allows. The stop lane is honoured throughout, so a client being torn
-    /// down does not wait out a dial to an unreachable host.
+    /// not merely the wait for `CONOK` that follows it. It is
+    /// [`SessionDriver::establishment_budget`]: the caller's
+    /// [`SessionOptions::open_timeout`] for a streaming connection, and that
+    /// plus the idle time for a polling one, whose response the server may
+    /// legitimately withhold until a notification is ready. The specification
+    /// defines no such limit; without it a connect that hangs below the port
+    /// hangs the session for as long as the operating system allows. The stop
+    /// lane is honoured throughout, so a client being torn down does not wait
+    /// out a dial to an unreachable host.
     async fn open_stream(&mut self, request: StreamOpen) -> Opened {
-        let budget = self.options.open_timeout;
+        let budget = self.establishment_budget();
         let transport = &mut self.transport;
         let stop = &mut self.stop;
         tokio::select! {
@@ -2495,6 +2606,10 @@ impl<T: Transport> SessionDriver<T> {
     ) {
         self.stream_state = StreamState::Bound;
         self.liveness.on_bound(keep_alive, Instant::now());
+        // Remember it: on a polling connection this is `LS_idle_millis`, and the
+        // next poll cycle's establishment budget must exceed it
+        // [`SessionDriver::establishment_budget`].
+        self.negotiated_keep_alive = Some(keep_alive);
         self.backoff.reset();
 
         // "upon the first time the 'control link' address is used to open a new
@@ -3795,6 +3910,11 @@ mod tests {
         /// Whether `open_stream` never completes. Models a dial that hangs
         /// below the port — in DNS, in TCP, in TLS, or in the handshake.
         hangs_on_open: bool,
+        /// How long `open_stream` withholds its completion. Models a polling
+        /// server that holds the whole response — the HTTP head and `CONOK`
+        /// included — until a notification is ready or the idle time expires
+        /// [`docs/spec/02-session-lifecycle.md` §7.2].
+        open_delay: Duration,
         log: Arc<Mutex<MockLog>>,
     }
 
@@ -3806,6 +3926,7 @@ mod tests {
                 current: VecDeque::new(),
                 control_failures: 0,
                 hangs_on_open: false,
+                open_delay: Duration::ZERO,
                 log: Arc::new(Mutex::new(MockLog::default())),
             }
         }
@@ -3817,6 +3938,11 @@ mod tests {
 
         const fn hanging_open(mut self) -> Self {
             self.hangs_on_open = true;
+            self
+        }
+
+        const fn with_open_delay(mut self, delay: Duration) -> Self {
+            self.open_delay = delay;
             self
         }
     }
@@ -3849,6 +3975,9 @@ mod tests {
                 .push(record);
             if self.hangs_on_open {
                 return std::future::pending().await;
+            }
+            if !self.open_delay.is_zero() {
+                tokio::time::sleep(self.open_delay).await;
             }
             self.current = self.scripts.pop_front().unwrap_or_default().into();
             Ok(())
@@ -4397,6 +4526,60 @@ mod tests {
                 session: Some(F1_SESSION.to_owned()),
                 recovery_from: None,
             })
+        );
+    }
+
+    /// Regression: a polling connection whose response is withheld for the idle
+    /// time — longer than the bare open timeout — must still bind. The
+    /// establishment budget on a polling transport is the open timeout **plus**
+    /// the idle time [`SessionDriver::establishment_budget`;
+    /// `docs/spec/02-session-lifecycle.md` §7.2], so a quiet poll cycle is not
+    /// aborted before its `CONOK` can arrive.
+    ///
+    /// Before the fix this looped forever with `ConnectionFailed { "…not
+    /// established within 10s" }` and delivered nothing, which the hermetic T4
+    /// test above could not catch because it modelled no server-side delay.
+    #[tokio::test(start_paused = true)]
+    async fn test_polling_establishment_budget_covers_a_withheld_response() {
+        // Idle 15s, open timeout the default 10s: a bare-open-timeout budget
+        // would kill the connection at 10s. The server withholds every response
+        // for 13s (10s < 13s < 10s + 15s), so it binds only if the idle time is
+        // in the budget. The `CONOK` reports the negotiated idle as 15000 ms.
+        let conok = "CONOK,S1,50000,15000,*";
+        let first = vec![line(conok), Step::End];
+        let second = vec![line(conok), line(SERVER_END)];
+
+        let polling = options().with_connection(ConnectionMode::Polling {
+            polling_millis: 5000,
+            idle_millis: Some(15_000),
+        });
+        assert_eq!(
+            polling.open_timeout,
+            Duration::from_secs(10),
+            "the fixture relies on the default 10s open timeout"
+        );
+
+        let transport = MockTransport::new(http_polling(), vec![first, second])
+            .with_open_delay(Duration::from_secs(13));
+        let outcome = drive_transport(transport, polling, Vec::new()).await;
+
+        // It bound on the create poll and again on the rebind poll — the
+        // withheld response was waited out both times, not aborted.
+        assert_eq!(outcome.bound().len(), 2, "both poll cycles bound");
+        assert!(
+            !outcome
+                .unbinds()
+                .iter()
+                .any(|reason| matches!(reason, UnbindReason::ConnectionFailed { .. })),
+            "no cycle was aborted as a failed establishment: {:?}",
+            outcome.unbinds()
+        );
+        // The only unbind between the two binds is the poll cycle itself.
+        assert_eq!(
+            outcome.unbinds(),
+            vec![&UnbindReason::PollCycleExpired {
+                expected_delay: Duration::ZERO
+            }]
         );
     }
 

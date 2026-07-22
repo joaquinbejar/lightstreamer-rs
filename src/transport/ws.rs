@@ -34,8 +34,6 @@
 //! counts. Connection targets are passed through [`redact`] first, so
 //! userinfo in a configured address cannot reach a log line either.
 
-use std::collections::VecDeque;
-
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -48,6 +46,7 @@ use tokio_tungstenite::{
     },
 };
 
+use super::framing::{CONTROL_LINK_SAME, LineBuffer, SCHEME_SEPARATOR, redact};
 use super::{EncodedRequest, StreamOpen, Transport, TransportError, TransportProperties};
 use crate::protocol::request::{TlcpRequest as _, WsOk, encode_ws_batch};
 
@@ -66,13 +65,6 @@ const STREAM_PATH: &str = "/lightstreamer";
 /// `LS_protocol` parameter of its own (§6.2, flagged ambiguity).
 const SUBPROTOCOL: &str = "TLCP-2.5.0.lightstreamer.com";
 
-/// The `<control-link>` value meaning "keep using the address this stream
-/// connection was opened to" [`docs/spec/02-session-lifecycle.md` §3.1].
-const CONTROL_LINK_SAME: &str = "*";
-
-/// The scheme prefix separator of an absolute URL.
-const SCHEME_SEPARATOR: &str = "://";
-
 /// The largest WebSocket message this transport will accept, in bytes.
 ///
 /// The specification sets no limit on a notification's length, and a server
@@ -81,152 +73,10 @@ const SCHEME_SEPARATOR: &str = "://";
 /// above anything TLCP produces — `LS_content_length` bounds a whole stream
 /// connection, not one message, and a single update line carries one item's
 /// fields [`docs/spec/04-notifications.md` §3.2] — so it is a defence against
-/// a hostile or broken peer rather than a protocol limit.
-const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
-
-/// The largest run of bytes this transport will hold waiting for a line
-/// terminator, in bytes.
-///
-/// Distinct from [`MAX_MESSAGE_BYTES`] because a fragment may legitimately
-/// straddle messages: it is the total held across them, not within one. Every
-/// line is CR-LF terminated [`docs/spec/01-foundations.md` §7.1], so a
-/// fragment this long is not one this client will ever be able to complete.
-const MAX_PARTIAL_LINE_BYTES: usize = MAX_MESSAGE_BYTES;
-
-// ---------------------------------------------------------------------------
-// Line reassembly
-// ---------------------------------------------------------------------------
-
-/// Turns a sequence of WS text messages into a sequence of TLCP lines.
-///
-/// Two facts force this to be a buffer rather than a `split`:
-///
-/// - a single text message may carry **several** lines — the spec says a
-///   session creation or binding response is "a WS text message, **or a
-///   sequence of them**" and each line is CR-LF terminated
-///   [`docs/spec/01-foundations.md` §6.2.5, §7.1], so `CONOK`, `SERVNAME`,
-///   `CLIENTIP` and `CONS` may all arrive in one message;
-/// - the spec never promises that a message boundary falls *on* a line
-///   boundary, so a line may in principle straddle two messages.
-///
-/// A trailing fragment with no terminator is therefore held back until the
-/// rest of it arrives, and discarded if the connection ends before it does
-/// (see [`LineBuffer::discard_partial`]).
-///
-/// # Bounded by construction
-///
-/// Everything a peer controls here is capped. The fragment held across
-/// messages cannot exceed [`MAX_PARTIAL_LINE_BYTES`], so a server that sends
-/// bytes and never a terminator is refused rather than allowed to allocate
-/// until the process dies. Scanning is linear in the bytes received, not
-/// quadratic: each message is scanned once from where the previous scan
-/// stopped, and the buffer is compacted once per message rather than once per
-/// line.
-//
-// SPEC-AMBIGUITY: `docs/spec/01-foundations.md` §6.2.5 states that a
-// creation/binding response may span a sequence of text messages but does not
-// say whether a *line* may span two of them. Holding an unterminated fragment
-// is the defensive reading: emitting it immediately would hand a truncated
-// line to the parser if the split is real, whereas holding it merely defers a
-// line that §7.1 says must be CR-LF terminated anyway.
-#[derive(Debug, Default)]
-struct LineBuffer {
-    /// Bytes received after the last line terminator.
-    partial: String,
-    /// How much of `partial` has already been searched for a terminator.
-    /// Prevents rescanning a long fragment once per message.
-    scanned: usize,
-    /// Complete lines, terminator already stripped, in arrival order.
-    ready: VecDeque<String>,
-}
-
-impl LineBuffer {
-    /// Absorbs the payload of one WS text message.
-    ///
-    /// Splits on `LF` and strips a preceding `CR`. The line terminator is
-    /// CR-LF [`docs/spec/01-foundations.md` §7.1], but that section flags that
-    /// the spec never says whether a receiver must reject a bare LF; tolerating
-    /// one costs nothing and cannot corrupt a well-formed line.
-    ///
-    /// # Errors
-    ///
-    /// [`TransportError::Capacity`] if the peer has sent more than
-    /// [`MAX_PARTIAL_LINE_BYTES`] with no terminator between them. The buffer
-    /// is left cleared: there is nothing recoverable in a line that long.
-    //
-    // SPEC-AMBIGUITY: `docs/spec/01-foundations.md` §7.1 mandates CR-LF but
-    // leaves "reject or tolerate a bare LF/CR" open. This accepts bare LF.
-    //
-    // SPEC-AMBIGUITY: empty lines are dropped rather than yielded. A line is
-    // `<tag>,<argument1>,...` with a non-empty uppercase tag
-    // [`docs/spec/01-foundations.md` §7.1], so an empty line cannot be one;
-    // yielding it would push a guaranteed parse failure up to the session
-    // layer. Dropping is framing, not interpretation.
-    fn push_message(&mut self, text: &str) -> Result<(), TransportError> {
-        self.partial.push_str(text);
-
-        // One pass over the bytes that have not been looked at yet, and one
-        // compaction at the end. Draining the front per line would rewrite the
-        // whole buffer once per line, which is quadratic in a message carrying
-        // many of them.
-        let mut consumed = 0;
-        let mut cursor = self.scanned;
-        while let Some(offset) = self.partial.get(cursor..).and_then(|rest| rest.find('\n')) {
-            let end = cursor.saturating_add(offset);
-            let raw = self.partial.get(consumed..end).unwrap_or_default();
-            let line = raw.strip_suffix('\r').unwrap_or(raw);
-            if !line.is_empty() {
-                self.ready.push_back(line.to_owned());
-            }
-            consumed = end.saturating_add(1);
-            cursor = consumed;
-        }
-        if consumed > 0 {
-            self.partial.drain(..consumed);
-        }
-        self.scanned = self.partial.len();
-
-        if self.partial.len() > MAX_PARTIAL_LINE_BYTES {
-            let held = self.partial.len();
-            self.clear();
-            return Err(TransportError::Capacity {
-                limit_bytes: MAX_PARTIAL_LINE_BYTES,
-                reason: format!("{held} bytes were received with no line terminator"),
-            });
-        }
-        Ok(())
-    }
-
-    /// Removes and returns the oldest complete line, if any.
-    fn pop_line(&mut self) -> Option<String> {
-        self.ready.pop_front()
-    }
-
-    /// Discards a held-back unterminated fragment, reporting whether there was
-    /// one.
-    ///
-    /// Every line "is terminated by CR-LF" [`docs/spec/01-foundations.md`
-    /// §7.1], and the specification states no exception for the last line
-    /// before a close — not for a clean close and not for an abrupt one. A
-    /// fragment left over when the connection ends is therefore a truncated
-    /// line, and promoting it to a notification would mean parsing something
-    /// the wire contract says cannot occur. It is reported instead, so the
-    /// session layer treats the connection as failed and recovers from the
-    /// progressive it has, rather than acting on half a line.
-    fn discard_partial(&mut self) -> Option<usize> {
-        let held = self.partial.len();
-        self.partial.clear();
-        self.scanned = 0;
-        (held > 0).then_some(held)
-    }
-
-    /// Discards everything buffered.
-    fn clear(&mut self) {
-        self.partial.clear();
-        self.scanned = 0;
-        self.ready.clear();
-    }
-}
+/// a hostile or broken peer rather than a protocol limit. It matches
+/// [`super::framing::MAX_LINE_BYTES`], the ceiling the shared [`LineBuffer`]
+/// enforces on a fragment held across messages.
+const MAX_MESSAGE_BYTES: usize = super::framing::MAX_LINE_BYTES;
 
 // ---------------------------------------------------------------------------
 // Message classification
@@ -328,26 +178,6 @@ fn connect_error(target: &str, reason: impl Into<String>) -> TransportError {
             std::io::ErrorKind::InvalidInput,
             reason.into(),
         )),
-    }
-}
-
-/// Removes any `userinfo@` component from a URL.
-///
-/// A configured address of the form `wss://user:secret@host` would otherwise
-/// carry a credential into every connect log line and every connect error.
-#[must_use]
-fn redact(uri: &str) -> String {
-    let Some((scheme, rest)) = uri.split_once(SCHEME_SEPARATOR) else {
-        return uri.to_owned();
-    };
-    // Userinfo, if present, precedes the first `@`, which itself precedes the
-    // first `/` of the path.
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = rest.get(..authority_end).unwrap_or(rest);
-    let path = rest.get(authority_end..).unwrap_or("");
-    match authority.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}{SCHEME_SEPARATOR}***@{host}{path}"),
-        None => uri.to_owned(),
     }
 }
 
@@ -769,7 +599,11 @@ impl Transport for WsTransport {
     async fn next_line(&mut self) -> Option<Result<String, TransportError>> {
         loop {
             if let Some(line) = self.buffer.pop_line() {
-                return Some(Ok(line));
+                // `pop_line` decodes lazily and so is fallible now; a WS text
+                // frame is already validated UTF-8 by `tungstenite`, so this
+                // arm only ever carries `Ok` here — but it is forwarded as-is
+                // rather than unwrapped, to keep the buffer's contract honest.
+                return Some(line);
             }
             // Complete lines first, then the complaint about the incomplete
             // one, then the end of the stream.
@@ -869,7 +703,7 @@ impl Transport for WsTransport {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     // `tungstenite`'s server handshake callback returns its own large
     // `ErrorResponse` type; the shape is not ours to change.
     #![allow(clippy::result_large_err)]
@@ -883,164 +717,17 @@ mod tests {
         tungstenite::handshake::server::{Request as ServerRequest, Response as ServerResponse},
     };
 
-    // -- line reassembly ----------------------------------------------------
-
-    /// Absorbs a message that is expected to stay within every limit.
-    fn push(buffer: &mut LineBuffer, text: &str) {
-        assert!(
-            buffer.push_message(text).is_ok(),
-            "the message is well within the configured limits"
-        );
-    }
-
-    #[test]
-    fn test_line_buffer_single_line_yields_that_line() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "WSOK\r\n");
-        assert_eq!(buffer.pop_line().as_deref(), Some("WSOK"));
-        assert_eq!(buffer.pop_line(), None);
-    }
-
-    /// The load-bearing case: a creation response arrives as one text message
-    /// carrying `CONOK` plus its head notifications
-    /// [`docs/spec/02-session-lifecycle.md` §3.1].
-    #[test]
-    fn test_line_buffer_multi_line_message_yields_every_line_in_order() {
-        let mut buffer = LineBuffer::default();
-        push(
-            &mut buffer,
-            "CONOK,S1aa6c792585db57aT1726545,50000,5000,*\r\n\
-             SERVNAME,Lightstreamer HTTP Server\r\n\
-             CLIENTIP,127.0.0.1\r\n\
-             CONS,unlimited\r\n",
-        );
-        assert_eq!(
-            buffer.pop_line().as_deref(),
-            Some("CONOK,S1aa6c792585db57aT1726545,50000,5000,*")
-        );
-        assert_eq!(
-            buffer.pop_line().as_deref(),
-            Some("SERVNAME,Lightstreamer HTTP Server")
-        );
-        assert_eq!(buffer.pop_line().as_deref(), Some("CLIENTIP,127.0.0.1"));
-        assert_eq!(buffer.pop_line().as_deref(), Some("CONS,unlimited"));
-        assert_eq!(buffer.pop_line(), None);
-    }
-
-    #[test]
-    fn test_line_buffer_line_split_across_messages_is_reassembled() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "U,1,1,20.4");
-        assert_eq!(buffer.pop_line(), None, "no terminator yet");
-        push(&mut buffer, "2|EUR\r\nU,1,2,");
-        assert_eq!(buffer.pop_line().as_deref(), Some("U,1,1,20.42|EUR"));
-        assert_eq!(buffer.pop_line(), None);
-        push(&mut buffer, "3\r\n");
-        assert_eq!(buffer.pop_line().as_deref(), Some("U,1,2,3"));
-    }
-
-    #[test]
-    fn test_line_buffer_bare_lf_is_tolerated() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "PROBE\nLOOP,0\r\n");
-        assert_eq!(buffer.pop_line().as_deref(), Some("PROBE"));
-        assert_eq!(buffer.pop_line().as_deref(), Some("LOOP,0"));
-    }
-
-    #[test]
-    fn test_line_buffer_empty_lines_are_dropped() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "\r\n\r\nEND,31,bye\r\n\r\n");
-        assert_eq!(buffer.pop_line().as_deref(), Some("END,31,bye"));
-        assert_eq!(buffer.pop_line(), None);
-    }
-
-    #[test]
-    fn test_line_buffer_terminated_message_leaves_no_partial() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "SYNC,12\r\n");
-        assert_eq!(buffer.pop_line().as_deref(), Some("SYNC,12"));
-        assert_eq!(buffer.discard_partial(), None);
-    }
-
-    /// C-15. Every line "is terminated by CR-LF"
-    /// [`docs/spec/01-foundations.md` §7.1] and the specification states no
-    /// exception for the last one before a close. An unterminated tail is
-    /// therefore a truncated line, not a notification.
-    #[test]
-    fn test_line_buffer_unterminated_tail_is_discarded_not_promoted() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "LOOP,0");
-        assert_eq!(buffer.pop_line(), None);
-        assert_eq!(buffer.discard_partial(), Some("LOOP,0".len()));
-        assert_eq!(buffer.discard_partial(), None);
-        assert_eq!(
-            buffer.pop_line(),
-            None,
-            "the fragment must not become a line"
-        );
-    }
-
-    /// C-14. A peer that sends bytes and never a terminator is refused rather
-    /// than allowed to make this client allocate without limit.
-    #[test]
-    fn test_line_buffer_refuses_an_unterminated_fragment_past_its_limit() {
-        let mut buffer = LineBuffer::default();
-        let chunk = "x".repeat(1024 * 1024);
-        let mut outcome = Ok(());
-        // Comfortably past the ceiling, in messages that are each acceptable.
-        for _ in 0..=(MAX_PARTIAL_LINE_BYTES / chunk.len()) {
-            outcome = buffer.push_message(&chunk);
-            if outcome.is_err() {
-                break;
-            }
-        }
-        match outcome {
-            Err(TransportError::Capacity { limit_bytes, .. }) => {
-                assert_eq!(limit_bytes, MAX_PARTIAL_LINE_BYTES);
-            }
-            other => panic!("expected a capacity refusal, got {other:?}"),
-        }
-        // Nothing is retained: there is no usable line in what was refused.
-        assert_eq!(buffer.pop_line(), None);
-        assert_eq!(buffer.discard_partial(), None);
-    }
-
-    /// C-14. Many small fragments must stay linear: the buffer is compacted
-    /// once per message, not once per line.
-    #[test]
-    fn test_line_buffer_handles_many_lines_in_one_message() {
-        let mut buffer = LineBuffer::default();
-        let message: String = (0..10_000)
-            .map(|index| format!("PROBE,{index}\r\n"))
-            .collect();
-        push(&mut buffer, &message);
-        for index in 0..10_000 {
-            assert_eq!(buffer.pop_line(), Some(format!("PROBE,{index}")));
-        }
-        assert_eq!(buffer.pop_line(), None);
-        assert_eq!(buffer.discard_partial(), None);
-    }
-
-    /// A line's payload is not touched: commas and percent escapes are the
-    /// parser's business [`docs/spec/01-foundations.md` §7.1, §7.2].
-    #[test]
-    fn test_line_buffer_preserves_line_payload_verbatim() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "U,3,1,a%2Cb|#|^Pxyz\r\n");
-        assert_eq!(buffer.pop_line().as_deref(), Some("U,3,1,a%2Cb|#|^Pxyz"));
-    }
-
-    #[test]
-    fn test_line_buffer_clear_discards_everything() {
-        let mut buffer = LineBuffer::default();
-        push(&mut buffer, "CONOK,S1,50000,5000,*\r\nSERVNAME");
-        buffer.clear();
-        assert_eq!(buffer.pop_line(), None);
-        assert_eq!(buffer.discard_partial(), None);
-    }
-
     // -- message classification --------------------------------------------
+    //
+    // The line-reassembly unit tests live beside [`LineBuffer`] itself, in
+    // `super::super::framing`, now that the buffer is shared with the HTTP
+    // transport. What is tested here is only this module's own `receive`.
+
+    /// The next buffered line, asserting it decoded — a WS text frame is always
+    /// validated UTF-8, so this never trips.
+    fn line(buffer: &mut LineBuffer) -> Option<String> {
+        buffer.pop_line().map(|result| result.expect("valid UTF-8"))
+    }
 
     #[test]
     fn test_receive_text_buffers_its_lines() {
@@ -1050,8 +737,8 @@ mod tests {
             Message::text("WSOK\r\nCONOK,S1,50000,5000,*\r\n"),
         );
         assert!(matches!(outcome, Ok(Reception::Buffered)));
-        assert_eq!(buffer.pop_line().as_deref(), Some("WSOK"));
-        assert_eq!(buffer.pop_line().as_deref(), Some("CONOK,S1,50000,5000,*"));
+        assert_eq!(line(&mut buffer).as_deref(), Some("WSOK"));
+        assert_eq!(line(&mut buffer).as_deref(), Some("CONOK,S1,50000,5000,*"));
     }
 
     #[test]
@@ -1075,7 +762,7 @@ mod tests {
             receive(&mut buffer, Message::Pong(Vec::new().into())),
             Ok(Reception::Ignored)
         ));
-        assert_eq!(buffer.pop_line(), None);
+        assert!(buffer.pop_line().is_none());
     }
 
     #[test]
@@ -1228,21 +915,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_redact_removes_userinfo() {
-        assert_eq!(
-            redact("wss://user:secret@push.example.com/lightstreamer"),
-            "wss://***@push.example.com/lightstreamer"
-        );
-    }
-
-    #[test]
-    fn test_redact_leaves_a_plain_address_alone() {
-        assert_eq!(
-            redact("wss://push.example.com/lightstreamer"),
-            "wss://push.example.com/lightstreamer"
-        );
-    }
+    // `redact` is unit-tested beside its definition in `super::super::framing`.
 
     // -- transport surface --------------------------------------------------
 

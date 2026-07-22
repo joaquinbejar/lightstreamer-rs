@@ -395,8 +395,9 @@ impl ClientConfigBuilder {
 
     /// Forces a particular transport.
     ///
-    /// Defaults to [`Transport::WebSocket`], which is the only one this
-    /// release implements.
+    /// Defaults to [`Transport::WebSocket`]. The two HTTP variants —
+    /// [`Transport::HttpStreaming`] and [`Transport::HttpPolling`] — are also
+    /// implemented, for a network path that mangles WebSocket upgrades.
     #[must_use = "builders do nothing unless .build() is called"]
     pub const fn with_transport(mut self, transport: Transport) -> Self {
         self.transport = transport;

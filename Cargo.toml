@@ -41,6 +41,14 @@ tokio = { version = "1.53", features = ["rt", "sync", "time", "macros", "net", "
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing = "0.1"
+# The HTTP transports (ADR-0002) speak a narrow slice of HTTP/1.1 by hand over
+# a TLS stream, rather than pulling in an HTTP client. Every crate below is
+# already in the graph transitively via `tokio-tungstenite`, so naming them
+# here adds nothing to the published dependency set — it only makes the reuse
+# explicit and version-pinned.
+httparse = "1.10"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 serde_json = { version = "1.0", optional = true }
 json-patch = { version = "4.2", optional = true }
 

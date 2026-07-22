@@ -597,9 +597,10 @@ mod tests {
     #[test]
     fn test_apply_tlcp_diff_counts_characters_not_bytes() -> Result<(), ProtocolError> {
         // Base of five characters, ten UTF-8 bytes. The diff is
-        // COPY(2) ADD(1,"ñ") DEL(1) COPY(2) = `c` `b`+`ñ` `b` `c`.
-        // Appendix D counts characters [p.98]; a byte-indexed decoder would cut
-        // this base in the middle of a code point.
+        // COPY(2) ADD(1, U+00F1) DEL(1) COPY(2), inserting a two-byte code
+        // point (see the payload below). Appendix D counts characters [p.98];
+        // a byte-indexed decoder would cut this base in the middle of a code
+        // point.
         let base = "áéíóú";
         assert_eq!(base.len(), 10);
         assert_eq!(base.chars().count(), 5);

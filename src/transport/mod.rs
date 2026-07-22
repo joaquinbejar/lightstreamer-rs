@@ -21,6 +21,8 @@
 pub(crate) use crate::error::TransportError;
 use crate::protocol::request::{BindSession, CreateSession};
 
+pub(crate) mod framing;
+pub(crate) mod http;
 pub(crate) mod ws;
 
 /// What a transport does that the session state machine must account for.
@@ -150,42 +152,53 @@ pub(crate) enum AnyTransport {
     /// TLCP over WebSocket, with control requests multiplexed on the stream
     /// connection [`docs/spec/02-session-lifecycle.md` §1].
     WebSocket(ws::WsTransport),
+    /// TLCP over HTTP — streaming or long polling — with each control request
+    /// on its own connection, whose response is forwarded onto the one line
+    /// stream [`docs/spec/01-foundations.md` §3;
+    /// `docs/adr/0007-transport-port-shape.md`].
+    Http(http::HttpTransport),
 }
 
 impl Transport for AnyTransport {
     fn properties(&self) -> TransportProperties {
         match self {
             Self::WebSocket(transport) => transport.properties(),
+            Self::Http(transport) => transport.properties(),
         }
     }
 
     fn set_control_link(&mut self, host: Option<&str>) {
         match self {
             Self::WebSocket(transport) => transport.set_control_link(host),
+            Self::Http(transport) => transport.set_control_link(host),
         }
     }
 
     async fn open_stream(&mut self, request: StreamOpen) -> Result<(), TransportError> {
         match self {
             Self::WebSocket(transport) => transport.open_stream(request).await,
+            Self::Http(transport) => transport.open_stream(request).await,
         }
     }
 
     async fn next_line(&mut self) -> Option<Result<String, TransportError>> {
         match self {
             Self::WebSocket(transport) => transport.next_line().await,
+            Self::Http(transport) => transport.next_line().await,
         }
     }
 
     async fn send_control(&mut self, request: EncodedRequest) -> Result<(), TransportError> {
         match self {
             Self::WebSocket(transport) => transport.send_control(request).await,
+            Self::Http(transport) => transport.send_control(request).await,
         }
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
         match self {
             Self::WebSocket(transport) => transport.close().await,
+            Self::Http(transport) => transport.close().await,
         }
     }
 }

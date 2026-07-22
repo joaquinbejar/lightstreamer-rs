@@ -57,15 +57,19 @@ const DEFAULT_UPDATE_CAPACITY: usize = 1024;
 /// Which transport carries the session.
 ///
 /// TLCP defines two: a WebSocket, and HTTP — the latter in a streaming and a
-/// long-polling flavour [`docs/spec/01-foundations.md` §6]. Only the WebSocket
-/// transport is exposed in this release; the enum is `#[non_exhaustive]` so
-/// that adding the others later is a minor version bump rather than a breaking
-/// one.
+/// long-polling flavour [`docs/spec/01-foundations.md` §6]. All three are
+/// implemented; the enum is `#[non_exhaustive]` so that a fourth could be added
+/// later as a minor version bump rather than a breaking one.
 ///
 /// Forcing a transport is offered because a caller sometimes knows something
-/// this crate cannot discover — a proxy that mangles WebSocket upgrades, say.
-/// With one variant the choice is currently trivial; it is here so the shape
-/// of the API does not have to change when it stops being trivial.
+/// this crate cannot discover — a proxy that mangles WebSocket upgrades, say,
+/// for which one of the HTTP variants is the way through.
+///
+/// The two HTTP variants differ in how a stream connection ends: streaming
+/// holds one response open until its content length is reached and then rebinds
+/// (transition T3), whereas long polling returns each cycle's notifications and
+/// rebinds every cycle (transition T4)
+/// [`docs/spec/02-session-lifecycle.md` §2.2, §7]. WebSocket does neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -74,6 +78,14 @@ pub enum Transport {
     /// [`docs/spec/01-foundations.md` §6.2].
     #[default]
     WebSocket,
+    /// HTTP streaming: one long-lived response body of near-infinite length,
+    /// with each control request on its own connection
+    /// [`docs/spec/01-foundations.md` §3; §6.1].
+    HttpStreaming,
+    /// HTTP long polling: each connection returns the notifications ready now
+    /// and closes, and the session rebinds each cycle
+    /// [`docs/spec/02-session-lifecycle.md` §7].
+    HttpPolling,
 }
 
 impl Transport {
@@ -83,6 +95,8 @@ impl Transport {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WebSocket => "websocket",
+            Self::HttpStreaming => "http-streaming",
+            Self::HttpPolling => "http-polling",
         }
     }
 }
@@ -469,5 +483,11 @@ mod tests {
     fn test_transport_default_is_websocket() {
         assert_eq!(Transport::default(), Transport::WebSocket);
         assert_eq!(Transport::default().as_str(), "websocket");
+    }
+
+    #[test]
+    fn test_transport_variants_name_themselves() {
+        assert_eq!(Transport::HttpStreaming.as_str(), "http-streaming");
+        assert_eq!(Transport::HttpPolling.as_str(), "http-polling");
     }
 }
