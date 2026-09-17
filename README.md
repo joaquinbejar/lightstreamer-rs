@@ -457,3 +457,16 @@ This software is not officially associated with Lightstreamer Srl. It is an
 independent client implementation of the publicly documented TLCP protocol.
 If you use it to handle financial data, test thoroughly against a demo
 environment before relying on it.
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [ig-client](https://github.com/joaquinbejar/ig-client) · [crates.io](https://crates.io/crates/ig-client) | Rust framework for the IG broker API (REST and Lightstreamer streaming). |
+
+<!-- related-projects:end -->
