@@ -57,7 +57,7 @@ every wire behaviour.
 
 ```toml
 [dependencies]
-lightstreamer-rs = "1.0.0"
+lightstreamer-rs = "1.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures-util = "0.3"   # for StreamExt, to poll the update streams
 ```
@@ -77,7 +77,7 @@ be decoded. Turn it on if your server's adapters emit JSON documents that
 benefit from patch compression:
 
 ```toml
-lightstreamer-rs = { version = "1.0.0", features = ["json-patch"] }
+lightstreamer-rs = { version = "1.0.1", features = ["json-patch"] }
 ```
 
 `test-util` exists because the payloads this crate delivers cannot be built
@@ -92,7 +92,7 @@ Cargo turns it on for your tests and leaves your release build untouched:
 
 ```toml
 [dev-dependencies]
-lightstreamer-rs = { version = "1.0.0", features = ["test-util"] }
+lightstreamer-rs = { version = "1.0.1", features = ["test-util"] }
 ```
 
 <!-- `ignore`, and deliberately: `my_parser` and `my_state_policy` are *your*
