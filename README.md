@@ -437,10 +437,9 @@ specification and from [`docs/spec/`](docs/spec/), and cite the chapter your
 change comes from. A pull request whose provenance cannot be explained cannot
 be merged, however good the code is.
 
-### Contact
-
+### **Contact Information**
 - **Author**: Joaquín Béjar García
-- **Email**: <jb@taunais.com>
+- **Email**: jb@taunais.com
 - **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
 - **Repository**: <https://github.com/joaquinbejar/lightstreamer-rs>
 - **Documentation**: <https://docs.rs/lightstreamer-rs>
@@ -467,6 +466,6 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [ig-client](https://github.com/joaquinbejar/ig-client) · [crates.io](https://crates.io/crates/ig-client) | Rust framework for the IG broker API (REST and Lightstreamer streaming). |
+| [ig-client](https://github.com/joaquinbejar/ig-client) | Rust framework for the IG broker API; it uses lightstreamer-rs for its real-time streaming of prices, accounts and trades. |
 
 <!-- related-projects:end -->
